@@ -86,9 +86,15 @@ st.sidebar.markdown("### 🛡️ Risk Management Parameters")
 broker_fee = st.sidebar.slider("Broker Fee + Taxes (% round-trip):", min_value=0.10, max_value=1.0, value=0.35, step=0.05)
 holding_limit = st.sidebar.slider("Max Holding Days (Backtest):", min_value=5, max_value=40, value=20, step=5)
 
+@st.cache_data(ttl=900, show_spinner=False)
+def get_cached_stock_data(symbol: str, period: str = "6mo", force_refresh: bool = False) -> dict:
+    """Cached accessor for PSX market data with a 15-minute TTL."""
+    return fetch_psx_stock(symbol, period=period, force_refresh=force_refresh)
+
+
 # ----------------- DATA LOADING -----------------
 with st.spinner(f"Fetching real market data for {active_symbol}..."):
-    stock_res = fetch_psx_stock(active_symbol, period=period)
+    stock_res = get_cached_stock_data(active_symbol, period=period)
 
 df_stock = stock_res.get("df")
 data_source = stock_res.get("source", "None")
@@ -167,19 +173,21 @@ with tab1:
 
 # ----------------- TAB 2: WATCHLIST SCREENER -----------------
 with tab2:
+    symbols_list = list(watchlist.keys())
     st.markdown("### 📊 Real PSX Watchlist Screener")
     st.caption(f"Scans {len(symbols_list)} leading PSX equities across all core sectors using verified real prices.")
 
-    if st.button("🔄 Scan Entire PSX Watchlist Now"):
+    force_refresh_scan = False
+    if st.button("🔄 Force Refresh & Scan PSX Watchlist"):
         st.cache_data.clear()
+        force_refresh_scan = True
 
     scan_records = []
     progress_bar = st.progress(0)
-    symbols_list = list(watchlist.keys())
 
     for idx, sym in enumerate(symbols_list):
         progress_bar.progress((idx + 1) / len(symbols_list))
-        res = fetch_psx_stock(sym, period="3mo")
+        res = get_cached_stock_data(sym, period="3mo", force_refresh=force_refresh_scan)
         if res.get("status") == "OK":
             df_sym = res["df"]
             sig = generate_signal(sym, df_sym, data_meta=res)

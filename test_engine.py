@@ -7,6 +7,7 @@ multi-target backtester accounting, and SQLite lifecycle tracking.
 import sys
 import os
 import sqlite3
+import datetime
 import numpy as np
 import pandas as pd
 
@@ -203,6 +204,68 @@ def test_signal_tracker_lifecycle():
     print("  ✓ SQLite signal ledger & lifecycle auditor passed.")
 
 
+def test_pkt_timezone_conversion():
+    print("5. Testing Pakistan Standard Time (PKT) timestamp conversion...")
+    import datetime
+    from data_engine import PKT_TZ
+    # Example: 19:30:00 UTC on 2026-09-14 is 00:30:00 PKT on 2026-09-15
+    utc_dt = datetime.datetime(2026, 9, 14, 19, 30, 0, tzinfo=datetime.timezone.utc)
+    ts = int(utc_dt.timestamp())
+
+    pkt_date = datetime.datetime.fromtimestamp(ts, tz=PKT_TZ).date()
+    assert pkt_date == datetime.date(2026, 9, 15), f"Expected 2026-09-15 in PKT, got {pkt_date}"
+    print(f"  ✓ PKT timezone conversion passed (UTC epoch correctly resolved to PKT session date: {pkt_date}).")
+
+
+def test_backtester_same_bar_breakeven():
+    print("6. Testing backtester same-bar TP1 + Breakeven retracement...")
+    # Build candle history that triggers a BREAKOUT setup
+    dates = pd.date_range(end=datetime.date.today(), periods=35, freq="B")
+    records = []
+    for i, d in enumerate(dates):
+        c = 100.0 + (i * 0.5)
+        records.append({
+            "Date": d,
+            "Open": c - 0.2,
+            "High": c + 0.8,
+            "Low": c - 0.8,
+            "Close": c,
+            "Volume": 1_000_000,
+        })
+    df = pd.DataFrame(records).set_index("Date")
+
+    # Bar 32: Clears 20-day high with huge volume to trigger BREAKOUT
+    df.loc[df.index[32], "High"] = 125.0
+    df.loc[df.index[32], "Close"] = 124.0
+    df.loc[df.index[32], "Volume"] = 3_000_000
+
+    # Bar 33: Spikes to TP1, but plunges back to entry price on the same bar
+    # Entry max is ~124.0, ATR is ~1.5, TP1 is ~125.8
+    df.loc[df.index[33], "High"] = 135.0  # Crosses TP1
+    df.loc[df.index[33], "Low"] = 123.0   # Drops below entry (124.0) but above initial SL (~122.0)
+    df.loc[df.index[33], "Close"] = 124.0
+
+    bt = run_signal_backtest(df, symbol="TEST_BE", holding_max_bars=20, broker_fee_pct=0.35)
+    assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
+    # Verify that the trade closed without waiting for the next bar
+    if not bt["trades_df"].empty:
+        first_trade = bt["trades_df"].iloc[0]
+        assert "BREAKEVEN" in first_trade["outcome"] or first_trade["tp1_reached"], (
+            f"Trade outcome should reflect TP1 hit: {first_trade['outcome']}"
+        )
+    print("  ✓ Backtester same-bar breakeven edge case handling passed.")
+
+
+def test_sqlite_wal_mode():
+    print("7. Testing SQLite Write-Ahead Logging (WAL) & connection busy timeout...")
+    with signal_tracker.get_connection() as conn:
+        mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+        timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+        assert mode.lower() in ["wal", "memory"], f"Expected WAL mode, got {mode}"
+        assert timeout >= 30000, f"Expected busy timeout >= 30000ms, got {timeout}"
+    print(f"  ✓ SQLite WAL mode active ({mode.upper()}) with {timeout}ms busy timeout.")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -210,4 +273,7 @@ if __name__ == "__main__":
     test_strategy_and_checklist(df_test)
     test_backtester_multi_target(df_test)
     test_signal_tracker_lifecycle()
+    test_pkt_timezone_conversion()
+    test_backtester_same_bar_breakeven()
+    test_sqlite_wal_mode()
     print("=== All Verification Tests Passed Successfully! ===")

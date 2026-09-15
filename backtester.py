@@ -99,7 +99,7 @@ def run_signal_backtest(
             if high >= tp1 and not active["tp1_hit"]:
                 active["tp1_hit"] = True
                 active["stop_loss"] = entry  # Move stop loss to breakeven
-                # If high also reached TP2 on same or subsequent bar
+                # Subcase 2a: If high also reached TP2 on same bar
                 if high >= tp2:
                     active["tp2_hit"] = True
                     # 50% exit at TP1, 50% exit at TP2
@@ -116,6 +116,27 @@ def run_signal_backtest(
                         "gross_pnl_pct": round(gross_return * 100, 2),
                         "net_pnl_pct": round(net_return * 100, 2),
                         "is_ambiguous": False,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
+
+                # Subcase 2b: Same-bar retracement to Breakeven (Low <= entry)
+                if low <= entry:
+                    active["ambiguous_bars"] += 1
+                    p1_ret = (tp1 - entry) / entry
+                    p2_ret = 0.0  # Breakeven on second half
+                    gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                    net_return = gross_return - (broker_fee_pct / 100.0)
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": entry,
+                        "outcome": "TP1 HIT + SAME-DAY BREAKEVEN",
+                        "tp1_reached": True,
+                        "tp2_reached": False,
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": True,
                     })
                     trades.append(active)
                     in_trade = False

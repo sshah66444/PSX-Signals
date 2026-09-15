@@ -152,6 +152,10 @@ def check_has_true_ohlc(df: pd.DataFrame) -> bool:
     return bool(has_high_wicks or has_low_wicks)
 
 
+# Pakistan Standard Time (PKT = UTC+5) for deterministic date conversion on all servers
+PKT_TZ = datetime.timezone(datetime.timedelta(hours=5))
+
+
 def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     """
     Fetches official end-of-day timeseries directly from the PSX Data Portal (DPS).
@@ -182,7 +186,8 @@ def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     records = []
     for item in rows:
         ts, c, v, o = item[0], float(item[1]), float(item[2]), float(item[3])
-        d = datetime.datetime.fromtimestamp(ts).date()
+        # Use explicit PKT (UTC+5) to prevent UTC servers (e.g. GitHub Actions) from shifting dates
+        d = datetime.datetime.fromtimestamp(ts, tz=PKT_TZ).date()
         # Bound High/Low to max/min of Open/Close without fabricating fictional intraday wicks
         h = max(o, c)
         l = min(o, c)
@@ -237,7 +242,12 @@ def validate_market_data(df: pd.DataFrame, max_age_days: int = 5, require_true_o
     return True, "Data valid and verified", age_days
 
 
-def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> dict:
+def fetch_psx_stock(
+    symbol: str,
+    period: str = "6mo",
+    max_age_days: int = 5,
+    force_refresh: bool = False,
+) -> dict:
     """
     Fetches real PSX market data with rigorous source attribution and integrity flags.
     Strictly refuses to fabricate synthetic data in production.
@@ -274,8 +284,8 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
     except Exception:
         df = None
 
-    # 2. Try Local Cache (if recently updated and valid with true OHLC)
-    if df is None and os.path.exists(cache_file):
+    # 2. Try Local Cache (only if force_refresh is False, recently updated and valid with true OHLC)
+    if df is None and not force_refresh and os.path.exists(cache_file):
         try:
             df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
             is_valid, reason, age = validate_market_data(df_cache, max_age_days=max_age_days)
@@ -299,6 +309,18 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
                     has_true_ohlc = False  # DPS schema lacks true intraday High/Low wicks
                     source = "PSX Official Portal (DPS) — OHLC approximated (Close/Open only)"
                     df.to_csv(cache_file)
+        except Exception:
+            df = None
+
+    # 4. Fallback to Local Cache if force_refresh was requested but network failed
+    if df is None and force_refresh and os.path.exists(cache_file):
+        try:
+            df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            is_valid, reason, age = validate_market_data(df_cache, max_age_days=max_age_days)
+            if is_valid:
+                df = df_cache
+                has_true_ohlc = check_has_true_ohlc(df_cache)
+                source = f"Verified Local Cache ({clean_symbol}) — {'True OHLC' if has_true_ohlc else 'OHLC approximated'}"
         except Exception:
             df = None
 
