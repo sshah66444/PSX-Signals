@@ -207,9 +207,22 @@ def run_signal_backtest(
     if not trades and not unresolved_trade:
         return {
             "symbol": symbol,
-            "total_trades": 0,
+            "total_triggered": 0,
             "resolved_trades": 0,
             "unresolved_trades": 0,
+            "unresolved_trade": None,
+            "tp1_hits": 0,
+            "tp2_hits": 0,
+            "sl_hits": 0,
+            "ambiguous_trades": 0,
+            "tp1_hit_rate_pct": 0.0,
+            "tp2_hit_rate_pct": 0.0,
+            "stop_loss_rate_pct": 0.0,
+            "net_pnl_pct": 0.0,
+            "avg_trade_pnl_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "profit_factor": 0.0,
+            "trades_df": pd.DataFrame(),
             "message": "No confirmed trade setups triggered in this historical window.",
         }
 

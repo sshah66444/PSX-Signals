@@ -71,6 +71,20 @@ def test_strategy_and_checklist(df):
     for rule, passed in setup["checklist"].items():
         assert isinstance(passed, (bool, np.bool_)), f"Rule '{rule}' must be boolean"
 
+    # CRITICAL: Verify TRIGGERED is strictly gated on 100% checklist pass
+    if setup["status"] == "TRIGGERED":
+        assert all(setup["checklist"].values()), "TRIGGERED status must have 100% checklist pass rate"
+    else:
+        # If any checklist item is False, status cannot be TRIGGERED
+        if not all(setup["checklist"].values()):
+            assert setup["status"] != "TRIGGERED", "Status cannot be TRIGGERED when checklist items fail"
+
+    # Verify user's edge case: Pinned RSI=100 must be rejected from TRIGGERED
+    df_pinned = df_ind.copy()
+    df_pinned.loc[df_pinned.index[-1], "RSI"] = 100.0
+    setup_pinned = evaluate_bar_strategy(df_pinned, bar_idx=-1)
+    assert setup_pinned["status"] != "TRIGGERED", "Setup with RSI=100 must NOT be TRIGGERED"
+
     # Test actionable card formatting & HTML escaping
     card = format_actionable_card(setup, company_name="Test Company")
     assert "<b>" in card, "Card should contain Telegram HTML tags"

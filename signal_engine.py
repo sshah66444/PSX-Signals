@@ -146,10 +146,16 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
             "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
         }
 
-        # Status determination
-        if c_breakout_level and c_volume_surge and c_macd_turn and c_liquidity:
+        # Status determination (gated strictly on ALL checklist conditions)
+        if all(checklist.values()):
             status = "TRIGGERED"
-            trigger_note = f"Daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume."
+            trigger_note = f"All criteria verified: daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume and R:R {rr_tp1}:1."
+        elif not (rr_tp1 >= 1.2):
+            status = "WATCHING"
+            trigger_note = f"Price cleared resistance, but disqualified: Risk:Reward ({rr_tp1}:1) is below 1.2:1 minimum threshold."
+        elif not c_rsi_healthy:
+            status = "WATCHING"
+            trigger_note = f"Price cleared resistance, but disqualified: RSI ({rsi:.1f}) is outside healthy range (42 - 68)."
         elif c_breakout_level and not c_volume_surge:
             status = "WATCHING"
             trigger_note = f"Price cleared resistance ({res20:.2f}), but volume ({volume/vol_ma:.1f}x MA) requires confirmation."
@@ -207,9 +213,16 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
             "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
         }
 
-        if c_bounce_candle and c_macd_turn and c_liquidity:
+        # Status determination (gated strictly on ALL checklist conditions)
+        if all(checklist.values()):
             status = "TRIGGERED"
-            trigger_note = f"Bullish bounce confirmed at 20 EMA ({ema20:.2f}) with stabilizing MACD."
+            trigger_note = f"All criteria verified: bullish bounce at 20 EMA ({ema20:.2f}) with stabilizing MACD and R:R {rr_tp1}:1."
+        elif not (rr_tp1 >= 1.2):
+            status = "WATCHING"
+            trigger_note = f"Support bounce detected, but disqualified: Risk:Reward ({rr_tp1}:1) is below 1.2:1 minimum threshold."
+        elif not (rsi < 58):
+            status = "WATCHING"
+            trigger_note = f"Testing support, but RSI ({rsi:.1f}) is elevated (> 58)."
         elif not c_liquidity:
             status = "WATCHING"
             trigger_note = f"Testing 20 EMA support, but liquidity ({vol_ma:.0f} shares) is below 80k threshold."
