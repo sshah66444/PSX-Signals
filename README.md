@@ -31,11 +31,14 @@ Scans the 75 most liquid and active stocks in the Pakistani stock market:
 
 ### 3. Unified Strategy Engine & Transparent Condition Checklists
 Both live alerts and historical backtests use the **exact same deterministic strategy function**:
-* **Breakout Strategy (`BREAKOUT`)**: Consolidations near 20-day resistance, triggered on high-volume breakout ($> 1.20\times$ 20MA).
-* **Pullback Strategy (`PULLBACK`)**: Macro uptrend (Price > 50 EMA), testing 20 EMA / support band with stabilizing momentum.
+* **Breakout Strategy (`BREAKOUT`)**: Consolidations near 20-day resistance, emerging from a tight volatility compression base, triggered on high-volume breakout ($> 1.20\times$ 20MA) with KSE-100 Relative Strength leadership.
+* **Pullback Strategy (`PULLBACK`)**: Macro uptrend (Price > 50 EMA), testing 20 EMA / support band with stabilizing momentum and benchmark outperformance.
 * **Non-Cosmetic Condition Checklist**: Status is strictly gated on 100% checklist pass rate:
   ```text
   📋 Condition Checklist:
+     [✓] Macro Market Gate (KSE-100 > 50 EMA)
+     [✓] Relative Strength Leader (vs KSE-100)
+     [✓] Volatility Compression (Tight Base)
      [✓] Verified Intraday OHLC (True High/Low)
      [✓] Trend Alignment (Price > 20 & 50 EMA)
      [✓] Resistance Test / Clearance
@@ -47,7 +50,11 @@ Both live alerts and historical backtests use the **exact same deterministic str
   ⚡ Status: TRIGGERED
   ```
 
-### 4. Rigorous Multi-Target Backtester with Friction Costs
+### 4. Positive-Expectancy Quant Engine & Multi-Target Backtester
+* **Macro Market Gate (KSE-100 Index)**: Official 5-year historical KSE-100 feed (`dps.psx.com.pk/timeseries/eod/KSE100`). Suppresses long entries when KSE-100 trades below its 50 EMA (`MARKET_CORRECTION - Cash Preservation Mode`), avoiding fighting market beta.
+* **Relative Strength (RS vs KSE-100)**: Quantifies stock performance relative to the index ($\text{RS} \ge \text{RS\_MA20}$), filtering for equities receiving institutional sponsorship.
+* **Volatility Compression Squeeze**: Measures Bollinger Bandwidth against 60-day compression minimums to ensure breakouts originate from tight bases rather than erratic exhaustion moves.
+* **Disciplined Time-Stops (4-Bar Rule)**: Automatically exits stalled trades after 4 sessions without follow-through, eliminating dead-capital drag and mitigating drawdown.
 * **Realistic Scale-Out Model**: 50% profit booked at TP1, Stop Loss trailed to Breakeven, remaining 50% trails toward TP2.
 * **Ambiguous Candle Detection**: Bars that touch both Target and Stop Loss on the same day are flagged as ambiguous and conservatively counted as stopped out. Same-bar retracements to breakeven after TP1 are accurately captured.
 * **Real Trading Costs**: Automatically factors in customizable PSX round-trip broker commissions and CDC/SECP taxes (default: 0.35%).

@@ -23,7 +23,7 @@ if os.path.exists(env_file):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-from data_engine import get_watchlist, fetch_psx_stock
+from data_engine import get_watchlist, fetch_psx_stock, fetch_kse100_index
 from signal_engine import generate_signal, format_actionable_card
 from signal_tracker import (
     record_or_update_setup,
@@ -72,16 +72,26 @@ def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool
 def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_run: bool = False) -> list[str]:
     """
     Executes the complete daily workflow:
-    1. Fetches real market data.
-    2. Audits existing open signals (checks TP/SL hits, sends updates).
-    3. Scans for new or triggered setups.
-    4. Records them in signals.db without repeating unchanged setups.
+    1. Fetches KSE-100 index and macro market regime.
+    2. Fetches real market data.
+    3. Audits existing open signals (checks TP/SL hits, sends updates).
+    4. Scans for new or triggered setups.
+    5. Records them in signals.db without repeating unchanged setups.
     """
     watchlist = get_watchlist()
     target_symbols = symbols if symbols else list(watchlist.keys())
     messages = []
 
-    print(f"1. Fetching real market data for {len(target_symbols)} symbols...")
+    # 1. Fetch KSE-100 Index and Macro Market Regime
+    print("1. Fetching KSE-100 index and macro market regime...")
+    df_kse, regime_info = fetch_kse100_index()
+    regime_name = regime_info.get("regime", "UNKNOWN")
+    is_bullish = regime_info.get("is_bullish", True)
+    kse_close = regime_info.get("close", 0.0)
+    kse_ema50 = regime_info.get("ema50", 0.0)
+    print(f"   KSE-100 Regime: {regime_name} (Close: {kse_close:,.0f} vs 50 EMA: {kse_ema50:,.0f})")
+
+    print(f"2. Fetching real market data for {len(target_symbols)} symbols...")
     market_data = {}
     skipped_symbols = []
 
@@ -92,20 +102,20 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
         else:
             skipped_symbols.append((sym, res.get("error", "Data unavailable")))
 
-    # 2. Audit existing open setups
-    print("2. Auditing open setups in signals.db...")
+    # 3. Audit existing open setups
+    print("3. Auditing open setups in signals.db...")
     lifecycle_updates = audit_active_signals(market_data)
     for upd in lifecycle_updates:
         messages.append(upd["text"])
         if not dry_run and token and chat_id:
             broadcast_telegram_message(token, chat_id, upd["text"])
 
-    # 3. Evaluate setups for new/updated triggers
-    print("3. Evaluating setups across watchlist...")
+    # 4. Evaluate setups for new/updated triggers
+    print("4. Evaluating setups across watchlist...")
     new_setup_cards = []
     for sym, m_info in market_data.items():
         df = m_info["df"]
-        setup = generate_signal(sym, df, data_meta=m_info)
+        setup = generate_signal(sym, df, data_meta=m_info, df_kse=df_kse, market_regime=regime_info)
         status = setup.get("status")
 
         if status in ["TRIGGERED", "WATCHING"]:
@@ -118,11 +128,15 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
                 if not dry_run and token and chat_id:
                     broadcast_telegram_message(token, chat_id, card)
 
-    # 4. Summary header
+    # 5. Summary header
     today_str = datetime.date.today().strftime("%d-%b-%Y")
+    regime_badge = "🟢 BULL MARKET" if is_bullish else "🔴 MARKET CORRECTION (Cash Preservation Mode)"
     header = (
         f"📊 <b>PSX AlphaSignals Daily Market Scan</b>\n"
         f"📅 Date: <b>{today_str}</b>\n"
+        f"🏛️ <b>Macro Regime:</b> {regime_badge}\n"
+        f"📈 KSE-100: <b>{kse_close:,.2f}</b> | 50 EMA: <b>{kse_ema50:,.2f}</b>\n"
+        f"<i>{regime_info.get('note', '')}</i>\n"
         f"────────────────────────\n"
         f"Audited active signals: {len(lifecycle_updates)} updates.\n"
         f"New/Triggered setups: {len(new_setup_cards)}.\n"
@@ -214,7 +228,8 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
             send_telegram_message(token, chat_id, f"❌ Data unavailable for ${sym}: {res.get('error')}")
             return
 
-        setup = generate_signal(sym, res["df"], data_meta=res)
+        df_kse, regime_info = fetch_kse100_index()
+        setup = generate_signal(sym, res["df"], data_meta=res, df_kse=df_kse, market_regime=regime_info)
         comp_name = watchlist.get(sym, {}).get("name", sym)
 
         if cmd == "/why":

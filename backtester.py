@@ -15,6 +15,8 @@ def run_signal_backtest(
     symbol: str,
     holding_max_bars: int = 20,
     broker_fee_pct: float = 0.35,  # Round-trip commission + CDC/SECP charges
+    df_kse: pd.DataFrame = None,
+    time_stop_bars: int = 4,
 ) -> dict:
     """
     Backtests strategy performance bar-by-bar across historical data.
@@ -31,8 +33,18 @@ def run_signal_backtest(
                      "which invalidates ATR, stop-loss triggers, and target simulations."
         }
 
-    df_ind = compute_all_indicators(df)
+    df_ind = compute_all_indicators(df, df_kse=df_kse)
     n_bars = len(df_ind)
+
+    # Pre-align KSE-100 series for fast O(1) regime lookup if provided
+    kse_close_series = None
+    kse_ema50_series = None
+    if df_kse is not None and not df_kse.empty:
+        if "EMA_50" not in df_kse.columns:
+            df_kse = df_kse.copy()
+            df_kse["EMA_50"] = df_kse["Close"].ewm(span=50, adjust=False).mean()
+        kse_close_series = df_kse["Close"].reindex(df_ind.index, method="ffill")
+        kse_ema50_series = df_kse["EMA_50"].reindex(df_ind.index, method="ffill")
 
     trades = []
     in_trade = False
@@ -183,7 +195,28 @@ def run_signal_backtest(
                     in_trade = False
                     continue
 
-            # Case 4: Expiration (Holding limit reached)
+            # Case 4: Time-Stop Exit (Stalled Momentum before TP1)
+            if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
+                stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
+                if close <= stalled_threshold:
+                    exit_price = close
+                    gross_return = (exit_price - entry) / entry
+                    net_return = gross_return - (broker_fee_pct / 100.0)
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": exit_price,
+                        "outcome": "TIME-STOP EXIT (Stalled Momentum)",
+                        "tp1_reached": False,
+                        "tp2_reached": False,
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": False,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
+
+            # Case 5: Expiration (Holding limit reached)
             if active["bars_held"] >= holding_max_bars:
                 exit_price = close
                 if active["tp1_hit"]:
@@ -209,7 +242,18 @@ def run_signal_backtest(
 
         # Look for new entries when not in trade
         if not in_trade:
-            setup = evaluate_bar_strategy(df_ind, bar_idx=i)
+            hist_regime = None
+            if kse_close_series is not None and i < len(kse_close_series):
+                kse_c = kse_close_series.iloc[i]
+                kse_e50 = kse_ema50_series.iloc[i]
+                if pd.notna(kse_c) and pd.notna(kse_e50):
+                    is_bull = bool(kse_c >= kse_e50)
+                    hist_regime = {
+                        "is_bullish": is_bull,
+                        "regime": "BULL_MARKET" if is_bull else "MARKET_CORRECTION",
+                    }
+
+            setup = evaluate_bar_strategy(df_ind, bar_idx=i, market_regime=hist_regime)
             if setup.get("status") == "TRIGGERED":
                 in_trade = True
                 active = {
@@ -220,6 +264,7 @@ def run_signal_backtest(
                     "stop_loss": setup["stop_loss"],
                     "tp1": setup["tp1"],
                     "tp2": setup["tp2"],
+                    "atr": setup.get("atr", 0.0),
                     "bars_held": 0,
                     "tp1_hit": False,
                     "tp2_hit": False,
@@ -244,6 +289,7 @@ def run_signal_backtest(
             "tp1_hits": 0,
             "tp2_hits": 0,
             "sl_hits": 0,
+            "time_stop_hits": 0,
             "ambiguous_trades": 0,
             "tp1_hit_rate_pct": 0.0,
             "tp2_hit_rate_pct": 0.0,
@@ -265,6 +311,7 @@ def run_signal_backtest(
         tp1_hits = int(df_trades["tp1_reached"].sum())
         tp2_hits = int(df_trades["tp2_reached"].sum())
         sl_hits = len(df_trades[df_trades["outcome"].str.contains("STOP LOSS")])
+        time_stop_hits = len(df_trades[df_trades["outcome"].str.contains("TIME-STOP")])
         ambiguous_hits = int(df_trades["is_ambiguous"].sum())
 
         win_rate_tp1 = round((tp1_hits / resolved_count) * 100, 1)
@@ -286,7 +333,7 @@ def run_signal_backtest(
         gross_loss = abs(float(losing_trades["gross_pnl_pct"].sum())) if not losing_trades.empty else 1e-6
         profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 99.0
     else:
-        tp1_hits = tp2_hits = sl_hits = ambiguous_hits = 0
+        tp1_hits = tp2_hits = sl_hits = time_stop_hits = ambiguous_hits = 0
         win_rate_tp1 = win_rate_tp2 = sl_rate = 0.0
         net_pnl_total = avg_trade_pnl = max_drawdown = profit_factor = 0.0
 
@@ -299,6 +346,7 @@ def run_signal_backtest(
         "tp1_hits": tp1_hits,
         "tp2_hits": tp2_hits,
         "sl_hits": sl_hits,
+        "time_stop_hits": time_stop_hits,
         "ambiguous_trades": ambiguous_hits,
         "tp1_hit_rate_pct": win_rate_tp1,
         "tp2_hit_rate_pct": win_rate_tp2,

@@ -4,6 +4,7 @@ Production PSX Data Engine with Strict Data Integrity & Multi-Source Fallback.
 Zero synthetic fabrication in production.
 """
 
+from __future__ import annotations
 import os
 import datetime
 import requests
@@ -349,6 +350,109 @@ def fetch_psx_stock(
         "last_date": None,
         "data_age_days": 999,
         "error": f"Real market data unavailable for {clean_symbol}. Alert skipped to maintain data integrity.",
+    }
+
+
+def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None, dict]:
+    """
+    Fetches official historical timeseries for the Pakistan Stock Exchange KSE-100 Index.
+    Endpoint: https://dps.psx.com.pk/timeseries/eod/KSE100
+    Computes 50 EMA, 200 EMA, and evaluates the broad Macro Market Regime.
+
+    Returns:
+      (df_kse, regime_info_dict)
+    """
+    cache_file = os.path.join(CACHE_DIR, "KSE100_real.csv")
+    df_kse = None
+
+    # 1. Try Local Cache if valid and not force_refresh
+    if not force_refresh and os.path.exists(cache_file):
+        try:
+            df_cached = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            if df_cached is not None and not df_cached.empty and len(df_cached) >= 50:
+                latest_dt = df_cached.index[-1].date()
+                if (datetime.date.today() - latest_dt).days <= 5:
+                    df_kse = df_cached
+        except Exception:
+            df_kse = None
+
+    # 2. Fetch fresh from PSX DPS if needed
+    if df_kse is None:
+        try:
+            url = "https://dps.psx.com.pk/timeseries/eod/KSE100"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            }
+            resp = requests.get(url, headers=headers, timeout=12)
+            if resp.status_code == 200:
+                rows = resp.json().get("data", [])
+                if rows and len(rows) >= 50:
+                    records = []
+                    for item in rows:
+                        ts, c, v, o = item[0], float(item[1]), float(item[2]), float(item[3])
+                        d = datetime.datetime.fromtimestamp(ts, tz=PKT_TZ).date()
+                        records.append({
+                            "Date": pd.to_datetime(d),
+                            "Open": round(o, 2),
+                            "Close": round(c, 2),
+                            "Volume": int(v),
+                        })
+                    df_fresh = pd.DataFrame(records).drop_duplicates("Date", keep="first").set_index("Date").sort_index()
+                    df_kse = df_fresh
+                    df_kse.to_csv(cache_file)
+        except Exception:
+            df_kse = None
+
+    # 3. Fallback to cache if network failed
+    if df_kse is None and os.path.exists(cache_file):
+        try:
+            df_kse = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+        except Exception:
+            df_kse = None
+
+    if df_kse is None or len(df_kse) < 50:
+        return None, {
+            "regime": "UNKNOWN",
+            "is_bullish": True,  # Neutral fallback
+            "close": 0.0,
+            "ema50": 0.0,
+            "ema200": 0.0,
+            "last_date": "N/A",
+            "note": "KSE-100 benchmark feed offline.",
+        }
+
+    # Compute Moving Averages
+    df_kse["EMA_50"] = df_kse["Close"].ewm(span=50, adjust=False).mean()
+    df_kse["EMA_200"] = df_kse["Close"].ewm(span=min(200, len(df_kse) - 1), adjust=False).mean()
+
+    latest_close = float(df_kse["Close"].iloc[-1])
+    latest_ema50 = float(df_kse["EMA_50"].iloc[-1])
+    latest_ema200 = float(df_kse["EMA_200"].iloc[-1])
+    last_date = df_kse.index[-1].strftime("%Y-%m-%d")
+
+    # Regime Determination:
+    if latest_close >= latest_ema50 and latest_ema50 >= latest_ema200:
+        regime = "BULL_MARKET"
+        is_bullish = True
+        note = f"KSE-100 ({latest_close:,.0f}) is trending firmly above 50 EMA ({latest_ema50:,.0f}). Full breakout participation enabled."
+    elif latest_close >= latest_ema50:
+        regime = "RECOVERY_ZONE"
+        is_bullish = True
+        note = f"KSE-100 ({latest_close:,.0f}) above 50 EMA ({latest_ema50:,.0f}) in recovery phase. Selective setups permitted."
+    else:
+        regime = "MARKET_CORRECTION"
+        is_bullish = False
+        note = f"KSE-100 ({latest_close:,.0f}) is below 50 EMA ({latest_ema50:,.0f}). Broad market in correction: Long breakouts suppressed to preserve cash."
+
+    return df_kse, {
+        "regime": regime,
+        "is_bullish": is_bullish,
+        "close": round(latest_close, 2),
+        "ema50": round(latest_ema50, 2),
+        "ema200": round(latest_ema200, 2),
+        "last_date": last_date,
+        "note": note,
     }
 
 

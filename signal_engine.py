@@ -48,8 +48,8 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Computes technical indicator series across the entire price history."""
+def compute_all_indicators(df: pd.DataFrame, df_kse: pd.DataFrame = None) -> pd.DataFrame:
+    """Computes technical indicator series and benchmark relative strength across the price history."""
     df = df.copy()
     close = df["Close"]
 
@@ -66,20 +66,46 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ATR"] = calculate_atr(df, 14)
     df["Vol_MA20"] = df["Volume"].rolling(20).mean()
 
-    # Dynamic rolling 20-day high and low (excluding current bar if needed, or including)
+    # Dynamic rolling 20-day high and low
     df["Rolling_High20"] = df["High"].rolling(20).max()
     df["Rolling_Low20"] = df["Low"].rolling(20).min()
+
+    # Bollinger Bands & Volatility Compression (Squeeze Base)
+    df["BB_Middle"] = df["Close"].rolling(20).mean()
+    df["BB_Std"] = df["Close"].rolling(20).std()
+    df["BB_Upper"] = df["BB_Middle"] + (2.0 * df["BB_Std"])
+    df["BB_Lower"] = df["BB_Middle"] - (2.0 * df["BB_Std"])
+    df["BB_Width"] = (df["BB_Upper"] - df["BB_Lower"]) / (df["BB_Middle"] + 1e-6)
+    df["BB_Width_Min60"] = df["BB_Width"].rolling(60, min_periods=20).min()
+    # Volatility squeeze: current bandwidth is within 35% of its 60-day tightest compression
+    df["Is_Squeeze"] = df["BB_Width"] <= (1.35 * df["BB_Width_Min60"])
+
+    # Relative Strength vs KSE-100 Benchmark
+    if df_kse is not None and not df_kse.empty:
+        kse_aligned = df_kse["Close"].reindex(df.index, method="ffill")
+        df["RS_Ratio"] = df["Close"] / (kse_aligned + 1e-6)
+        df["RS_MA20"] = df["RS_Ratio"].rolling(20, min_periods=10).mean()
+        df["Is_RS_Leader"] = df["RS_Ratio"] >= df["RS_MA20"]
+    else:
+        df["RS_Ratio"] = 1.0
+        df["RS_MA20"] = 1.0
+        df["Is_RS_Leader"] = True
 
     return df
 
 
-def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc: bool = True) -> dict:
+def evaluate_bar_strategy(
+    df_ind: pd.DataFrame,
+    bar_idx: int = -1,
+    has_true_ohlc: bool = True,
+    market_regime: dict = None,
+) -> dict:
     """
     Evaluates strategy conditions on a specific historical bar.
     Single source of truth used identically by both the screener and the backtester.
 
     Strategies supported:
-    1. BREAKOUT: Consolidation near 20-day resistance, breakout with volume.
+    1. BREAKOUT: Consolidation near 20-day resistance, breakout with volume & RS leadership.
     2. PULLBACK: Healthy uptrend, price pulling back to 20 EMA / support band.
     """
     if df_ind is None or len(df_ind) < 25:
@@ -114,7 +140,14 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
     date_val = df_ind.index[idx]
     date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
 
-    # Condition checks
+    # Macro & Benchmark Conditions
+    is_market_bullish = market_regime.get("is_bullish", True) if market_regime else True
+    regime_name = market_regime.get("regime", "UNKNOWN") if market_regime else "UNKNOWN"
+    c_market_gate = bool(is_market_bullish)
+    c_rs_leader = bool(bar["Is_RS_Leader"]) if "Is_RS_Leader" in bar else True
+    c_squeeze = bool(bar["Is_Squeeze"]) if "Is_Squeeze" in bar else True
+
+    # Technical Condition checks
     c_true_ohlc = bool(has_true_ohlc)
     c_trend = price > ema20 and ema20 > ema50
     c_macd_turn = macd_hist > prev_macd_hist
@@ -129,15 +162,17 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
         strategy = "BREAKOUT"
         entry_min = round(max(res20 * 0.995, price - 0.3 * atr), 2)
         entry_max = round(max(price, res20 * 1.01), 2)
-        invalidation = round(min(res20 - 0.8 * atr, ema20 - 0.3 * atr), 2)
-        tp1 = round(entry_max + 1.2 * atr, 2)
-        tp2 = round(entry_max + 2.4 * atr, 2)
-
-        risk = entry_max - invalidation
+        invalidation = round(res20 - 0.8 * atr, 2)
+        risk = max(entry_max - invalidation, 0.01)
+        tp1 = round(entry_max + max(1.35 * risk, 1.4 * atr), 2)
+        tp2 = round(entry_max + max(2.5 * risk, 2.6 * atr), 2)
         rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
         rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
 
         checklist = {
+            "Macro Market Gate (KSE-100 > 50 EMA)": c_market_gate,
+            "Relative Strength Leader (vs KSE-100)": c_rs_leader,
+            "Volatility Compression (Tight Base)": c_squeeze,
             "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
             "Trend Alignment (Price > 20 & 50 EMA)": c_trend,
             "Resistance Test / Clearance": c_breakout_level,
@@ -151,7 +186,16 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
         # Status determination (gated strictly on ALL checklist conditions)
         if all(checklist.values()):
             status = "TRIGGERED"
-            trigger_note = f"All criteria verified: daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume and R:R {rr_tp1}:1."
+            trigger_note = f"All criteria verified: daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume, RS leadership, tight base, and R:R {rr_tp1}:1."
+        elif not c_market_gate:
+            status = "WATCHING"
+            trigger_note = f"Disqualified from TRIGGERED: Broad market in correction ({regime_name}). Long breakouts suppressed to preserve cash."
+        elif not c_rs_leader:
+            status = "WATCHING"
+            trigger_note = "Disqualified from TRIGGERED: Stock is lagging behind KSE-100 index (lack of institutional sponsorship)."
+        elif not c_squeeze:
+            status = "WATCHING"
+            trigger_note = "Disqualified from TRIGGERED: Volatility is loose/erratic. Setup requires tight volatility compression base before breakout."
         elif not c_true_ohlc:
             status = "WATCHING"
             trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and resistance levels cannot be reliably calculated."
@@ -190,6 +234,8 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
             "atr": round(atr, 2),
             "vol_ratio": round(volume / vol_ma, 2),
             "has_true_ohlc": c_true_ohlc,
+            "is_rs_leader": c_rs_leader,
+            "is_squeeze": c_squeeze,
         }
 
     # --- STRATEGY 2: Pullback to 20 EMA / Support ---
@@ -199,17 +245,18 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
         strategy = "PULLBACK"
         entry_min = round(min(ema20 - 0.2 * atr, price * 0.99), 2)
         entry_max = round(max(price, ema20 + 0.2 * atr), 2)
-        invalidation = round(min(ema50 - 0.2 * atr, entry_min - 0.9 * atr), 2)
-        tp1 = round(entry_max + 1.2 * atr, 2)
-        tp2 = round(entry_max + 2.2 * atr, 2)
-
-        risk = entry_max - invalidation
+        invalidation = round(ema20 - 0.8 * atr, 2)
+        risk = max(entry_max - invalidation, 0.01)
+        tp1 = round(entry_max + max(1.35 * risk, 1.4 * atr), 2)
+        tp2 = round(entry_max + max(2.5 * risk, 2.6 * atr), 2)
         rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
         rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
 
         c_bounce_candle = price >= open_price  # Green close off support
 
         checklist = {
+            "Macro Market Gate (KSE-100 > 50 EMA)": c_market_gate,
+            "Relative Strength Leader (vs KSE-100)": c_rs_leader,
             "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
             "Macro Trend Intact (Price > 50 EMA)": price > ema50,
             "Testing 20 EMA Support Zone": True,
@@ -223,7 +270,13 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
         # Status determination (gated strictly on ALL checklist conditions)
         if all(checklist.values()):
             status = "TRIGGERED"
-            trigger_note = f"All criteria verified: bullish bounce at 20 EMA ({ema20:.2f}) with stabilizing MACD and R:R {rr_tp1}:1."
+            trigger_note = f"All criteria verified: bullish bounce at 20 EMA ({ema20:.2f}) with RS leadership, stabilizing MACD, and R:R {rr_tp1}:1."
+        elif not c_market_gate:
+            status = "WATCHING"
+            trigger_note = f"Disqualified from TRIGGERED: Broad market in correction ({regime_name}). Long pullbacks suppressed to preserve cash."
+        elif not c_rs_leader:
+            status = "WATCHING"
+            trigger_note = "Disqualified from TRIGGERED: Stock is lagging behind KSE-100 index."
         elif not c_true_ohlc:
             status = "WATCHING"
             trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and stop-loss distance cannot be reliably calculated."
@@ -259,6 +312,8 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
             "atr": round(atr, 2),
             "vol_ratio": round(volume / vol_ma, 2),
             "has_true_ohlc": c_true_ohlc,
+            "is_rs_leader": c_rs_leader,
+            "is_squeeze": c_squeeze,
         }
 
     # Default: No clear actionable setup
@@ -282,7 +337,13 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc
     }
 
 
-def generate_signal(symbol: str, df: pd.DataFrame, data_meta: dict = None) -> dict:
+def generate_signal(
+    symbol: str,
+    df: pd.DataFrame,
+    data_meta: dict = None,
+    df_kse: pd.DataFrame = None,
+    market_regime: dict = None,
+) -> dict:
     """
     Evaluates the latest completed session and formats a comprehensive setup package.
     """
@@ -290,8 +351,13 @@ def generate_signal(symbol: str, df: pd.DataFrame, data_meta: dict = None) -> di
         return {}
 
     has_true_ohlc = data_meta.get("has_true_ohlc", True) if data_meta else True
-    df_ind = compute_all_indicators(df)
-    setup = evaluate_bar_strategy(df_ind, bar_idx=-1, has_true_ohlc=has_true_ohlc)
+    df_ind = compute_all_indicators(df, df_kse=df_kse)
+    setup = evaluate_bar_strategy(
+        df_ind,
+        bar_idx=-1,
+        has_true_ohlc=has_true_ohlc,
+        market_regime=market_regime,
+    )
     setup["symbol"] = symbol
     setup["df_indicators"] = df_ind
     setup["has_true_ohlc"] = has_true_ohlc

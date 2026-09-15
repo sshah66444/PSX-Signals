@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data_engine import get_watchlist, fetch_psx_stock
+from data_engine import get_watchlist, fetch_psx_stock, fetch_kse100_index
 from signal_engine import generate_signal, format_actionable_card
 from chart_engine import create_signal_chart
 from backtester import run_signal_backtest
@@ -36,7 +36,23 @@ st.markdown("""
     .sub-header {
         color: #90a4ae;
         font-size: 0.95rem;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.0rem;
+    }
+    .macro-banner-bull {
+        background: linear-gradient(90deg, #064e3b, #047857);
+        border: 1px solid #10b981;
+        border-radius: 8px;
+        padding: 12px 18px;
+        margin-bottom: 1.2rem;
+        color: #ecfdf5;
+    }
+    .macro-banner-bear {
+        background: linear-gradient(90deg, #450a0a, #7f1d1d);
+        border: 1px solid #ef4444;
+        border-radius: 8px;
+        padding: 12px 18px;
+        margin-bottom: 1.2rem;
+        color: #fef2f2;
     }
     .signal-card {
         background-color: #0f172a;
@@ -82,28 +98,42 @@ selected_period_label = st.sidebar.selectbox("Lookback Period:", list(period_opt
 period = period_options[selected_period_label]
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🛡️ Risk Management Parameters")
+st.sidebar.markdown("### 🛡️ Risk & Strategy Controls")
 broker_fee = st.sidebar.slider("Broker Fee + Taxes (% round-trip):", min_value=0.10, max_value=1.0, value=0.35, step=0.05)
+time_stop_limit = st.sidebar.slider("Time-Stop Exit (Bars Stalled):", min_value=0, max_value=10, value=4, step=1, help="Exits trades that stall for N bars without momentum follow-through.")
 holding_limit = st.sidebar.slider("Max Holding Days (Backtest):", min_value=5, max_value=40, value=20, step=5)
+apply_macro_gate = st.sidebar.checkbox("Enforce KSE-100 Macro Gate", value=True, help="Suppresses long breakout entries when KSE-100 is in correction.")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_cached_stock_data(symbol: str, period: str = "6mo", force_refresh: bool = False) -> dict:
     """Cached accessor for PSX market data with a 15-minute TTL."""
     return fetch_psx_stock(symbol, period=period, force_refresh=force_refresh)
 
+@st.cache_data(ttl=900, show_spinner=False)
+def get_cached_kse100(force_refresh: bool = False):
+    """Cached accessor for KSE-100 index timeseries and macro regime."""
+    return fetch_kse100_index(force_refresh=force_refresh)
+
 
 # ----------------- DATA LOADING -----------------
-with st.spinner(f"Fetching real market data for {active_symbol}..."):
+with st.spinner(f"Fetching real market data for {active_symbol} and KSE-100 benchmark..."):
     stock_res = get_cached_stock_data(active_symbol, period=period)
+    df_kse, regime_info = get_cached_kse100()
 
 df_stock = stock_res.get("df")
 data_source = stock_res.get("source", "None")
 last_session = stock_res.get("last_date", "N/A")
 data_age = stock_res.get("data_age_days", 999)
 
-signal_data = generate_signal(active_symbol, df_stock, data_meta=stock_res) if df_stock is not None else {}
+signal_data = generate_signal(
+    active_symbol,
+    df_stock,
+    data_meta=stock_res,
+    df_kse=df_kse,
+    market_regime=regime_info if apply_macro_gate else None,
+) if df_stock is not None else {}
 
-# ----------------- HEADER -----------------
+# ----------------- HEADER & MACRO REGIME BANNER -----------------
 company_info = watchlist.get(active_symbol, {"name": f"{active_symbol} (Custom PSX Stock)", "sector": "Equities"})
 
 col_title, col_status = st.columns([3, 1])
@@ -113,12 +143,36 @@ with col_title:
 
 with col_status:
     if stock_res.get("status") == "OK":
-        st.caption(f"Source: **{data_source}**")
+        st.caption(f"Stock Data: **{data_source}**")
         st.caption(f"Last Session: **{last_session}** (Age: {data_age}d)")
         if not stock_res.get("has_true_ohlc", True):
             st.warning("⚠️ **Approximated OHLC**: Data source provides Close/Open only. Setups requiring true intraday ranges (ATR, SL) are disqualified from TRIGGERED.")
     else:
         st.error(stock_res.get("error", "Data unavailable"))
+
+# Macro Market Health Banner
+if regime_info.get("is_bullish"):
+    st.markdown(
+        f"""
+        <div class="macro-banner-bull">
+            <b>🟢 Macro Market Regime: BULL MARKET</b><br>
+            KSE-100 Closed at <b>{regime_info['close']:,.2f}</b> (above 50 EMA: <b>{regime_info['ema50']:,.2f}</b> | 200 EMA: <b>{regime_info['ema200']:,.2f}</b>).<br>
+            <span style="font-size: 0.88rem; opacity: 0.95;">Institutional participation is favorable. Full breakout and pullback triggers enabled.</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f"""
+        <div class="macro-banner-bear">
+            <b>🔴 Macro Market Regime: MARKET CORRECTION (Cash Preservation Mode)</b><br>
+            KSE-100 Closed at <b>{regime_info['close']:,.2f}</b> (below 50 EMA: <b>{regime_info['ema50']:,.2f}</b>).<br>
+            <span style="font-size: 0.88rem; opacity: 0.95;">Long breakouts are strictly suppressed across the screener. In a correcting market, cash is a valid defensive position.</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ----------------- TABS -----------------
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -190,7 +244,13 @@ with tab2:
         res = get_cached_stock_data(sym, period="3mo", force_refresh=force_refresh_scan)
         if res.get("status") == "OK":
             df_sym = res["df"]
-            sig = generate_signal(sym, df_sym, data_meta=res)
+            sig = generate_signal(
+                sym,
+                df_sym,
+                data_meta=res,
+                df_kse=df_kse,
+                market_regime=regime_info if apply_macro_gate else None,
+            )
             if sig:
                 scan_records.append({
                     "Symbol": sym,
@@ -199,6 +259,8 @@ with tab2:
                     "Price (PKR)": sig["price"],
                     "Strategy": sig["strategy"],
                     "Status": sig["status"],
+                    "RS vs KSE-100": "🟢 Leader" if sig.get("is_rs_leader") else "🔴 Lagging",
+                    "Volatility Base": "🟢 Tight Base" if sig.get("is_squeeze") else "⚪ Loose",
                     "Entry Range": f"{sig.get('entry_min', 0):.2f} – {sig.get('entry_max', 0):.2f}",
                     "Stop Loss": sig.get("stop_loss", 0),
                     "TP1": sig.get("tp1", 0),
@@ -215,6 +277,8 @@ with tab2:
                 "Price (PKR)": "-",
                 "Strategy": "-",
                 "Status": "UNAVAILABLE",
+                "RS vs KSE-100": "-",
+                "Volatility Base": "-",
                 "Entry Range": "-",
                 "Stop Loss": "-",
                 "TP1": "-",
@@ -256,7 +320,7 @@ with tab3:
     st.markdown(f"### 🧪 Rigorous Historical Simulation for {active_symbol}")
     st.markdown(
         "Uses the **exact same strategy rules** as the live screener. "
-        f"Tracks independent TP1 & TP2 targets, detects ambiguous candles, and deducts **{broker_fee}% round-trip costs**."
+        f"Tracks independent TP1 & TP2 targets, detects ambiguous candles, enforces time-stops, and deducts **{broker_fee}% round-trip costs**."
     )
 
     if df_stock is None:
@@ -267,6 +331,8 @@ with tab3:
             symbol=active_symbol,
             holding_max_bars=holding_limit,
             broker_fee_pct=broker_fee,
+            df_kse=df_kse if apply_macro_gate else None,
+            time_stop_bars=time_stop_limit,
         )
 
         if "error" in bt_results:
@@ -274,7 +340,7 @@ with tab3:
         elif bt_results.get("resolved_trades", 0) == 0 and bt_results.get("unresolved_trades", 0) == 0:
             st.info("No trade signals triggered for this stock during this historical lookback period.")
         else:
-            b1, b2, b3, b4, b5 = st.columns(5)
+            b1, b2, b3, b4, b5, b6 = st.columns(6)
             with b1:
                 st.metric("Total Setups Triggered", bt_results["total_triggered"])
             with b2:
@@ -284,7 +350,16 @@ with tab3:
             with b4:
                 st.metric("Stop Loss Hit Rate", f"{bt_results['stop_loss_rate_pct']}%")
             with b5:
+                st.metric("Time-Stop Exits", bt_results.get("time_stop_hits", 0))
+            with b6:
                 st.metric("Net Strategy P&L", f"{bt_results['net_pnl_pct']:+.2f}%")
+
+            st.caption(
+                f"📊 **Profit Factor:** {bt_results.get('profit_factor', 0.0)} | "
+                f"**Max Drawdown:** {bt_results.get('max_drawdown_pct', 0.0)}% | "
+                f"**Avg Trade P&L:** {bt_results.get('avg_trade_pnl_pct', 0.0):+.2f}% | "
+                f"**Macro Filter:** {'Active (KSE-100)' if apply_macro_gate else 'Disabled'}"
+            )
 
             if bt_results["ambiguous_trades"] > 0:
                 st.warning(
@@ -346,7 +421,7 @@ with tab4:
 
 # ----------------- TAB 5: EDUCATIONAL GUIDE -----------------
 with tab5:
-    st.markdown("### 📚 Realities of PSX Trading")
+    st.markdown("### 📚 Realities & Quantitative Edge of PSX Trading")
     st.markdown("""
     #### 1. Why We Require Data Integrity
     Fabricated or synthetic data destroys trader trust. A trade alert is only as dependable as the quote on which it was generated.
@@ -360,4 +435,10 @@ with tab5:
     * Small targets (2-3%) hit frequently due to market noise.
     * A system with 60% win rate can lose money if the average loss (-6%) is twice the size of the average gain (+3%).
     * Strict minimum Risk-to-Reward filters (>= 1.2:1 to 1.5:1) are mandatory to achieve long-term positive expectancy.
+
+    #### 4. The Positive-Expectancy Edge (Institutional Quantitative Framework)
+    * **Macro Market Gate (KSE-100)**: Over 75% of individual equity movements are tied to broad market beta. When the KSE-100 index trades below its 50 EMA, breakouts suffer high failure rates and pullbacks turn into deep traps. Suppressing long breakouts during corrections preserves cash and avoids severe drawdowns.
+    * **Relative Strength (RS vs KSE-100)**: Institutional accumulation drives market leadership. We calculate the price ratio of each stock relative to the KSE-100 benchmark; only stocks demonstrating expanding relative strength are permitted to trigger.
+    * **Volatility Compression Squeeze**: Breakouts that emerge from wide, erratic fluctuations have low follow-through. By measuring Bollinger Bandwidth compression against the 60-day range, we ensure entry occurs as volatility coils before an explosive directional thrust.
+    * **Disciplined Time-Stops (4-Bar Rule)**: In ready market swing trading (T+2 settlement), genuine breakout momentum expands immediately. Positions that languish for 4 sessions without reaching TP1 are closed as stalled momentum, eliminating capital tie-up and preventing rolling declines.
     """)

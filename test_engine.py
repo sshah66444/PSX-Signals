@@ -266,6 +266,60 @@ def test_sqlite_wal_mode():
     print(f"  ✓ SQLite WAL mode active ({mode.upper()}) with {timeout}ms busy timeout.")
 
 
+def test_kse100_macro_and_relative_strength(df):
+    print("8. Testing KSE-100 index feed, Macro Market Gate, & Relative Strength...")
+    from data_engine import fetch_kse100_index
+    df_kse, regime = fetch_kse100_index()
+    assert df_kse is not None and not df_kse.empty, "KSE-100 index dataframe must not be empty"
+    assert len(df_kse) >= 50, "KSE-100 index must have at least 50 historical sessions"
+    assert "regime" in regime, "regime dict must contain 'regime'"
+    assert regime["regime"] in ["BULL_MARKET", "RECOVERY_ZONE", "MARKET_CORRECTION"]
+    assert "close" in regime and regime["close"] > 0
+    assert "ema50" in regime and regime["ema50"] > 0
+
+    # Indicator computation with KSE-100 benchmark
+    df_ind = compute_all_indicators(df, df_kse=df_kse)
+    assert "RS_Ratio" in df_ind.columns, "Relative strength ratio must be computed"
+    assert "RS_MA20" in df_ind.columns, "Relative strength 20-day moving average must be computed"
+    assert "Is_RS_Leader" in df_ind.columns, "Relative strength leadership flag must be present"
+    assert "Is_Squeeze" in df_ind.columns, "Bollinger squeeze compression flag must be present"
+
+    # Test Macro Gate Disqualification: Bearish market must suppress TRIGGERED status
+    bearish_regime = {
+        "regime": "MARKET_CORRECTION",
+        "is_bullish": False,
+        "close": 150000.0,
+        "ema50": 160000.0,
+    }
+    setup_bear = evaluate_bar_strategy(df_ind, bar_idx=-1, has_true_ohlc=True, market_regime=bearish_regime)
+    assert setup_bear["status"] != "TRIGGERED", "Signal must NEVER trigger when KSE-100 is in MARKET_CORRECTION"
+    if setup_bear.get("strategy") in ["BREAKOUT", "PULLBACK"]:
+        assert setup_bear["checklist"].get("Macro Market Gate (KSE-100 > 50 EMA)") is False
+        assert "correction" in setup_bear["trigger_note"].lower() or "suppressed" in setup_bear["trigger_note"].lower()
+
+    print(f"  ✓ KSE-100 Macro Gate & RS passed (KSE-100: {regime['close']:,.2f} | Regime: {regime['regime']}).")
+
+
+def test_time_stop_exit():
+    print("9. Testing Time-Stop Rule (Exit stalled positions after N bars)...")
+    cache_sys = os.path.join(os.path.dirname(__file__), ".cache", "SYS_real.csv")
+    assert os.path.exists(cache_sys), "SYS_real.csv cache file must exist"
+    df_sys = pd.read_csv(cache_sys, index_col=0, parse_dates=True)
+
+    bt = run_signal_backtest(df_sys, symbol="SYS", holding_max_bars=20, time_stop_bars=4)
+    assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
+    assert bt["total_triggered"] >= 1, "Should have triggered setups in SYS"
+    assert bt.get("time_stop_hits", 0) >= 1, "Should have triggered at least one time-stop exit"
+
+    trades = bt["trades_df"]
+    stalled_trades = trades[trades["outcome"].str.contains("TIME-STOP")]
+    assert not stalled_trades.empty, "Must have recorded at least one TIME-STOP exit in trades_df"
+    first_stalled = stalled_trades.iloc[0]
+    assert first_stalled["bars_held"] >= 4, f"Time stop should trigger at >= 4 bars, held: {first_stalled['bars_held']}"
+    assert not bool(first_stalled["tp1_reached"]), "Time-stopped trade must not have reached TP1"
+    print(f"  ✓ Time-Stop Rule passed ({len(stalled_trades)} stalled trade(s) exited cleanly at >= 4 bars).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -276,4 +330,6 @@ if __name__ == "__main__":
     test_pkt_timezone_conversion()
     test_backtester_same_bar_breakeven()
     test_sqlite_wal_mode()
+    test_kse100_macro_and_relative_strength(df_test)
+    test_time_stop_exit()
     print("=== All Verification Tests Passed Successfully! ===")
