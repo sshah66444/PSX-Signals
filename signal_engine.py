@@ -120,6 +120,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
     c_volume_surge = volume >= (1.20 * vol_ma)
     c_rsi_healthy = 42.0 <= rsi <= 68.0
     c_breakout_level = price >= res20
+    c_liquidity = vol_ma >= 80_000
 
     # --- STRATEGY 1: 20-Day Range Breakout ---
     dist_to_res = (res20 - price) / price
@@ -139,18 +140,22 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
             "Trend Alignment (Price > 20 & 50 EMA)": c_trend,
             "Resistance Test / Clearance": c_breakout_level,
             "Volume Surge (Vol >= 1.20x 20MA)": c_volume_surge,
+            "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
             "Momentum Health (MACD Histogram Expanding)": c_macd_turn,
             "Healthy RSI Range (42 - 68)": c_rsi_healthy,
             "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
         }
 
         # Status determination
-        if c_breakout_level and c_volume_surge and c_macd_turn:
+        if c_breakout_level and c_volume_surge and c_macd_turn and c_liquidity:
             status = "TRIGGERED"
             trigger_note = f"Daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume."
         elif c_breakout_level and not c_volume_surge:
             status = "WATCHING"
             trigger_note = f"Price cleared resistance ({res20:.2f}), but volume ({volume/vol_ma:.1f}x MA) requires confirmation."
+        elif not c_liquidity:
+            status = "WATCHING"
+            trigger_note = f"Approaching resistance ({res20:.2f}), but average liquidity ({vol_ma:.0f} shares) is below 80k threshold."
         else:
             status = "WATCHING"
             trigger_note = f"Approaching 20-day resistance ({res20:.2f}). Waiting for close breakout with volume."
@@ -195,15 +200,19 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         checklist = {
             "Macro Trend Intact (Price > 50 EMA)": price > ema50,
             "Testing 20 EMA Support Zone": True,
+            "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
             "Cooling RSI (< 58, Not Overbought)": rsi < 58,
             "Bounce Confirmation (Bullish Close)": c_bounce_candle,
             "MACD Momentum Stabilization": c_macd_turn,
             "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
         }
 
-        if c_bounce_candle and c_macd_turn:
+        if c_bounce_candle and c_macd_turn and c_liquidity:
             status = "TRIGGERED"
             trigger_note = f"Bullish bounce confirmed at 20 EMA ({ema20:.2f}) with stabilizing MACD."
+        elif not c_liquidity:
+            status = "WATCHING"
+            trigger_note = f"Testing 20 EMA support, but liquidity ({vol_ma:.0f} shares) is below 80k threshold."
         else:
             status = "WATCHING"
             trigger_note = f"Testing 20 EMA support ({ema20:.2f}). Waiting for bullish reversal confirmation."

@@ -12,28 +12,104 @@ import pandas as pd
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Prominent PSX tickers across key sectors
+# Top 65 Most Liquid & Active PSX Stocks across All Core Sectors
 PSX_WATCHLIST = {
+    # --- Oil & Gas Exploration (E&P) ---
     "OGDC": {"name": "Oil & Gas Development Company Limited", "sector": "Oil & Gas Exploration"},
     "PPL": {"name": "Pakistan Petroleum Limited", "sector": "Oil & Gas Exploration"},
-    "SYS": {"name": "Systems Limited", "sector": "Technology"},
-    "LUCK": {"name": "Lucky Cement Limited", "sector": "Cement"},
-    "ENGRO": {"name": "Engro Corporation Limited", "sector": "Fertilizer / Conglomerate"},
-    "FFC": {"name": "Fauji Fertilizer Company Limited", "sector": "Fertilizer"},
-    "HUBC": {"name": "The Hub Power Company Limited", "sector": "Power Generation"},
-    "MCB": {"name": "MCB Bank Limited", "sector": "Commercial Banks"},
+    "MARI": {"name": "Mari Petroleum Company Limited", "sector": "Oil & Gas Exploration"},
+    "POL": {"name": "Pakistan Oilfields Limited", "sector": "Oil & Gas Exploration"},
+
+    # --- Commercial & Islamic Banks ---
     "MEBL": {"name": "Meezan Bank Limited", "sector": "Islamic Commercial Banks"},
+    "MCB": {"name": "MCB Bank Limited", "sector": "Commercial Banks"},
     "UBL": {"name": "United Bank Limited", "sector": "Commercial Banks"},
-    "PSO": {"name": "Pakistan State Oil Company", "sector": "Oil & Gas Marketing"},
-    "ATRL": {"name": "Attock Refinery Limited", "sector": "Refinery"},
-    "DGKC": {"name": "D.G. Khan Cement Company", "sector": "Cement"},
+    "HBL": {"name": "Habib Bank Limited", "sector": "Commercial Banks"},
+    "BAFL": {"name": "Bank Alfalah Limited", "sector": "Commercial Banks"},
+    "BAHL": {"name": "Bank AL Habib Limited", "sector": "Commercial Banks"},
+    "FABL": {"name": "Faysal Bank Limited", "sector": "Islamic Commercial Banks"},
+    "BIPL": {"name": "BankIslami Pakistan Limited", "sector": "Islamic Commercial Banks"},
+    "AKBL": {"name": "Askari Bank Limited", "sector": "Commercial Banks"},
+    "NBP": {"name": "National Bank of Pakistan", "sector": "Commercial Banks"},
+
+    # --- Fertilizer ---
+    "FFC": {"name": "Fauji Fertilizer Company Limited", "sector": "Fertilizer"},
     "EFERT": {"name": "Engro Fertilizers Limited", "sector": "Fertilizer"},
-    "PIOC": {"name": "Pioneer Cement Limited", "sector": "Cement"},
-    "SEARL": {"name": "The Searle Company Limited", "sector": "Pharmaceuticals"},
-    "TRG": {"name": "TRG Pakistan Limited", "sector": "Technology"},
-    "PRL": {"name": "Pakistan Refinery Limited", "sector": "Refinery"},
+    "ENGRO": {"name": "Engro Corporation Limited", "sector": "Fertilizer / Conglomerate"},
+    "FATIMA": {"name": "Fatima Fertilizer Company Limited", "sector": "Fertilizer"},
+    "FFBL": {"name": "Fauji Fertilizer Bin Qasim Limited", "sector": "Fertilizer"},
+
+    # --- Cement ---
+    "LUCK": {"name": "Lucky Cement Limited", "sector": "Cement"},
+    "DGKC": {"name": "D.G. Khan Cement Company", "sector": "Cement"},
     "MLCF": {"name": "Maple Leaf Cement Factory", "sector": "Cement"},
+    "PIOC": {"name": "Pioneer Cement Limited", "sector": "Cement"},
+    "CHCC": {"name": "Cherat Cement Company Limited", "sector": "Cement"},
+    "FCCL": {"name": "Fauji Cement Company Limited", "sector": "Cement"},
+    "KOHC": {"name": "Kohat Cement Company Limited", "sector": "Cement"},
+    "POWER": {"name": "Power Cement Limited", "sector": "Cement"},
+
+    # --- Technology & Telecommunication ---
+    "SYS": {"name": "Systems Limited", "sector": "Technology"},
+    "TRG": {"name": "TRG Pakistan Limited", "sector": "Technology"},
+    "AVN": {"name": "Avanceon Limited", "sector": "Technology"},
+    "AIRLINK": {"name": "Air Link Communication Limited", "sector": "Technology"},
+    "PTC": {"name": "Pakistan Telecommunication Company", "sector": "Telecommunication"},
+    "NETSOL": {"name": "NetSol Technologies Limited", "sector": "Technology"},
+    "OCTOPUS": {"name": "Octopus Digital Limited", "sector": "Technology"},
+    "WTL": {"name": "WorldCall Telecom Limited", "sector": "Telecommunication"},
+
+    # --- Power Generation & Distribution ---
+    "HUBC": {"name": "The Hub Power Company Limited", "sector": "Power Generation"},
+    "KAPCO": {"name": "Kot Addu Power Company Limited", "sector": "Power Generation"},
+    "KEL": {"name": "K-Electric Limited", "sector": "Power Distribution"},
+    "NCPL": {"name": "Nishat Chunian Power Limited", "sector": "Power Generation"},
+    "NPL": {"name": "Nishat Power Limited", "sector": "Power Generation"},
+
+    # --- Oil & Gas Marketing (OMCs) & Distribution ---
+    "PSO": {"name": "Pakistan State Oil Company", "sector": "Oil & Gas Marketing"},
+    "APL": {"name": "Attock Petroleum Limited", "sector": "Oil & Gas Marketing"},
+    "SHEL": {"name": "Shell Pakistan Limited", "sector": "Oil & Gas Marketing"},
+    "SNGP": {"name": "Sui Northern Gas Pipelines Limited", "sector": "Gas Distribution"},
+    "SSGC": {"name": "Sui Southern Gas Company Limited", "sector": "Gas Distribution"},
+    "HASCOL": {"name": "Hascol Petroleum Limited", "sector": "Oil & Gas Marketing"},
+
+    # --- Refineries ---
+    "ATRL": {"name": "Attock Refinery Limited", "sector": "Refinery"},
+    "PRL": {"name": "Pakistan Refinery Limited", "sector": "Refinery"},
+    "NRL": {"name": "National Refinery Limited", "sector": "Refinery"},
+    "CYNERGICO": {"name": "Cynergico PK Limited", "sector": "Refinery"},
+
+    # --- Pharmaceuticals & Chemicals ---
+    "SEARL": {"name": "The Searle Company Limited", "sector": "Pharmaceuticals"},
+    "AGP": {"name": "AGP Limited", "sector": "Pharmaceuticals"},
+    "CPHL": {"name": "Citi Pharma Limited", "sector": "Pharmaceuticals"},
+    "GLAXO": {"name": "GlaxoSmithKline Pakistan", "sector": "Pharmaceuticals"},
+    "HINOON": {"name": "Highnoon Laboratories Limited", "sector": "Pharmaceuticals"},
+    "LOTCHEM": {"name": "Lotte Chemical Pakistan Limited", "sector": "Chemicals"},
+    "EPCL": {"name": "Engro Polymer & Chemicals Limited", "sector": "Chemicals"},
+    "GLL": {"name": "Ghani Global Limited", "sector": "Chemicals"},
+
+    # --- Automobile & Engineering ---
+    "MTL": {"name": "Millat Tractors Limited", "sector": "Automobile Assembler"},
+    "INDU": {"name": "Indus Motor Company Limited", "sector": "Automobile Assembler"},
+    "SAZEW": {"name": "Sazgar Engineering Works", "sector": "Automobile Assembler"},
+    "AGTL": {"name": "Al-Ghazi Tractors Limited", "sector": "Automobile Assembler"},
+    "THALL": {"name": "Thal Limited", "sector": "Automobile Parts"},
+    "MUGHAL": {"name": "Mughal Iron & Steel Industries", "sector": "Engineering / Steel"},
+    "ISL": {"name": "International Steels Limited", "sector": "Engineering / Steel"},
+    "INIL": {"name": "International Industries Limited", "sector": "Engineering / Steel"},
+    "TGL": {"name": "Tariq Glass Industries Limited", "sector": "Glass & Ceramics"},
+
+    # --- Textile, Packaging & Consumer Foods ---
+    "NML": {"name": "Nishat Mills Limited", "sector": "Textile Composite"},
+    "ILP": {"name": "Interloop Limited", "sector": "Textile Composite"},
+    "KTML": {"name": "Kohinoor Textile Mills Limited", "sector": "Textile Composite"},
+    "GATM": {"name": "Gul Ahmed Textile Mills Limited", "sector": "Textile Composite"},
     "IPAK": {"name": "International Packaging Films Limited", "sector": "Packaging"},
+    "UNITY": {"name": "Unity Foods Limited", "sector": "Food & Personal Care"},
+    "FCEPL": {"name": "FrieslandCampina Engro Pakistan", "sector": "Food & Personal Care"},
+    "NATF": {"name": "National Foods Limited", "sector": "Food & Personal Care"},
 }
 
 
