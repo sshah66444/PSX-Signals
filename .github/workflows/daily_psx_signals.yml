@@ -4,7 +4,10 @@ on:
   schedule:
     # Runs Monday through Friday at 11:30 UTC (4:30 PM Pakistan Time - right after PSX closes)
     - cron: '30 11 * * 1-5'
-  workflow_dispatch: # Allows manual trigger anytime from GitHub UI or GitHub Mobile app
+  workflow_dispatch: # Allows manual trigger anytime from GitHub UI or mobile app
+
+permissions:
+  contents: write
 
 jobs:
   scan-and-notify:
@@ -25,9 +28,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run PSX Screener & Send Telegram Signals
+      - name: Check Interactive Commands & Run PSX Daily Scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python telegram_notifier.py --lang english
+          # Process any pending interactive user commands first
+          python telegram_notifier.py --check-commands
+          # Execute daily market scan and lifecycle audit
+          python telegram_notifier.py
+
+      - name: Persist Signal Ledger (signals.db)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add signals.db
+          git diff --staged --quiet || (git commit -m "Update persistent signal ledger [skip ci]" && git push)

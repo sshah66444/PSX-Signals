@@ -1,6 +1,7 @@
 """
 app.py
-PSX AlphaSignals — Technical Screener & Signal Generator Web Dashboard.
+PSX AlphaSignals — Professional Screener, Signal Engine & Audited Ledger.
+Built with real PSX market data, transparent condition checklists, and strict accounting.
 """
 
 import streamlit as st
@@ -8,13 +9,14 @@ import pandas as pd
 import plotly.express as px
 
 from data_engine import get_watchlist, fetch_psx_stock
-from signal_engine import generate_signal
+from signal_engine import generate_signal, format_actionable_card
 from chart_engine import create_signal_chart
 from backtester import run_signal_backtest
+from signal_tracker import get_active_signals, get_performance_summary
 
 # Set page configuration
 st.set_page_config(
-    page_title="PSX AlphaSignals | Screener & Signal Engine",
+    page_title="PSX AlphaSignals | Professional Screener & Signal Engine",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -36,48 +38,24 @@ st.markdown("""
         font-size: 0.95rem;
         margin-bottom: 1.5rem;
     }
-    .metric-card {
-        background-color: #1e293b;
-        border-radius: 10px;
-        padding: 16px;
-        border: 1px solid #334155;
-        text-align: center;
-    }
-    .signal-box {
+    .signal-card {
         background-color: #0f172a;
         border: 1px solid #1e293b;
         border-left: 4px solid #00e676;
         border-radius: 8px;
         padding: 16px;
-        font-family: 'Courier New', Courier, monospace;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         color: #eceff1;
-        white-space: pre-wrap;
-        font-size: 0.88rem;
-        line-height: 1.5;
+        font-size: 0.92rem;
+        line-height: 1.6;
     }
-    .tag-buy {
-        background-color: #1b5e20;
-        color: #a5d6a7;
-        padding: 4px 10px;
-        border-radius: 6px;
+    .chk-pass {
+        color: #00e676;
         font-weight: 600;
-        display: inline-block;
     }
-    .tag-risky {
-        background-color: #bf360c;
-        color: #ffccbc;
-        padding: 4px 10px;
-        border-radius: 6px;
+    .chk-fail {
+        color: #ef5350;
         font-weight: 600;
-        display: inline-block;
-    }
-    .tag-neutral {
-        background-color: #37474f;
-        color: #cfd8dc;
-        padding: 4px 10px;
-        border-radius: 6px;
-        font-weight: 600;
-        display: inline-block;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -86,12 +64,8 @@ st.markdown("""
 st.sidebar.markdown("## ⚙️ PSX Engine Controls")
 watchlist = get_watchlist()
 
-# Data feed toggle
-use_live = st.sidebar.toggle("🌐 Live PSX Feed (Yahoo / .KA)", value=True, help="Toggle between live market fetching and local offline data engine.")
-
-# Stock selection (default to IPAK as seen in screenshot)
 symbols = list(watchlist.keys())
-default_index = symbols.index("IPAK") if "IPAK" in symbols else 0
+default_index = symbols.index("OGDC") if "OGDC" in symbols else 0
 
 selected_symbol = st.sidebar.selectbox(
     "Select PSX Stock:",
@@ -112,14 +86,16 @@ st.sidebar.markdown("### 🛡️ Risk Management Parameters")
 broker_fee = st.sidebar.slider("Broker Fee + Taxes (% round-trip):", min_value=0.10, max_value=1.0, value=0.35, step=0.05)
 holding_limit = st.sidebar.slider("Max Holding Days (Backtest):", min_value=5, max_value=40, value=20, step=5)
 
-st.sidebar.markdown("---")
-st.sidebar.info("💡 **Tip**: Select **IPAK** to compare this system's output directly with the social media signal card.")
-
 # ----------------- DATA LOADING -----------------
-with st.spinner(f"Loading data for {active_symbol}..."):
-    df_stock, data_source = fetch_psx_stock(active_symbol, period=period, use_live=use_live)
+with st.spinner(f"Fetching real market data for {active_symbol}..."):
+    stock_res = fetch_psx_stock(active_symbol, period=period)
 
-signal_data = generate_signal(active_symbol, df_stock) if not df_stock.empty else {}
+df_stock = stock_res.get("df")
+data_source = stock_res.get("source", "None")
+last_session = stock_res.get("last_date", "N/A")
+data_age = stock_res.get("data_age_days", 999)
+
+signal_data = generate_signal(active_symbol, df_stock, data_meta=stock_res) if df_stock is not None else {}
 
 # ----------------- HEADER -----------------
 company_info = watchlist.get(active_symbol, {"name": f"{active_symbol} (Custom PSX Stock)", "sector": "Equities"})
@@ -130,92 +106,67 @@ with col_title:
     st.markdown(f'<div class="sub-header">{company_info["name"]} | Sector: <b>{company_info["sector"]}</b> | Ticker: <b>{active_symbol}</b></div>', unsafe_allow_html=True)
 
 with col_status:
-    st.caption(f"Source: **{data_source}**")
-    if signal_data:
-        st.caption(f"Last Updated: {signal_data.get('date_time')}")
+    if stock_res.get("status") == "OK":
+        st.caption(f"Source: **{data_source}**")
+        st.caption(f"Last Session: **{last_session}** (Age: {data_age}d)")
+    else:
+        st.error(stock_res.get("error", "Data unavailable"))
 
 # ----------------- TABS -----------------
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🎯 Stock Deep Dive & Signal Card",
-    "📊 PSX Watchlist Screener",
-    "🧪 Signal Accuracy Auditor (Backtester)",
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🎯 Actionable Setup & Checklist",
+    "📊 Real PSX Watchlist Screener",
+    "🧪 Historical Backtester (Rigorous)",
+    "📜 Live Bot Ledger (signals.db)",
     "📚 PSX Reality & Truth Guide",
 ])
 
-# ----------------- TAB 1: STOCK DEEP DIVE -----------------
+# ----------------- TAB 1: ACTIONABLE SETUP -----------------
 with tab1:
-    if not signal_data:
-        st.error(f"Could not compute signals for {active_symbol}. Please check historical data availability.")
+    if not signal_data or df_stock is None:
+        st.warning(f"Live market data unavailable for {active_symbol}. The system refuses to fabricate synthetic prices.")
     else:
-        # Metric cards
+        # Top Metrics Row
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
             st.metric("Current Price", f"PKR {signal_data['price']:.2f}")
         with m2:
-            st.metric("Signal Status", signal_data["signal_type"])
+            st.metric("Strategy", signal_data["strategy"].title())
         with m3:
-            st.metric("Quality Rating", signal_data["stars"])
+            st.metric("Status", signal_data["status"])
         with m4:
-            st.metric("TP1 Risk:Reward", f"{signal_data['rr_tp1']}:1")
+            st.metric("TP1 Reward:Risk", f"{signal_data.get('rr_tp1', 0)}:1")
         with m5:
             st.metric("RSI (14)", f"{signal_data['rsi']}")
 
         st.markdown("---")
 
-        col_chart, col_card = st.columns([1.6, 1.0])
+        col_chart, col_card = st.columns([1.6, 1.1])
 
         with col_chart:
-            st.markdown("#### 📈 Interactive Technical Chart")
+            st.markdown("#### 📈 Price Action & Key Levels")
             fig = create_signal_chart(signal_data["df_indicators"], signal_data, active_symbol)
             st.plotly_chart(fig, use_container_width=True)
 
-            # Indicator Summary Table
-            st.markdown("##### Key Indicator Metrics")
-            ind_df = pd.DataFrame([{
-                "Price": f"{signal_data['price']:.2f}",
-                "20 EMA": f"{signal_data['ema20']:.2f}",
-                "50 EMA": f"{signal_data['ema50']:.2f}",
-                "MACD": f"{signal_data['macd']:.2f}",
-                "MACD Signal": f"{signal_data['macd_signal']:.2f}",
-                "Histogram": f"{signal_data['macd_hist']:.2f}",
-                "RSI (14)": f"{signal_data['rsi']:.1f}",
-                "ATR (14)": f"{signal_data['atr']:.2f}",
-            }])
-            st.dataframe(ind_df, use_container_width=True, hide_index=True)
-
         with col_card:
-            st.markdown("#### 📱 Generated Trade Signal Card")
-            st.caption("Matches the exact format and wording seen in PSX trading groups.")
+            st.markdown("#### 📋 Actionable Setup Card")
+            card_html = format_actionable_card(signal_data, company_name=company_info["name"])
+            st.markdown(f'<div class="signal-card">{card_html}</div>', unsafe_allow_html=True)
 
-            card_lang = st.radio("Card Language:", ["Roman Urdu (Social Style)", "English (Analytical)"], horizontal=True)
+            st.markdown("---")
+            st.markdown("#### 🔍 Condition Checklist")
+            checklist = signal_data.get("checklist", {})
+            for rule, passed in checklist.items():
+                icon = "✅" if passed else "❌"
+                cls = "chk-pass" if passed else "chk-fail"
+                st.markdown(f"{icon} <span class='{cls}'>{rule}</span>", unsafe_allow_html=True)
 
-            if "Roman Urdu" in card_lang:
-                card_text = signal_data["card_roman_urdu"]
-            else:
-                card_text = signal_data["card_english"]
-
-            st.markdown(f'<div class="signal-box">{card_text}</div>', unsafe_allow_html=True)
-            st.text_area("Raw Text for Copying / Sharing:", value=card_text, height=140)
-
-            # Risk-Reward Inspection Alert
-            st.markdown("##### ⚖️ Mathematical Risk vs Reward Audit")
-            risk_pct = round((signal_data["risk_amount"] / signal_data["price"]) * 100, 1)
-            tp1_pct = round((signal_data["reward_tp1"] / signal_data["price"]) * 100, 1)
-
-            if signal_data["rr_tp1"] < 1.0:
-                st.warning(
-                    f"⚠️ **Inverted Risk-Reward Alert**: You are risking **{risk_pct}%** (to Stop Loss) to make **{tp1_pct}%** (on TP1). "
-                    f"After PSX broker commissions ({broker_fee}%) and Capital Gains Tax, your net edge on TP1 is marginal."
-                )
-            else:
-                st.success(
-                    f"✅ **Favorable Setup**: Reward ({tp1_pct}%) exceeds Risk ({risk_pct}%). Ratio: **{signal_data['rr_tp1']}:1**"
-                )
+            st.caption(f"Trigger Note: {signal_data.get('trigger_note')}")
 
 # ----------------- TAB 2: WATCHLIST SCREENER -----------------
 with tab2:
-    st.markdown("### 📊 PSX KSE Watchlist Screener")
-    st.caption("Scans 20 leading PSX equities simultaneously and classifies signal states in real time.")
+    st.markdown("### 📊 Real PSX Watchlist Screener")
+    st.caption("Scans 20 leading PSX equities using verified real prices (No synthetic data).")
 
     if st.button("🔄 Scan Entire PSX Watchlist Now"):
         st.cache_data.clear()
@@ -226,23 +177,40 @@ with tab2:
 
     for idx, sym in enumerate(symbols_list):
         progress_bar.progress((idx + 1) / len(symbols_list))
-        df_sym, _ = fetch_psx_stock(sym, period="3mo", use_live=use_live)
-        if not df_sym.empty and len(df_sym) > 20:
-            sig = generate_signal(sym, df_sym)
+        res = fetch_psx_stock(sym, period="3mo")
+        if res.get("status") == "OK":
+            df_sym = res["df"]
+            sig = generate_signal(sym, df_sym, data_meta=res)
             if sig:
                 scan_records.append({
                     "Symbol": sym,
                     "Company": watchlist[sym]["name"],
                     "Sector": watchlist[sym]["sector"],
                     "Price (PKR)": sig["price"],
-                    "Signal": sig["signal_type"],
-                    "Stars": sig["stars"],
-                    "Buy Zone": f"{sig['buy_zone_low']} - {sig['buy_zone_high']}",
-                    "Stop Loss": sig["stop_loss"],
-                    "TP1": sig["tp1"],
-                    "R:R (TP1)": f"{sig['rr_tp1']}:1",
+                    "Strategy": sig["strategy"],
+                    "Status": sig["status"],
+                    "Entry Range": f"{sig.get('entry_min', 0):.2f} – {sig.get('entry_max', 0):.2f}",
+                    "Stop Loss": sig.get("stop_loss", 0),
+                    "TP1": sig.get("tp1", 0),
+                    "R:R (TP1)": f"{sig.get('rr_tp1', 0)}:1",
                     "RSI": sig["rsi"],
+                    "Data Source": res["source"],
                 })
+        else:
+            scan_records.append({
+                "Symbol": sym,
+                "Company": watchlist[sym]["name"],
+                "Sector": watchlist[sym]["sector"],
+                "Price (PKR)": "-",
+                "Strategy": "-",
+                "Status": "UNAVAILABLE",
+                "Entry Range": "-",
+                "Stop Loss": "-",
+                "TP1": "-",
+                "R:R (TP1)": "-",
+                "RSI": "-",
+                "Data Source": "Offline / Skipped",
+            })
 
     progress_bar.empty()
 
@@ -252,127 +220,132 @@ with tab2:
         # Filters
         c_filter1, c_filter2 = st.columns([1, 1])
         with c_filter1:
-            signal_filter = st.selectbox(
-                "Filter by Signal Status:",
-                ["All", "STRONG BUY", "BUY (Risky / Extended)", "BUY ON PULLBACK", "NEUTRAL / WAIT", "SELL / TAKE PROFIT"]
+            status_filter = st.selectbox(
+                "Filter by Setup Status:",
+                ["All", "TRIGGERED", "WATCHING", "NEUTRAL", "UNAVAILABLE"]
             )
         with c_filter2:
-            sector_filter = st.selectbox(
-                "Filter by Sector:",
-                ["All"] + sorted(list(set(df_scan["Sector"])))
+            strategy_filter = st.selectbox(
+                "Filter by Strategy:",
+                ["All", "BREAKOUT", "PULLBACK", "NONE"]
             )
 
         df_filtered = df_scan.copy()
-        if signal_filter != "All":
-            df_filtered = df_filtered[df_filtered["Signal"] == signal_filter]
-        if sector_filter != "All":
-            df_filtered = df_filtered[df_filtered["Sector"] == sector_filter]
+        if status_filter != "All":
+            df_filtered = df_filtered[df_filtered["Status"] == status_filter]
+        if strategy_filter != "All":
+            df_filtered = df_filtered[df_filtered["Strategy"] == strategy_filter]
 
-        st.dataframe(
-            df_filtered.style.highlight_max(subset=["RSI"], color="#3b1d1d")
-                             .highlight_min(subset=["RSI"], color="#1d3b24"),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption(f"Showing {len(df_filtered)} of {len(df_scan)} PSX companies scanned.")
+        st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+        st.caption(f"Showing {len(df_filtered)} of {len(df_scan)} PSX companies.")
 
-# ----------------- TAB 3: BACKTESTER & ACCURACY AUDITOR -----------------
+# ----------------- TAB 3: RIGOROUS BACKTESTER -----------------
 with tab3:
-    st.markdown(f"### 🧪 Historical Accuracy Auditor for {active_symbol}")
+    st.markdown(f"### 🧪 Rigorous Historical Simulation for {active_symbol}")
     st.markdown(
-        "Audits the **true mathematical win rate** of these technical trade signals by simulating trades bar-by-bar "
-        f"over historical PSX data, deducting **{broker_fee}% round-trip transaction costs**."
+        "Uses the **exact same strategy rules** as the live screener. "
+        f"Tracks independent TP1 & TP2 targets, detects ambiguous candles, and deducts **{broker_fee}% round-trip costs**."
     )
 
-    bt_results = run_signal_backtest(
-        df_stock,
-        symbol=active_symbol,
-        holding_max_bars=holding_limit,
-        broker_fee_pct=broker_fee,
-    )
-
-    if "error" in bt_results:
-        st.warning(bt_results["error"])
+    if df_stock is None:
+        st.warning("Cannot backtest without verified historical market data.")
     else:
-        b1, b2, b3, b4 = st.columns(4)
-        with b1:
-            st.metric("Total Signals Generated", bt_results["total_trades"])
-        with b2:
-            st.metric("Win Rate (Hit TP1/TP2)", f"{bt_results['win_rate_pct']}%")
-        with b3:
-            st.metric("Stop Loss Hit Rate", f"{bt_results['sl_rate_pct']}%")
-        with b4:
-            net_color = "normal" if bt_results["total_net_pnl_pct"] >= 0 else "inverse"
-            st.metric("Total Net P&L (%)", f"{bt_results['total_net_pnl_pct']}%", delta_color=net_color)
+        bt_results = run_signal_backtest(
+            df_stock,
+            symbol=active_symbol,
+            holding_max_bars=holding_limit,
+            broker_fee_pct=broker_fee,
+        )
 
-        c_graph, c_pie = st.columns([1.5, 1.0])
+        if "error" in bt_results:
+            st.warning(bt_results["error"])
+        elif bt_results.get("resolved_trades", 0) == 0 and bt_results.get("unresolved_trades", 0) == 0:
+            st.info("No trade signals triggered for this stock during this historical lookback period.")
+        else:
+            b1, b2, b3, b4, b5 = st.columns(5)
+            with b1:
+                st.metric("Total Setups Triggered", bt_results["total_triggered"])
+            with b2:
+                st.metric("TP1 Hit Rate", f"{bt_results['tp1_hit_rate_pct']}%")
+            with b3:
+                st.metric("TP2 Hit Rate", f"{bt_results['tp2_hit_rate_pct']}%")
+            with b4:
+                st.metric("Stop Loss Hit Rate", f"{bt_results['stop_loss_rate_pct']}%")
+            with b5:
+                st.metric("Net Strategy P&L", f"{bt_results['net_pnl_pct']:+.2f}%")
 
-        with c_graph:
-            st.markdown("#### Cumulative Trade Return (%)")
-            trades_df = bt_results["trades_df"].copy()
-            trades_df["Cumulative PnL (%)"] = trades_df["net_pnl_pct"].cumsum()
-            fig_pnl = px.line(
-                trades_df,
-                x="exit_date",
-                y="Cumulative PnL (%)",
-                markers=True,
-                title=f"{active_symbol} Equity Curve (Net of Fees)",
-                template="plotly_dark",
-            )
-            fig_pnl.update_traces(line_color="#00e676", line_width=2.5)
-            fig_pnl.update_layout(paper_bgcolor="#111722", plot_bgcolor="#161f30")
-            st.plotly_chart(fig_pnl, use_container_width=True)
+            if bt_results["ambiguous_trades"] > 0:
+                st.warning(
+                    f"⚠️ **Ambiguous Candles Detected**: {bt_results['ambiguous_trades']} trade(s) touched both Target and Stop Loss "
+                    "on the same day. These have been conservatively counted as stopped out."
+                )
 
-        with c_pie:
-            st.markdown("#### Signal Outcome Breakdown")
-            outcome_counts = trades_df["outcome"].value_counts().reset_index()
-            outcome_counts.columns = ["Outcome", "Count"]
-            fig_pie = px.pie(
-                outcome_counts,
-                names="Outcome",
-                values="Count",
-                color="Outcome",
-                color_discrete_map={
-                    "TP1 HIT (Target 1)": "#26a69a",
-                    "TP2 HIT (Target 2)": "#00e676",
-                    "STOP LOSS HIT": "#ef5350",
-                    "EXPIRED (Time Limit)": "#78909c",
-                },
-                template="plotly_dark",
-            )
-            fig_pie.update_layout(paper_bgcolor="#111722", plot_bgcolor="#161f30")
-            st.plotly_chart(fig_pie, use_container_width=True)
+            trades_df = bt_results.get("trades_df")
+            if trades_df is not None and not trades_df.empty:
+                st.markdown("#### 📈 Simulated Equity Curve (Net of Broker Fees)")
+                trades_df["Cumulative PnL (%)"] = trades_df["net_pnl_pct"].cumsum()
+                fig_pnl = px.line(
+                    trades_df,
+                    x="exit_date",
+                    y="Cumulative PnL (%)",
+                    markers=True,
+                    template="plotly_dark",
+                )
+                fig_pnl.update_traces(line_color="#00e676", line_width=2.5)
+                fig_pnl.update_layout(paper_bgcolor="#111722", plot_bgcolor="#161f30")
+                st.plotly_chart(fig_pnl, use_container_width=True)
 
-        st.markdown("#### 📜 Chronological Trade Log")
-        display_log = trades_df[["entry_date", "entry_price", "exit_date", "exit_price", "outcome", "net_pnl_pct"]].copy()
-        display_log.columns = ["Entry Date", "Entry (PKR)", "Exit Date", "Exit (PKR)", "Outcome", "Net PnL (%)"]
-        st.dataframe(display_log, use_container_width=True, hide_index=True)
+                st.markdown("#### 📜 Historical Simulated Trade Log")
+                st.dataframe(trades_df, use_container_width=True, hide_index=True)
 
-# ----------------- TAB 4: PSX REALITY & TRUTHS GUIDE -----------------
+# ----------------- TAB 4: LIVE BOT LEDGER (SIGNALS.DB) -----------------
 with tab4:
-    st.markdown("### 📚 The Anatomy of PSX Social Trade Signals")
+    st.markdown("### 📜 Live Persistent Signal Ledger (`signals.db`)")
+    st.markdown(
+        "Audited track record of real signals **actually issued by this bot** over time. "
+        "Completely separated from historical backtests."
+    )
+
+    perf = get_performance_summary()
+    active_setups = get_active_signals()
+
+    l1, l2, l3, l4 = st.columns(4)
+    with l1:
+        st.metric("Total Setups Recorded", perf["total_recorded"])
+    with l2:
+        st.metric("Currently Active / Watching", perf["active_count"])
+    with l3:
+        st.metric("Closed Trades", perf.get("closed_count", 0))
+    with l4:
+        st.metric("Audited Win Rate", f"{perf.get('win_rate_pct', 0.0)}%")
+
+    st.markdown("#### ⚡ Currently Active & Watching Setups")
+    if active_setups:
+        df_active = pd.DataFrame(active_setups)
+        st.dataframe(df_active, use_container_width=True, hide_index=True)
+    else:
+        st.info("No active setups in progress.")
+
+    st.markdown("#### 📜 Completed Ledger Trades")
+    if "ledger_df" in perf and not perf["ledger_df"].empty:
+        st.dataframe(perf["ledger_df"], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No closed trades recorded in the live ledger yet.")
+
+# ----------------- TAB 5: EDUCATIONAL GUIDE -----------------
+with tab5:
+    st.markdown("### 📚 Realities of PSX Trading")
     st.markdown("""
-    #### 1. Why Social Media Claims *"TP 1 2 3 hit Alhamdulilah"*
-    * **The Law of Small Targets**: If a stock trades at 38 PKR and TP1 is placed at 39.5 PKR (+3.9%), ordinary daily market noise and fluctuations will frequently touch that level.
-    * **Survivorship Bias**: Signal channels publish dozens of calls per month. The winning calls are watermarked and promoted heavily to sell VIP subscriptions; losing calls are quietly ignored or deleted.
-    * **Double-talk Disclaimers**: Notice how the signal says *"BUY"*, but simultaneously says *"MACD bearish turn le chuka hai"* and *"price extended hai"*. This ensures the provider can take credit regardless of whether the price goes up or down.
+    #### 1. Why We Require Data Integrity
+    Fabricated or synthetic data destroys trader trust. A trade alert is only as dependable as the quote on which it was generated.
+    If PSX portals or market feeds are unreachable or delayed, this system explicitly marks data as unavailable rather than inventing numbers.
 
-    ---
+    #### 2. Why Backtests and Live Signals Must Match
+    Many retail signal systems publish attractive backtests that use rules entirely different from the alerts sent to subscribers.
+    Here, `evaluate_bar_strategy()` is the single mathematical engine evaluating both past bars and today's live close.
 
-    #### 2. The Inverted Risk-Reward Trap
-    Many retail traders lose money even with a 50% or 60% win rate because of poor payoff geometry:
-    * **Average Gain on TP1**: ~3.5%
-    * **Average Loss on Stop Loss**: ~6.5%
-    * If you win 6 out of 10 trades: $6 \times 3.5\% = +21\%$
-    * If you lose 4 out of 10 trades: $4 \times 6.5\% = -26\%$
-    * **Net Result**: **-5% Account Loss**, despite a 60% "Accuracy"!
-    * Adding PSX broker commissions and Capital Gains Tax widens the deficit further.
-
-    ---
-
-    #### 3. What Actually Drives PSX Stock Prices?
-    To trade PSX professionally, combine technical analysis with the factors institutional participants follow:
-    * **NCCPL LIPI vs FIPI**: Track whether Local Mutual Funds, Banks, and Foreign Investors are net buyers. Institutional accumulation sets sustainable trends.
-    * **Dividend Yields & Book Value**: PSX is heavily value- and dividend-driven. High-dividend paying blue chips (E&P, Fertilizers, Power, Commercial Banks) have strong valuation floors.
-    * **Macro Policy**: State Bank of Pakistan (SBP) Monetary Policy Committee (MPC) rate announcements, T-bill cut-offs, and IMF tranche reviews dictate broad market direction.
+    #### 3. Managing Asymmetry
+    * Small targets (2-3%) hit frequently due to market noise.
+    * A system with 60% win rate can lose money if the average loss (-6%) is twice the size of the average gain (+3%).
+    * Strict minimum Risk-to-Reward filters (>= 1.2:1 to 1.5:1) are mandatory to achieve long-term positive expectancy.
     """)

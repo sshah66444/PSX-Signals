@@ -1,7 +1,7 @@
 """
 signal_engine.py
-Calculates technical indicators, classifies trade signals,
-computes dynamic Buy Zones/SL/TPs, and generates social-style signal cards.
+Unified Strategy Engine & Transparent Condition Checklist.
+Serves as the single deterministic source of truth for both live alerts and backtesting.
 """
 
 import datetime
@@ -49,13 +49,13 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Enriches DataFrame with EMA20, EMA50, MACD, RSI, ATR, and Volume MA."""
+    """Computes technical indicator series across the entire price history."""
     df = df.copy()
     close = df["Close"]
 
     df["EMA_20"] = calculate_ema(close, 20)
     df["EMA_50"] = calculate_ema(close, 50)
-    df["EMA_200"] = calculate_ema(close, min(200, len(df) - 1))
+    df["EMA_200"] = calculate_ema(close, min(200, max(20, len(df) - 1)))
 
     macd, sig, hist = calculate_macd(close, 12, 26, 9)
     df["MACD"] = macd
@@ -66,204 +66,255 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ATR"] = calculate_atr(df, 14)
     df["Vol_MA20"] = df["Volume"].rolling(20).mean()
 
-    # Recent support (rolling 20-day low) and resistance (rolling 20-day high)
-    df["Support_20"] = df["Low"].rolling(20).min()
-    df["Resistance_20"] = df["High"].rolling(20).max()
+    # Dynamic rolling 20-day high and low (excluding current bar if needed, or including)
+    df["Rolling_High20"] = df["High"].rolling(20).max()
+    df["Rolling_Low20"] = df["Low"].rolling(20).min()
 
     return df
 
 
-def generate_signal(symbol: str, df: pd.DataFrame) -> dict:
+def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
     """
-    Analyzes the latest bar and indicators to generate a complete trade setup
-    matching the format of the PSX social post with rigorous mathematical targets.
+    Evaluates strategy conditions on a specific historical bar.
+    Single source of truth used identically by both the screener and the backtester.
+
+    Strategies supported:
+    1. BREAKOUT: Consolidation near 20-day resistance, breakout with volume.
+    2. PULLBACK: Healthy uptrend, price pulling back to 20 EMA / support band.
+    """
+    if df_ind is None or len(df_ind) < 25:
+        return {"status": "INSUFFICIENT_DATA"}
+
+    # Normalize negative index
+    n = len(df_ind)
+    idx = (n + bar_idx) if bar_idx < 0 else bar_idx
+    if idx < 20 or idx >= n:
+        return {"status": "INDEX_OUT_OF_BOUNDS"}
+
+    bar = df_ind.iloc[idx]
+    prev = df_ind.iloc[idx - 1]
+
+    price = float(bar["Close"])
+    open_price = float(bar["Open"])
+    high = float(bar["High"])
+    low = float(bar["Low"])
+    ema20 = float(bar["EMA_20"])
+    ema50 = float(bar["EMA_50"])
+    rsi = float(bar["RSI"]) if not pd.isna(bar["RSI"]) else 50.0
+    macd_hist = float(bar["MACD_Hist"])
+    prev_macd_hist = float(prev["MACD_Hist"])
+    atr = float(bar["ATR"]) if not pd.isna(bar["ATR"]) and bar["ATR"] > 0 else (price * 0.025)
+    volume = float(bar["Volume"])
+    vol_ma = float(bar["Vol_MA20"]) if not pd.isna(bar["Vol_MA20"]) and bar["Vol_MA20"] > 0 else 1.0
+
+    # 20-day resistance & support measured from preceding bars
+    res20 = float(df_ind["High"].iloc[max(0, idx - 20):idx].max())
+    sup20 = float(df_ind["Low"].iloc[max(0, idx - 20):idx].min())
+
+    date_val = df_ind.index[idx]
+    date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
+
+    # Condition checks
+    c_trend = price > ema20 and ema20 > ema50
+    c_macd_turn = macd_hist > prev_macd_hist
+    c_volume_surge = volume >= (1.20 * vol_ma)
+    c_rsi_healthy = 42.0 <= rsi <= 68.0
+    c_breakout_level = price >= res20
+
+    # --- STRATEGY 1: 20-Day Range Breakout ---
+    dist_to_res = (res20 - price) / price
+    if c_trend and (-0.015 <= dist_to_res <= 0.03):
+        strategy = "BREAKOUT"
+        entry_min = round(max(res20 * 0.995, price - 0.3 * atr), 2)
+        entry_max = round(max(price, res20 * 1.01), 2)
+        invalidation = round(min(res20 - 0.8 * atr, ema20 - 0.3 * atr), 2)
+        tp1 = round(entry_max + 1.2 * atr, 2)
+        tp2 = round(entry_max + 2.4 * atr, 2)
+
+        risk = entry_max - invalidation
+        rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
+        rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
+
+        checklist = {
+            "Trend Alignment (Price > 20 & 50 EMA)": c_trend,
+            "Resistance Test / Clearance": c_breakout_level,
+            "Volume Surge (Vol >= 1.20x 20MA)": c_volume_surge,
+            "Momentum Health (MACD Histogram Expanding)": c_macd_turn,
+            "Healthy RSI Range (42 - 68)": c_rsi_healthy,
+            "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
+        }
+
+        # Status determination
+        if c_breakout_level and c_volume_surge and c_macd_turn:
+            status = "TRIGGERED"
+            trigger_note = f"Daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume."
+        elif c_breakout_level and not c_volume_surge:
+            status = "WATCHING"
+            trigger_note = f"Price cleared resistance ({res20:.2f}), but volume ({volume/vol_ma:.1f}x MA) requires confirmation."
+        else:
+            status = "WATCHING"
+            trigger_note = f"Approaching 20-day resistance ({res20:.2f}). Waiting for close breakout with volume."
+
+        return {
+            "strategy": strategy,
+            "status": status,
+            "date": date_str,
+            "price": price,
+            "entry_min": entry_min,
+            "entry_max": entry_max,
+            "stop_loss": invalidation,
+            "tp1": tp1,
+            "tp2": tp2,
+            "risk_pct": round((risk / entry_max) * 100, 1),
+            "rr_tp1": rr_tp1,
+            "rr_tp2": rr_tp2,
+            "trigger_note": trigger_note,
+            "checklist": checklist,
+            "rsi": round(rsi, 1),
+            "atr": round(atr, 2),
+            "vol_ratio": round(volume / vol_ma, 2),
+        }
+
+    # --- STRATEGY 2: Pullback to 20 EMA / Support ---
+    dist_to_ema20 = (price - ema20) / ema20
+    is_in_pullback_zone = price > ema50 and (-0.02 <= dist_to_ema20 <= 0.02)
+    if is_in_pullback_zone and rsi < 58:
+        strategy = "PULLBACK"
+        entry_min = round(min(ema20 - 0.2 * atr, price * 0.99), 2)
+        entry_max = round(max(price, ema20 + 0.2 * atr), 2)
+        invalidation = round(min(ema50 - 0.2 * atr, entry_min - 0.9 * atr), 2)
+        tp1 = round(entry_max + 1.2 * atr, 2)
+        tp2 = round(entry_max + 2.2 * atr, 2)
+
+        risk = entry_max - invalidation
+        rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
+        rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
+
+        c_bounce_candle = price >= open_price  # Green close off support
+
+        checklist = {
+            "Macro Trend Intact (Price > 50 EMA)": price > ema50,
+            "Testing 20 EMA Support Zone": True,
+            "Cooling RSI (< 58, Not Overbought)": rsi < 58,
+            "Bounce Confirmation (Bullish Close)": c_bounce_candle,
+            "MACD Momentum Stabilization": c_macd_turn,
+            "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
+        }
+
+        if c_bounce_candle and c_macd_turn:
+            status = "TRIGGERED"
+            trigger_note = f"Bullish bounce confirmed at 20 EMA ({ema20:.2f}) with stabilizing MACD."
+        else:
+            status = "WATCHING"
+            trigger_note = f"Testing 20 EMA support ({ema20:.2f}). Waiting for bullish reversal confirmation."
+
+        return {
+            "strategy": strategy,
+            "status": status,
+            "date": date_str,
+            "price": price,
+            "entry_min": entry_min,
+            "entry_max": entry_max,
+            "stop_loss": invalidation,
+            "tp1": tp1,
+            "tp2": tp2,
+            "risk_pct": round((risk / entry_max) * 100, 1),
+            "rr_tp1": rr_tp1,
+            "rr_tp2": rr_tp2,
+            "trigger_note": trigger_note,
+            "checklist": checklist,
+            "rsi": round(rsi, 1),
+            "atr": round(atr, 2),
+            "vol_ratio": round(volume / vol_ma, 2),
+        }
+
+    # Default: No clear actionable setup
+    return {
+        "strategy": "NONE",
+        "status": "NEUTRAL",
+        "date": date_str,
+        "price": price,
+        "trigger_note": "Consolidating / Choppy. No high-probability breakout or pullback setup.",
+        "checklist": {
+            "Trend Alignment": c_trend,
+            "Volume Confirmation": c_volume_surge,
+            "Momentum Health": c_macd_turn,
+            "RSI in Range": c_rsi_healthy,
+        },
+        "rsi": round(rsi, 1),
+        "atr": round(atr, 2),
+        "vol_ratio": round(volume / vol_ma, 2),
+    }
+
+
+def generate_signal(symbol: str, df: pd.DataFrame, data_meta: dict = None) -> dict:
+    """
+    Evaluates the latest completed session and formats a comprehensive setup package.
     """
     if df is None or len(df) < 25:
         return {}
 
     df_ind = compute_all_indicators(df)
-    latest = df_ind.iloc[-1]
-    prev = df_ind.iloc[-2]
+    setup = evaluate_bar_strategy(df_ind, bar_idx=-1)
+    setup["symbol"] = symbol
+    setup["df_indicators"] = df_ind
 
-    price = float(latest["Close"])
-    ema20 = float(latest["EMA_20"])
-    ema50 = float(latest["EMA_50"])
-    rsi = float(latest["RSI"]) if not pd.isna(latest["RSI"]) else 50.0
-    macd = float(latest["MACD"])
-    macd_sig = float(latest["MACD_Signal"])
-    macd_hist = float(latest["MACD_Hist"])
-    prev_hist = float(prev["MACD_Hist"])
-    atr = float(latest["ATR"]) if not pd.isna(latest["ATR"]) and latest["ATR"] > 0 else (price * 0.025)
-    support = float(latest["Support_20"]) if not pd.isna(latest["Support_20"]) else (price - 1.5 * atr)
-    resistance = float(latest["Resistance_20"]) if not pd.isna(latest["Resistance_20"]) else (price + 1.5 * atr)
-
-    # 1. Indicator Condition Flags
-    trend_bullish = price > ema20 and ema20 > ema50
-    trend_bearish = price < ema20 and ema20 < ema50
-    price_extended = price > (ema20 + 0.8 * atr)
-    macd_bullish = macd > macd_sig
-    macd_hist_cooling = macd_hist < prev_hist  # Momentum slowing down
-    macd_bearish_turn = (macd < macd_sig) or (macd_hist > 0 and macd_hist_cooling)
-    rsi_overbought = rsi > 68
-    rsi_oversold = rsi < 35
-    volume_high = latest["Volume"] > (latest["Vol_MA20"] if not pd.isna(latest["Vol_MA20"]) else 0)
-
-    # 2. Signal Classification & Reasoning
-    if trend_bullish and not price_extended and macd_bullish and not macd_hist_cooling and (45 <= rsi <= 65):
-        signal_type = "STRONG BUY"
-        signal_ur = "BUY (Mazboot Momentum)"
-        wajah_ur = "Price 20 EMA se upar hai, MACD bullish expansion mein hai aur RSI healthy range mein hai."
-        wajah_en = "Price above 20 EMA with bullish MACD expansion and healthy RSI."
-        entry_advice_ur = "CURRENT PRICE PAR LE SAKTE HAIN"
-        pullback_note_ur = "Momentum strong hai, breakout confirmation mil chuka hai."
-        caution_ur = "Aam volume se zyada volume confirm karein aur stop loss lazmi follow karein."
-        caution_en = "Confirm above-average volume and strictly follow stop loss."
-        stars = "★★★★☆"
-        star_count = 4
-
-    elif trend_bullish and (price_extended or macd_bearish_turn):
-        # The exact scenario from the user's screenshot!
-        signal_type = "BUY (Risky / Extended)"
-        signal_ur = "BUY (lekin abhi risky hai)"
-        wajah_ur = "MACD bearish turn le chuka hai ya momentum cool ho raha hai (price extended hai)."
-        wajah_en = "Price is extended above 20 EMA and MACD momentum is cooling down."
-        entry_advice_ur = "LE SAKTE HAIN (price extended hai)"
-        pullback_note_ur = "Behtar entry Buy Zone mein milegi, lekin agar pullback ka wait nahi karna to abhi bhi partial lena reasonable hai."
-        caution_ur = "MACD bearish turn le chuka hai (momentum cooling) — chhoti/partial position ya extra confirmation ke sath hi lein."
-        caution_en = "Wait for pullback to Buy Zone or trade only small/partial position."
-        stars = "★★★☆☆"
-        star_count = 3
-
-    elif price <= (support + 0.5 * atr) and rsi < 45 and not trend_bearish:
-        signal_type = "BUY ON PULLBACK"
-        signal_ur = "BUY ON DIP (Support Zone)"
-        wajah_ur = "Price key support aur Buy Zone ke qareeb test kar rahi hai. Risk/reward yahan sab se behtar hai."
-        wajah_en = "Price testing key support and Buy Zone. Optimal risk-to-reward setup."
-        entry_advice_ur = "BUY ZONE ENTRY (Ideal Risk/Reward)"
-        pullback_note_ur = "Support se bounce ka wait karein, confirmation par full quantity accumulate karein."
-        caution_ur = "Agar support break ho jaye to fauran exit karein."
-        caution_en = "Wait for bounce confirmation. Exit immediately if support breaks."
-        stars = "★★★★☆"
-        star_count = 4
-
-    elif rsi_overbought or (trend_bearish and macd < macd_sig):
-        signal_type = "SELL / TAKE PROFIT"
-        signal_ur = "SELL / PROFIT BOOKING"
-        wajah_ur = "RSI overbought zone mein hai ya moving average breakdown ho chuka hai."
-        wajah_en = "RSI in overbought zone or moving average breakdown confirmed."
-        entry_advice_ur = "NAYA BUY MAT KAREIN (Risky Zone)"
-        pullback_note_ur = "Mojooda holdings par munafa book karein aur consolidation ka intezar karein."
-        caution_ur = "Greed se bachein, market distribution phase mein ho sakti hai."
-        caution_en = "Avoid new buys. Lock in profits on existing positions."
-        stars = "★★☆☆☆"
-        star_count = 2
-
+    # Attach data metadata
+    if data_meta:
+        setup["source"] = data_meta.get("source", "PSX Direct")
+        setup["last_date"] = data_meta.get("last_date", str(df.index[-1].date()))
+        setup["data_age_days"] = data_meta.get("data_age_days", 0)
     else:
-        signal_type = "NEUTRAL / WAIT"
-        signal_ur = "NEUTRAL (Intezar Karein)"
-        wajah_ur = "Market consolidation / range-bound phase mein hai. Directional confirmation nahi hai."
-        wajah_en = "Market in consolidation / range-bound phase without directional bias."
-        entry_advice_ur = "WAIT FOR BREAKOUT"
-        pullback_note_ur = "Breakout ya support bounce ka intezar karein."
-        caution_ur = "Range mein choppy trades se bachein."
-        caution_en = "Wait for breakout confirmation or key support test."
-        stars = "★★☆☆☆"
-        star_count = 2
+        setup["source"] = "PSX Direct"
+        setup["last_date"] = str(df.index[-1].date())
+        setup["data_age_days"] = 0
 
-    # 3. Dynamic Levels (Buy Zone, Stop Loss, TP1-TP4)
-    # Buy Zone: lower bound near support, upper bound slightly below current price
-    bz_low = round(max(support, price - 0.75 * atr), 2)
-    bz_high = round(max(bz_low + 0.2, price - 0.25 * atr), 2)
-    if bz_high >= price:
-        bz_high = round(price * 0.99, 2)
-    if bz_low >= bz_high:
-        bz_low = round(bz_high - 0.5 * atr, 2)
+    return setup
 
-    # Stop Loss: beneath support or 1.3x ATR
-    stop_loss = round(min(bz_low - 0.3 * atr, price - 1.25 * atr), 2)
 
-    # Take Profits (ensuring strictly ascending targets)
-    # TP1: near local resistance or ~1.0 ATR
-    if resistance > price and (resistance - price) <= 1.5 * atr:
-        tp1 = round(resistance, 2)
-    else:
-        tp1 = round(price + 1.0 * atr, 2)
+def format_actionable_card(setup: dict, company_name: str = "") -> str:
+    """
+    Formats the transparent, actionable Telegram card requested by the user.
+    """
+    sym = setup.get("symbol", "")
+    strategy = setup.get("strategy", "NONE")
+    status = setup.get("status", "NEUTRAL")
+    price = setup.get("price", 0.0)
+    source = setup.get("source", "PSX Feed")
+    last_date = setup.get("last_date", "Today")
+    age = setup.get("data_age_days", 0)
 
-    tp2 = round(max(tp1 + 0.6 * atr, price + 1.8 * atr), 2)
-    tp3 = round(max(tp2 + 0.8 * atr, price + 2.8 * atr), 2)
-    tp4 = round(max(tp3 + 1.0 * atr, price + 4.0 * atr), 2)
+    if status == "NEUTRAL" or strategy == "NONE":
+        return f"⚪ <b>${sym}</b> — {company_name}\nStatus: NEUTRAL (No high-probability setup)."
 
-    # Risk & Reward calculation
-    risk_amount = round(price - stop_loss, 2)
-    reward_tp1 = round(tp1 - price, 2)
-    reward_tp2 = round(tp2 - price, 2)
-    rr_tp1 = round(reward_tp1 / (risk_amount + 1e-6), 2)
-    rr_tp2 = round(reward_tp2 / (risk_amount + 1e-6), 2)
+    badge_emoji = "🟢" if status == "TRIGGERED" else "🟡"
+    status_label = "Triggered (Confirmed)" if status == "TRIGGERED" else "Watching (Waiting for Confirmation)"
+    import html
 
-    now_str = datetime.datetime.now().strftime("%d-%B-%Y | %I:%M %p")
+    def esc(text: str) -> str:
+        return html.escape(str(text), quote=False)
 
-    # Roman Urdu card matching the user's screenshot
-    card_roman_urdu = f"""DATE / TIME  : {now_str}
-Symbol      : {symbol}
-Price       : {price:.2f}
-Signal      : {signal_ur} {stars}
-⚠️ Wajah    : {wajah_ur}
-Entry       : ⚠️ {entry_advice_ur} - ~{price:.2f}
-              {pullback_note_ur}
-⚠️ Caution  : {caution_ur}
-Buy Zone    : {bz_low:.2f} - {bz_high:.2f} (yahan entry behtar/sasti hogi)
-Stop Loss   : {stop_loss:.2f} (chart ke mazboot support level se)
-TP1         : {tp1:.2f} (✅ historical resistance level - pichle data se confirmed)
-TP2         : {tp2:.2f} (⚠️ estimate - is level par koi historical resistance nahi mila)
-TP3         : {tp3:.2f} (⚠️ estimate - is level par koi historical resistance nahi mila)
-TP4         : {tp4:.2f} (⚠️ estimate - is level par koi historical resistance nahi mila)
-"""
+    checklist = setup.get("checklist", {})
+    checklist_lines = "\n".join([
+        f"   {'[✓]' if passed else '[✗]'} {esc(k)}" for k, passed in checklist.items()
+    ])
 
-    card_english = f"""DATE / TIME  : {now_str}
-Symbol      : {symbol}
-Price       : {price:.2f} PKR
-Signal      : {signal_type} ({stars})
-Analysis    : Trend {'Bullish' if trend_bullish else 'Bearish/Neutral'}, MACD {'Cooling' if macd_hist_cooling else 'Expanding'}, RSI {rsi:.1f}
-Entry       : ~{price:.2f} (Ideal Buy Zone: {bz_low:.2f} - {bz_high:.2f})
-Stop Loss   : {stop_loss:.2f} (-{((price - stop_loss)/price)*100:.1f}%)
-TP1 Target  : {tp1:.2f} (+{((tp1 - price)/price)*100:.1f}%) | R:R = {rr_tp1}:1
-TP2 Target  : {tp2:.2f} (+{((tp2 - price)/price)*100:.1f}%) | R:R = {rr_tp2}:1
-TP3 Target  : {tp3:.2f} (+{((tp3 - price)/price)*100:.1f}%)
-TP4 Target  : {tp4:.2f} (+{((tp4 - price)/price)*100:.1f}%)
-"""
+    trigger_note = esc(setup.get('trigger_note', ''))
+    source_esc = esc(source)
+    company_esc = esc(company_name)
 
-    return {
-        "symbol": symbol,
-        "date_time": now_str,
-        "price": price,
-        "signal_type": signal_type,
-        "signal_ur": signal_ur,
-        "stars": stars,
-        "star_count": star_count,
-        "wajah_ur": wajah_ur,
-        "wajah_en": wajah_en,
-        "caution_ur": caution_ur,
-        "caution_en": caution_en,
-        "entry_advice_ur": entry_advice_ur,
-        "buy_zone_low": bz_low,
-        "buy_zone_high": bz_high,
-        "stop_loss": stop_loss,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "tp4": tp4,
-        "risk_amount": risk_amount,
-        "reward_tp1": reward_tp1,
-        "rr_tp1": rr_tp1,
-        "rr_tp2": rr_tp2,
-        "rsi": round(rsi, 2),
-        "macd": round(macd, 2),
-        "macd_signal": round(macd_sig, 2),
-        "macd_hist": round(macd_hist, 2),
-        "atr": round(atr, 2),
-        "ema20": round(ema20, 2),
-        "ema50": round(ema50, 2),
-        "card_roman_urdu": card_roman_urdu,
-        "card_english": card_english,
-        "df_indicators": df_ind,
-    }
+    card = (
+        f"{badge_emoji} <b>${sym} — {status_label}</b>\n"
+        f"🏢 {company_esc}\n"
+        f"📅 <b>Data:</b> {last_date} Close ({source_esc}) | Age: {age}d\n"
+        f"🎯 <b>Strategy:</b> {strategy.title()} Setup\n"
+        f"📍 <b>Trigger Condition:</b> {trigger_note}\n"
+        f"💰 <b>Current Price:</b> {price:.2f} PKR\n"
+        f"🛒 <b>Planned Entry:</b> {setup.get('entry_min', 0):.2f} – {setup.get('entry_max', 0):.2f} PKR\n"
+        f"🛑 <b>Invalidation / SL:</b> {setup.get('stop_loss', 0):.2f} PKR (Risk: -{setup.get('risk_pct', 0)}%)\n"
+        f"🎯 <b>Targets:</b> TP1: {setup.get('tp1', 0):.2f} PKR | TP2: {setup.get('tp2', 0):.2f} PKR\n"
+        f"⚖️ <b>Reward:Risk:</b> {setup.get('rr_tp1', 0)}:1 (to TP1) | {setup.get('rr_tp2', 0)}:1 (to TP2)\n"
+        f"📋 <b>Condition Checklist:</b>\n{checklist_lines}\n"
+        f"⚡ <b>Status:</b> <b>{status}</b>\n"
+    )
+    return card
