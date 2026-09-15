@@ -15,8 +15,8 @@ The app demystifies and audits social media trade signals (such as the viral *"T
 * **Zero Synthetic Fabrication**: Production alerts and backtests strictly refuse to invent or approximate prices. If market data is unavailable or stale (> 5 days), the system explicitly reports `UNAVAILABLE` and skips the signal. Isolated test generators are strictly quarantined to automated unit tests.
 * **Intraday Wick Verification**: The engine deterministically verifies that datasets contain true candle wicks. Datasets lacking true High/Low (e.g. DPS Open/Close only) are flagged as `Approximated OHLC` and disqualified from triggering live orders, protecting ATR and stop-loss fidelity.
 
-### 2. Full PSX Liquid Watchlist (65 Equities across 10 Sectors)
-Scans the 65 most liquid and active stocks in the Pakistani stock market:
+### 2. Full PSX Liquid Watchlist (75 Equities across 10 Sectors)
+Scans the 75 most liquid and active stocks in the Pakistani stock market:
 * **Commercial & Islamic Banks**: MEBL, MCB, UBL, HBL, BAFL, BAHL, FABL, BIPL, AKBL, NBP.
 * **Oil & Gas Exploration (E&P)**: OGDC, PPL, MARI, POL.
 * **Fertilizer & Conglomerates**: FFC, EFERT, ENGRO, FATIMA, FFBL.
@@ -60,12 +60,12 @@ Both live alerts and historical backtests use the **exact same deterministic str
 ### 6. Autonomous Telegram Bot with Interactive Commands
 * **Daily Morning Scan**: Automatically audits active setups and alerts on newly confirmed triggers.
 * **Interactive Command Handler**:
-  * `/scan` — Trigger an immediate market-wide scan across all 65 stocks.
+  * `/scan` — Trigger an immediate market-wide scan across all 75 stocks.
   * `/active` — View all open, watching, and triggered setups in the ledger.
   * `/stock <SYM>` — View full setup card for any symbol (e.g. `/stock OGDC`).
   * `/why <SYM>` — View the complete condition checklist breakdown.
   * `/performance` — View audited live ledger performance after costs.
-  * `/watchlist` — List all 65 tracked PSX equities.
+  * `/watchlist` — List all 75 tracked PSX equities.
 
 ---
 

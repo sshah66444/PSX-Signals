@@ -12,7 +12,7 @@ import pandas as pd
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Top 65 Most Liquid & Active PSX Stocks across All Core Sectors
+# Top 75 Most Liquid & Active PSX Stocks across All Core Sectors
 PSX_WATCHLIST = {
     # --- Oil & Gas Exploration (E&P) ---
     "OGDC": {"name": "Oil & Gas Development Company Limited", "sector": "Oil & Gas Exploration"},

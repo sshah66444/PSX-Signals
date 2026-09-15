@@ -157,7 +157,7 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
             "• <b>/stock &lt;SYM&gt;</b> — View full checklist and levels for a stock (e.g. <code>/stock OGDC</code>)\n"
             "• <b>/why &lt;SYM&gt;</b> — Detailed pass/fail reasoning for a stock\n"
             "• <b>/performance</b> — Audited track record from the live signal ledger\n"
-            "• <b>/watchlist</b> — List all 20 tracked PSX blue-chip stocks\n"
+            f"• <b>/watchlist</b> — List all {len(watchlist)} tracked PSX equities\n"
         )
         send_telegram_message(token, chat_id, reply)
 
