@@ -73,7 +73,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
+def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1, has_true_ohlc: bool = True) -> dict:
     """
     Evaluates strategy conditions on a specific historical bar.
     Single source of truth used identically by both the screener and the backtester.
@@ -115,6 +115,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
     date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
 
     # Condition checks
+    c_true_ohlc = bool(has_true_ohlc)
     c_trend = price > ema20 and ema20 > ema50
     c_macd_turn = macd_hist > prev_macd_hist
     c_volume_surge = volume >= (1.20 * vol_ma)
@@ -137,6 +138,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
 
         checklist = {
+            "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
             "Trend Alignment (Price > 20 & 50 EMA)": c_trend,
             "Resistance Test / Clearance": c_breakout_level,
             "Volume Surge (Vol >= 1.20x 20MA)": c_volume_surge,
@@ -150,6 +152,9 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         if all(checklist.values()):
             status = "TRIGGERED"
             trigger_note = f"All criteria verified: daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume and R:R {rr_tp1}:1."
+        elif not c_true_ohlc:
+            status = "WATCHING"
+            trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and resistance levels cannot be reliably calculated."
         elif not (rr_tp1 >= 1.2):
             status = "WATCHING"
             trigger_note = f"Price cleared resistance, but disqualified: Risk:Reward ({rr_tp1}:1) is below 1.2:1 minimum threshold."
@@ -184,6 +189,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
             "rsi": round(rsi, 1),
             "atr": round(atr, 2),
             "vol_ratio": round(volume / vol_ma, 2),
+            "has_true_ohlc": c_true_ohlc,
         }
 
     # --- STRATEGY 2: Pullback to 20 EMA / Support ---
@@ -204,6 +210,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         c_bounce_candle = price >= open_price  # Green close off support
 
         checklist = {
+            "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
             "Macro Trend Intact (Price > 50 EMA)": price > ema50,
             "Testing 20 EMA Support Zone": True,
             "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
@@ -217,6 +224,9 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         if all(checklist.values()):
             status = "TRIGGERED"
             trigger_note = f"All criteria verified: bullish bounce at 20 EMA ({ema20:.2f}) with stabilizing MACD and R:R {rr_tp1}:1."
+        elif not c_true_ohlc:
+            status = "WATCHING"
+            trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and stop-loss distance cannot be reliably calculated."
         elif not (rr_tp1 >= 1.2):
             status = "WATCHING"
             trigger_note = f"Support bounce detected, but disqualified: Risk:Reward ({rr_tp1}:1) is below 1.2:1 minimum threshold."
@@ -248,6 +258,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
             "rsi": round(rsi, 1),
             "atr": round(atr, 2),
             "vol_ratio": round(volume / vol_ma, 2),
+            "has_true_ohlc": c_true_ohlc,
         }
 
     # Default: No clear actionable setup
@@ -258,6 +269,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         "price": price,
         "trigger_note": "Consolidating / Choppy. No high-probability breakout or pullback setup.",
         "checklist": {
+            "Verified Intraday OHLC": c_true_ohlc,
             "Trend Alignment": c_trend,
             "Volume Confirmation": c_volume_surge,
             "Momentum Health": c_macd_turn,
@@ -266,6 +278,7 @@ def evaluate_bar_strategy(df_ind: pd.DataFrame, bar_idx: int = -1) -> dict:
         "rsi": round(rsi, 1),
         "atr": round(atr, 2),
         "vol_ratio": round(volume / vol_ma, 2),
+        "has_true_ohlc": c_true_ohlc,
     }
 
 
@@ -276,10 +289,12 @@ def generate_signal(symbol: str, df: pd.DataFrame, data_meta: dict = None) -> di
     if df is None or len(df) < 25:
         return {}
 
+    has_true_ohlc = data_meta.get("has_true_ohlc", True) if data_meta else True
     df_ind = compute_all_indicators(df)
-    setup = evaluate_bar_strategy(df_ind, bar_idx=-1)
+    setup = evaluate_bar_strategy(df_ind, bar_idx=-1, has_true_ohlc=has_true_ohlc)
     setup["symbol"] = symbol
     setup["df_indicators"] = df_ind
+    setup["has_true_ohlc"] = has_true_ohlc
 
     # Attach data metadata
     if data_meta:

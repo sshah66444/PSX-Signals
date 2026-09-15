@@ -7,6 +7,7 @@ as the live signal engine, with multi-target tracking and ambiguous candle detec
 import pandas as pd
 import numpy as np
 from signal_engine import compute_all_indicators, evaluate_bar_strategy
+from data_engine import check_has_true_ohlc
 
 
 def run_signal_backtest(
@@ -18,9 +19,17 @@ def run_signal_backtest(
     """
     Backtests strategy performance bar-by-bar across historical data.
     Uses evaluate_bar_strategy directly to guarantee identical rules.
+    Strictly requires verified intraday High/Low data.
     """
     if df is None or len(df) < 30:
         return {"error": "Insufficient historical data (minimum 30 bars required)."}
+
+    if not check_has_true_ohlc(df):
+        return {
+            "error": "Backtesting requires verified intraday High/Low prices. "
+                     "The provided dataset contains approximated OHLC (Close/Open only), "
+                     "which invalidates ATR, stop-loss triggers, and target simulations."
+        }
 
     df_ind = compute_all_indicators(df)
     n_bars = len(df_ind)

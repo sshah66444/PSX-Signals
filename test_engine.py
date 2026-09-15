@@ -17,6 +17,7 @@ from data_engine import (
     validate_market_data,
     generate_isolated_test_data,
     get_watchlist,
+    check_has_true_ohlc,
 )
 from signal_engine import (
     compute_all_indicators,
@@ -30,6 +31,43 @@ from signal_engine import (
 )
 from backtester import run_signal_backtest
 import signal_tracker
+
+
+def test_true_ohlc_enforcement():
+    print("1b. Testing true OHLC verification & approximated DPS protection...")
+    # 1. Real / Isolated test data has true wicks
+    df_real = generate_isolated_test_data(days=60, base_price=150.0)
+    assert check_has_true_ohlc(df_real) is True, "Test data with real wicks must pass check_has_true_ohlc"
+
+    # 2. Fabricate / approximated DPS-style dataset where High = max(O, C) and Low = min(O, C)
+    df_approx = df_real.copy()
+    df_approx["High"] = np.maximum(df_approx["Open"], df_approx["Close"])
+    df_approx["Low"] = np.minimum(df_approx["Open"], df_approx["Close"])
+    assert check_has_true_ohlc(df_approx) is False, "Approximated OHLC without wicks must be identified as has_true_ohlc=False"
+
+    # 3. validate_market_data with require_true_ohlc=True must reject it
+    is_valid, reason, _ = validate_market_data(df_approx, require_true_ohlc=True)
+    assert not is_valid, "validate_market_data must reject approximated OHLC when require_true_ohlc=True"
+    assert "intraday high/low" in reason.lower() or "approximated" in reason.lower()
+
+    # 4. Signal engine must refuse to produce a TRIGGERED status on approximated data
+    meta_approx = {
+        "source": "PSX Official Portal (DPS) — OHLC approximated (Close/Open only)",
+        "has_true_ohlc": False,
+        "last_date": "2026-09-15",
+        "data_age_days": 0,
+    }
+    setup_approx = generate_signal("DPS_TEST", df_approx, data_meta=meta_approx)
+    assert setup_approx["status"] != "TRIGGERED", "Signal engine must NEVER trigger on approximated OHLC data"
+    if setup_approx.get("strategy") in ["BREAKOUT", "PULLBACK"]:
+        assert setup_approx["checklist"].get("Verified Intraday OHLC (True High/Low)") is False
+        assert "disqualified" in setup_approx["trigger_note"].lower()
+
+    # 5. Backtester must refuse to simulate on approximated data
+    bt_res = run_signal_backtest(df_approx, symbol="DPS_TEST")
+    assert "error" in bt_res, "Backtester must return error when given approximated OHLC"
+    assert "intraday high/low" in bt_res["error"].lower() or "approximated" in bt_res["error"].lower()
+    print("  ✓ True OHLC enforcement passed (Approximated DPS data strictly disqualified from alerts & backtests).")
 
 
 def test_data_integrity():
@@ -168,6 +206,7 @@ def test_signal_tracker_lifecycle():
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
+    test_true_ohlc_enforcement()
     test_strategy_and_checklist(df_test)
     test_backtester_multi_target(df_test)
     test_signal_tracker_lifecycle()

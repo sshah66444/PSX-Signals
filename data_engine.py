@@ -130,10 +130,39 @@ def _fetch_from_yahoo(clean_symbol: str, period: str = "6mo") -> pd.DataFrame:
     return None
 
 
+def check_has_true_ohlc(df: pd.DataFrame) -> bool:
+    """
+    Deterministically verifies whether a dataframe contains true intraday
+    excursions (wicks) beyond the Open and Close prices.
+    If High == max(Open, Close) and Low == min(Open, Close) across all bars,
+    the data is synthetic or approximated without true intraday range.
+    """
+    if df is None or df.empty or len(df) < 5:
+        return False
+    for col in ["Open", "High", "Low", "Close"]:
+        if col not in df.columns:
+            return False
+
+    max_oc = df[["Open", "Close"]].max(axis=1)
+    min_oc = df[["Open", "Close"]].min(axis=1)
+
+    has_high_wicks = (df["High"] > max_oc + 1e-5).any()
+    has_low_wicks = (df["Low"] < min_oc - 1e-5).any()
+
+    return bool(has_high_wicks or has_low_wicks)
+
+
 def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     """
     Fetches official end-of-day timeseries directly from the PSX Data Portal (DPS).
     Endpoint: https://dps.psx.com.pk/timeseries/eod/{symbol}
+
+    NOTE ON DATA INTEGRITY:
+    The PSX DPS EOD endpoint schema is strictly [timestamp, close, volume, open]
+    and lacks true intraday High/Low excursions. High and Low are stored as
+    max(o, c) and min(o, c) as candle bounds, but this dataset is strictly flagged
+    with has_true_ohlc = False. Downstream signal engines must refuse to trigger
+    live setups on this data to prevent distorted ATR and stop-loss levels.
     """
     url = f"https://dps.psx.com.pk/timeseries/eod/{clean_symbol}"
     headers = {
@@ -154,7 +183,7 @@ def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     for item in rows:
         ts, c, v, o = item[0], float(item[1]), float(item[2]), float(item[3])
         d = datetime.datetime.fromtimestamp(ts).date()
-        # Derive robust High and Low bounds from Open, Close, and typical spread
+        # Bound High/Low to max/min of Open/Close without fabricating fictional intraday wicks
         h = max(o, c)
         l = min(o, c)
         records.append({
@@ -173,10 +202,11 @@ def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     return df
 
 
-def validate_market_data(df: pd.DataFrame, max_age_days: int = 5) -> tuple[bool, str, int]:
+def validate_market_data(df: pd.DataFrame, max_age_days: int = 5, require_true_ohlc: bool = False) -> tuple[bool, str, int]:
     """
     Validates that market data is fresh, non-empty, and has reasonable integrity.
     Accounts for weekends (up to 4-5 days gap over holiday/long weekends).
+    If require_true_ohlc is True, rejects datasets lacking true intraday wicks.
     Returns (is_valid, reason, data_age_days).
     """
     if df is None or df.empty or len(df) < 20:
@@ -201,12 +231,15 @@ def validate_market_data(df: pd.DataFrame, max_age_days: int = 5) -> tuple[bool,
     if pd.isna(df["Close"].iloc[-1]) or df["Close"].iloc[-1] <= 0:
         return False, "Latest close price is invalid or NaN", age_days
 
+    if require_true_ohlc and not check_has_true_ohlc(df):
+        return False, "Data lacks verified intraday High/Low wicks (OHLC approximated)", age_days
+
     return True, "Data valid and verified", age_days
 
 
 def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> dict:
     """
-    Fetches real PSX market data.
+    Fetches real PSX market data with rigorous source attribution and integrity flags.
     Strictly refuses to fabricate synthetic data in production.
 
     Returns dict:
@@ -215,6 +248,7 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
         "status": "OK" | "UNAVAILABLE",
         "df": pd.DataFrame | None,
         "source": str,
+        "has_true_ohlc": bool,
         "last_date": str,
         "data_age_days": int,
         "error": str | None
@@ -223,21 +257,38 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
     clean_symbol = symbol.strip().upper()
     cache_file = os.path.join(CACHE_DIR, f"{clean_symbol}_real.csv")
 
-    # 1. Try Yahoo Finance (.KA)
     df = None
     source = "None"
+    has_true_ohlc = False
+
+    # 1. Try Yahoo Finance (.KA) - Primary Source for verified true OHLCV
     try:
         df_yf = _fetch_from_yahoo(clean_symbol, period=period)
         if df_yf is not None:
             is_valid, reason, age = validate_market_data(df_yf, max_age_days=max_age_days)
             if is_valid:
                 df = df_yf
-                source = f"Yahoo Finance ({clean_symbol}.KA)"
+                has_true_ohlc = check_has_true_ohlc(df_yf)
+                source = f"Yahoo Finance ({clean_symbol}.KA) — Verified True OHLC" if has_true_ohlc else f"Yahoo Finance ({clean_symbol}.KA) — Flat Wicks"
                 df.to_csv(cache_file)
     except Exception:
         df = None
 
-    # 2. Try Official PSX Data Portal (DPS) Fallback
+    # 2. Try Local Cache (if recently updated and valid with true OHLC)
+    if df is None and os.path.exists(cache_file):
+        try:
+            df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            is_valid, reason, age = validate_market_data(df_cache, max_age_days=max_age_days)
+            if is_valid:
+                df = df_cache
+                has_true_ohlc = check_has_true_ohlc(df_cache)
+                source = f"Verified Local Cache ({clean_symbol}) — {'True OHLC' if has_true_ohlc else 'OHLC approximated'}"
+        except Exception:
+            df = None
+
+    # 3. Try Official PSX Data Portal (DPS) Fallback
+    # Note: DPS EOD endpoint schema provides [ts, close, volume, open] without intraday High/Low.
+    # We explicitly label source so UI and alerts display 'OHLC approximated'.
     if df is None:
         try:
             df_dps = _fetch_from_psx_dps(clean_symbol)
@@ -245,19 +296,9 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
                 is_valid, reason, age = validate_market_data(df_dps, max_age_days=max_age_days)
                 if is_valid:
                     df = df_dps
-                    source = f"PSX Official Portal (DPS)"
+                    has_true_ohlc = False  # DPS schema lacks true intraday High/Low wicks
+                    source = "PSX Official Portal (DPS) — OHLC approximated (Close/Open only)"
                     df.to_csv(cache_file)
-        except Exception:
-            df = None
-
-    # 3. Try Local Cache (if recently updated and valid)
-    if df is None and os.path.exists(cache_file):
-        try:
-            df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-            is_valid, reason, age = validate_market_data(df_cache, max_age_days=max_age_days)
-            if is_valid:
-                df = df_cache
-                source = "Verified Local Cache"
         except Exception:
             df = None
 
@@ -270,6 +311,7 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
             "status": "OK",
             "df": df,
             "source": source,
+            "has_true_ohlc": has_true_ohlc,
             "last_date": latest_date_str,
             "data_age_days": max(0, age_days),
             "error": None,
@@ -281,6 +323,7 @@ def fetch_psx_stock(symbol: str, period: str = "6mo", max_age_days: int = 5) -> 
         "status": "UNAVAILABLE",
         "df": None,
         "source": "None",
+        "has_true_ohlc": False,
         "last_date": None,
         "data_age_days": 999,
         "error": f"Real market data unavailable for {clean_symbol}. Alert skipped to maintain data integrity.",

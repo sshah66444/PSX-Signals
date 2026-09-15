@@ -109,6 +109,8 @@ with col_status:
     if stock_res.get("status") == "OK":
         st.caption(f"Source: **{data_source}**")
         st.caption(f"Last Session: **{last_session}** (Age: {data_age}d)")
+        if not stock_res.get("has_true_ohlc", True):
+            st.warning("⚠️ **Approximated OHLC**: Data source provides Close/Open only. Setups requiring true intraday ranges (ATR, SL) are disqualified from TRIGGERED.")
     else:
         st.error(stock_res.get("error", "Data unavailable"))
 
@@ -166,7 +168,7 @@ with tab1:
 # ----------------- TAB 2: WATCHLIST SCREENER -----------------
 with tab2:
     st.markdown("### 📊 Real PSX Watchlist Screener")
-    st.caption("Scans 20 leading PSX equities using verified real prices (No synthetic data).")
+    st.caption(f"Scans {len(symbols_list)} leading PSX equities across all core sectors using verified real prices.")
 
     if st.button("🔄 Scan Entire PSX Watchlist Now"):
         st.cache_data.clear()
@@ -194,6 +196,7 @@ with tab2:
                     "TP1": sig.get("tp1", 0),
                     "R:R (TP1)": f"{sig.get('rr_tp1', 0)}:1",
                     "RSI": sig["rsi"],
+                    "OHLC Integrity": "Verified True OHLC" if res.get("has_true_ohlc") else "Approximated (Open/Close)",
                     "Data Source": res["source"],
                 })
         else:
@@ -209,6 +212,7 @@ with tab2:
                 "TP1": "-",
                 "R:R (TP1)": "-",
                 "RSI": "-",
+                "OHLC Integrity": "Unavailable",
                 "Data Source": "Offline / Skipped",
             })
 
