@@ -11,7 +11,11 @@ import plotly.express as px
 from data_engine import get_watchlist, fetch_psx_stock, fetch_kse100_index
 from signal_engine import generate_signal, format_actionable_card
 from chart_engine import create_signal_chart
-from backtester import run_signal_backtest
+from backtester import (
+    run_signal_backtest,
+    run_sensitivity_grid,
+    run_walk_forward_analysis,
+)
 from signal_tracker import get_active_signals, get_performance_summary
 
 # Set page configuration
@@ -103,6 +107,8 @@ broker_fee = st.sidebar.slider("Broker Fee + Taxes (% round-trip):", min_value=0
 time_stop_limit = st.sidebar.slider("Time-Stop Exit (Bars Stalled):", min_value=0, max_value=10, value=4, step=1, help="Exits trades that stall for N bars without momentum follow-through.")
 holding_limit = st.sidebar.slider("Max Holding Days (Backtest):", min_value=5, max_value=40, value=20, step=5)
 apply_macro_gate = st.sidebar.checkbox("Enforce KSE-100 Macro Gate", value=True, help="Suppresses long breakout entries when KSE-100 is in correction.")
+use_next_open = st.sidebar.checkbox("Next-Day Open Fills (T+1 Open)", value=True, help="Fills orders on bar T+1 Open price with volume-tiered spread & slippage rather than signal bar close.")
+enforce_circuit = st.sidebar.checkbox("PSX Circuit Breakers (±7.5%)", value=True, help="Enforces PSX daily limit bounds; discards upper-locked opens and penalizes limit-down stop exits.")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_cached_stock_data(symbol: str, period: str = "6mo", force_refresh: bool = False) -> dict:
@@ -317,10 +323,12 @@ with tab2:
 
 # ----------------- TAB 3: RIGOROUS BACKTESTER -----------------
 with tab3:
-    st.markdown(f"### 🧪 Rigorous Historical Simulation for {active_symbol}")
+    st.markdown(f"### 🧪 Quantitative Backtesting & Statistical Validation for {active_symbol}")
     st.markdown(
-        "Uses the **exact same strategy rules** as the live screener. "
-        f"Tracks independent TP1 & TP2 targets, detects ambiguous candles, enforces time-stops, and deducts **{broker_fee}% round-trip costs**."
+        "Evaluates the **exact same deterministic strategy** as the live screener with institutional realism: "
+        f"**Next-Day Open execution ({'Active' if use_next_open else 'Off'})**, "
+        f"**PSX ±7.5% Circuit Breakers ({'Active' if enforce_circuit else 'Off'})**, "
+        f"**Volume-Tiered Spread & Slippage**, and **{broker_fee}% commission**."
     )
 
     if df_stock is None:
@@ -333,6 +341,8 @@ with tab3:
             broker_fee_pct=broker_fee,
             df_kse=df_kse if apply_macro_gate else None,
             time_stop_bars=time_stop_limit,
+            use_next_day_open=use_next_open,
+            enforce_circuit_limits=enforce_circuit,
         )
 
         if "error" in bt_results:
@@ -340,26 +350,53 @@ with tab3:
         elif bt_results.get("resolved_trades", 0) == 0 and bt_results.get("unresolved_trades", 0) == 0:
             st.info("No trade signals triggered for this stock during this historical lookback period.")
         else:
+            # 1. Sample Size Adequacy & Microstructure Banner
+            adequacy = bt_results.get("sample_adequacy", {})
+            if adequacy.get("is_adequate"):
+                st.success(f"{adequacy.get('badge')}: {adequacy.get('warning')}")
+            else:
+                st.warning(f"{adequacy.get('badge')}: {adequacy.get('warning')}")
+
+            boot = bt_results.get("bootstrap", {})
+
+            # 2. Metrics Row with 95% Confidence Intervals
             b1, b2, b3, b4, b5, b6 = st.columns(6)
             with b1:
-                st.metric("Total Setups Triggered", bt_results["total_triggered"])
+                st.metric("Setups Triggered", bt_results["total_triggered"])
+                st.caption(f"Resolved: {bt_results['resolved_trades']}")
             with b2:
                 st.metric("TP1 Hit Rate", f"{bt_results['tp1_hit_rate_pct']}%")
+                st.caption(f"95% CI: [{boot.get('tp1_rate_ci', (0, 0))[0]}% – {boot.get('tp1_rate_ci', (0, 0))[1]}%]")
             with b3:
                 st.metric("TP2 Hit Rate", f"{bt_results['tp2_hit_rate_pct']}%")
+                st.caption(f"Hits: {bt_results['tp2_hits']}")
             with b4:
-                st.metric("Stop Loss Hit Rate", f"{bt_results['stop_loss_rate_pct']}%")
+                st.metric("Stop Loss Rate", f"{bt_results['stop_loss_rate_pct']}%")
+                st.caption(f"Hits: {bt_results['sl_hits']}")
             with b5:
                 st.metric("Time-Stop Exits", bt_results.get("time_stop_hits", 0))
+                st.caption(f"Limit: {time_stop_limit} bars")
             with b6:
                 st.metric("Net Strategy P&L", f"{bt_results['net_pnl_pct']:+.2f}%")
+                st.caption(f"95% CI: [{boot.get('net_pnl_ci', (0, 0))[0]:+.1f}% – {boot.get('net_pnl_ci', (0, 0))[1]:+.1f}%]")
 
             st.caption(
-                f"📊 **Profit Factor:** {bt_results.get('profit_factor', 0.0)} | "
+                f"📊 **Profit Factor:** {bt_results.get('profit_factor', 0.0)} (95% CI: [{boot.get('profit_factor_ci', (0, 0))[0]} – {boot.get('profit_factor_ci', (0, 0))[1]}]) | "
                 f"**Max Drawdown:** {bt_results.get('max_drawdown_pct', 0.0)}% | "
                 f"**Avg Trade P&L:** {bt_results.get('avg_trade_pnl_pct', 0.0):+.2f}% | "
+                f"**Execution Fill:** {'T+1 Open + Friction' if use_next_open else 'Bar Close'} | "
                 f"**Macro Filter:** {'Active (KSE-100)' if apply_macro_gate else 'Disabled'}"
             )
+
+            # Microstructure Discards notification
+            c_discards = bt_results.get("circuit_lock_discards", 0)
+            g_discards = bt_results.get("gap_discards", 0)
+            if c_discards > 0 or g_discards > 0:
+                st.info(
+                    f"🛡️ **Realistic Microstructure Discards**: "
+                    f"**{c_discards}** entry order(s) discarded due to Upper Circuit Lock (unfillable limit-up); "
+                    f"**{g_discards}** entry order(s) skipped due to overnight gap past target or stop loss."
+                )
 
             if bt_results["ambiguous_trades"] > 0:
                 st.warning(
@@ -369,7 +406,7 @@ with tab3:
 
             trades_df = bt_results.get("trades_df")
             if trades_df is not None and not trades_df.empty:
-                st.markdown("#### 📈 Simulated Equity Curve (Net of Broker Fees)")
+                st.markdown("#### 📈 Simulated Equity Curve (Net of Broker Fees & Friction)")
                 trades_df["Cumulative PnL (%)"] = trades_df["net_pnl_pct"].cumsum()
                 fig_pnl = px.line(
                     trades_df,
@@ -382,8 +419,58 @@ with tab3:
                 fig_pnl.update_layout(paper_bgcolor="#111722", plot_bgcolor="#161f30")
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-                st.markdown("#### 📜 Historical Simulated Trade Log")
+                st.markdown("#### 📜 Historical Simulated Trade Log (Realistic Microstructure)")
                 st.dataframe(trades_df, use_container_width=True, hide_index=True)
+
+            # 3. Interactive Parameter Sensitivity Expander
+            with st.expander("🔬 Parameter Sensitivity Matrix (Plateau vs. Needle Peak Analyzer)"):
+                st.markdown(
+                    "Pivots core strategy thresholds across a 9-point grid (RSI upper band, volume surge multiplier, and minimum R:R) "
+                    "to test whether profitability is an **enduring parameter plateau** or an **overfitted needle peak**."
+                )
+                with st.spinner("Computing parameter sensitivity surface..."):
+                    grid_res = run_sensitivity_grid(
+                        df_stock,
+                        symbol=active_symbol,
+                        df_kse=df_kse if apply_macro_gate else None,
+                        holding_max_bars=holding_limit,
+                        time_stop_bars=time_stop_limit,
+                    )
+                st.markdown(f"**Stability Rating:** {grid_res['stability_badge']}")
+                st.caption(
+                    f"**Profitable Variations:** {grid_res['profitable_pct']}% | "
+                    f"**Mean Net P&L:** {grid_res['mean_pnl']:+.2f}% | "
+                    f"**Std Dev:** ±{grid_res['std_pnl']}%"
+                )
+                st.markdown(f"*{grid_res['assessment']}*")
+                st.dataframe(grid_res["grid_df"], use_container_width=True, hide_index=True)
+
+            # 4. Walk-Forward Cross-Validation Expander
+            with st.expander("🔄 Rolling Walk-Forward Analysis (Out-of-Sample Forward Validation)"):
+                st.markdown(
+                    "Simulates rolling walk-forward optimization: trains in-sample on historical segments and tests forward "
+                    "on subsequent unseen sessions to detect lookahead bias and curve-fitting."
+                )
+                with st.spinner("Evaluating rolling out-of-sample forward windows..."):
+                    wfo_res = run_walk_forward_analysis(
+                        df_stock,
+                        symbol=active_symbol,
+                        df_kse=df_kse if apply_macro_gate else None,
+                    )
+                if wfo_res["status"] == "INSUFFICIENT_HISTORY":
+                    st.info(f"ℹ️ {wfo_res['message']}")
+                else:
+                    wf1, wf2, wf3 = st.columns(3)
+                    with wf1:
+                        st.metric("Forward Windows", wfo_res["windows_evaluated"])
+                    with wf2:
+                        st.metric("Out-of-Sample Trades", wfo_res["total_oos_trades"])
+                    with wf3:
+                        st.metric("Out-of-Sample Net P&L", f"{wfo_res['total_oos_net_pnl']:+.2f}%")
+                    if not wfo_res["oos_trades_df"].empty:
+                        st.dataframe(wfo_res["oos_trades_df"], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No out-of-sample setups triggered in forward windows.")
 
 # ----------------- TAB 4: LIVE BOT LEDGER (SIGNALS.DB) -----------------
 with tab4:

@@ -99,6 +99,7 @@ def evaluate_bar_strategy(
     bar_idx: int = -1,
     has_true_ohlc: bool = True,
     market_regime: dict = None,
+    params: dict = None,
 ) -> dict:
     """
     Evaluates strategy conditions on a specific historical bar.
@@ -110,6 +111,13 @@ def evaluate_bar_strategy(
     """
     if df_ind is None or len(df_ind) < 25:
         return {"status": "INSUFFICIENT_DATA"}
+
+    # Configurable Strategy Parameters with institutional defaults
+    p_vol_mult = params.get("vol_surge_mult", 1.20) if params else 1.20
+    p_rsi_min = params.get("rsi_min", 42.0) if params else 42.0
+    p_rsi_max = params.get("rsi_max", 68.0) if params else 68.0
+    p_pb_rsi_max = params.get("pullback_rsi_max", 58.0) if params else 58.0
+    p_rr_min = params.get("rr_min", 1.20) if params else 1.20
 
     # Normalize negative index
     n = len(df_ind)
@@ -151,8 +159,8 @@ def evaluate_bar_strategy(
     c_true_ohlc = bool(has_true_ohlc)
     c_trend = price > ema20 and ema20 > ema50
     c_macd_turn = macd_hist > prev_macd_hist
-    c_volume_surge = volume >= (1.20 * vol_ma)
-    c_rsi_healthy = 42.0 <= rsi <= 68.0
+    c_volume_surge = volume >= (p_vol_mult * vol_ma)
+    c_rsi_healthy = p_rsi_min <= rsi <= p_rsi_max
     c_breakout_level = price >= res20
     c_liquidity = vol_ma >= 80_000
 
@@ -176,11 +184,11 @@ def evaluate_bar_strategy(
             "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
             "Trend Alignment (Price > 20 & 50 EMA)": c_trend,
             "Resistance Test / Clearance": c_breakout_level,
-            "Volume Surge (Vol >= 1.20x 20MA)": c_volume_surge,
+            f"Volume Surge (Vol >= {p_vol_mult:.2f}x 20MA)": c_volume_surge,
             "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
             "Momentum Health (MACD Histogram Expanding)": c_macd_turn,
-            "Healthy RSI Range (42 - 68)": c_rsi_healthy,
-            "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
+            f"Healthy RSI Range ({p_rsi_min:.0f} - {p_rsi_max:.0f})": c_rsi_healthy,
+            f"Favorable Risk:Reward (>= {p_rr_min:.1f}:1)": rr_tp1 >= p_rr_min,
         }
 
         # Status determination (gated strictly on ALL checklist conditions)
@@ -241,7 +249,7 @@ def evaluate_bar_strategy(
     # --- STRATEGY 2: Pullback to 20 EMA / Support ---
     dist_to_ema20 = (price - ema20) / ema20
     is_in_pullback_zone = price > ema50 and (-0.02 <= dist_to_ema20 <= 0.02)
-    if is_in_pullback_zone and rsi < 58:
+    if is_in_pullback_zone and rsi < p_pb_rsi_max:
         strategy = "PULLBACK"
         entry_min = round(min(ema20 - 0.2 * atr, price * 0.99), 2)
         entry_max = round(max(price, ema20 + 0.2 * atr), 2)
@@ -261,10 +269,10 @@ def evaluate_bar_strategy(
             "Macro Trend Intact (Price > 50 EMA)": price > ema50,
             "Testing 20 EMA Support Zone": True,
             "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
-            "Cooling RSI (< 58, Not Overbought)": rsi < 58,
+            f"Cooling RSI (< {p_pb_rsi_max:.0f}, Not Overbought)": rsi < p_pb_rsi_max,
             "Bounce Confirmation (Bullish Close)": c_bounce_candle,
             "MACD Momentum Stabilization": c_macd_turn,
-            "Favorable Risk:Reward (>= 1.2:1)": rr_tp1 >= 1.2,
+            f"Favorable Risk:Reward (>= {p_rr_min:.1f}:1)": rr_tp1 >= p_rr_min,
         }
 
         # Status determination (gated strictly on ALL checklist conditions)
@@ -280,12 +288,12 @@ def evaluate_bar_strategy(
         elif not c_true_ohlc:
             status = "WATCHING"
             trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and stop-loss distance cannot be reliably calculated."
-        elif not (rr_tp1 >= 1.2):
+        elif not (rr_tp1 >= p_rr_min):
             status = "WATCHING"
-            trigger_note = f"Support bounce detected, but disqualified: Risk:Reward ({rr_tp1}:1) is below 1.2:1 minimum threshold."
-        elif not (rsi < 58):
+            trigger_note = f"Support bounce detected, but disqualified: Risk:Reward ({rr_tp1}:1) is below {p_rr_min:.1f}:1 minimum threshold."
+        elif not (rsi < p_pb_rsi_max):
             status = "WATCHING"
-            trigger_note = f"Testing support, but RSI ({rsi:.1f}) is elevated (> 58)."
+            trigger_note = f"Testing support, but RSI ({rsi:.1f}) is elevated (> {p_pb_rsi_max:.0f})."
         elif not c_liquidity:
             status = "WATCHING"
             trigger_note = f"Testing 20 EMA support, but liquidity ({vol_ma:.0f} shares) is below 80k threshold."
@@ -343,6 +351,7 @@ def generate_signal(
     data_meta: dict = None,
     df_kse: pd.DataFrame = None,
     market_regime: dict = None,
+    params: dict = None,
 ) -> dict:
     """
     Evaluates the latest completed session and formats a comprehensive setup package.
@@ -357,6 +366,7 @@ def generate_signal(
         bar_idx=-1,
         has_true_ohlc=has_true_ohlc,
         market_regime=market_regime,
+        params=params,
     )
     setup["symbol"] = symbol
     setup["df_indicators"] = df_ind

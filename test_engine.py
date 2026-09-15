@@ -320,6 +320,103 @@ def test_time_stop_exit():
     print(f"  ✓ Time-Stop Rule passed ({len(stalled_trades)} stalled trade(s) exited cleanly at >= 4 bars).")
 
 
+def test_microstructure_and_next_day_open():
+    print("10. Testing Next-Day Open (T+1 Open) fills & Volume-Tiered Friction...")
+    from backtester import calculate_execution_friction
+    
+    # Verify ADV tiers
+    spread1, slip1, tier1 = calculate_execution_friction(3_000_000)
+    assert spread1 == 0.15 and slip1 == 0.10 and "Tier 1" in tier1
+    spread2, slip2, tier2 = calculate_execution_friction(1_000_000)
+    assert spread2 == 0.35 and slip2 == 0.20 and "Tier 2" in tier2
+    spread3, slip3, tier3 = calculate_execution_friction(200_000)
+    assert spread3 == 0.65 and slip3 == 0.35 and "Tier 3" in tier3
+
+    cache_sys = os.path.join(os.path.dirname(__file__), ".cache", "SYS_real.csv")
+    df_sys = pd.read_csv(cache_sys, index_col=0, parse_dates=True)
+    bt = run_signal_backtest(df_sys, symbol="SYS", use_next_day_open=True)
+
+    assert "error" not in bt
+    trades = bt["trades_df"]
+    if not trades.empty:
+        for _, tr in trades.iterrows():
+            # Signal date must be strictly before entry date (cannot buy on signal candle close)
+            assert tr["entry_date"] > tr["signal_date"], (
+                f"Entry date {tr['entry_date']} must be after signal date {tr['signal_date']}"
+            )
+            # Entry price must incorporate spread and slippage above raw open
+            assert tr["entry_price"] >= tr["raw_open"], "Fill price must include friction above raw open"
+    print(f"  ✓ Next-Day Open execution passed (All {len(trades)} trades entered on Day T+1 Open with ADV friction).")
+
+
+def test_circuit_breaker_locks():
+    print("11. Testing PSX ±7.5% Circuit Breaker upper-lock discard & limit-down rules...")
+    # Use isolated test data with confirmed signal
+    df_circuit = generate_isolated_test_data(days=120, base_price=100.0)
+    
+    # Run backtest to find a triggered signal date
+    bt_initial = run_signal_backtest(df_circuit, symbol="TEST_CIRCUIT", use_next_day_open=True)
+    assert not bt_initial["trades_df"].empty, "Test data must generate at least one trade"
+    first_sig_date = bt_initial["trades_df"].iloc[0]["signal_date"]
+    
+    # Locate signal bar index and lock the next bar at Upper Circuit (+7.5%)
+    idx_sig = df_circuit.index.get_loc(first_sig_date)
+    idx_next = idx_sig + 1
+    prev_c = float(df_circuit["Close"].iloc[idx_sig])
+    upper_lock_price = round(prev_c * 1.075, 2)
+    
+    df_circuit.loc[df_circuit.index[idx_next], "Open"] = upper_lock_price
+    df_circuit.loc[df_circuit.index[idx_next], "High"] = upper_lock_price
+    df_circuit.loc[df_circuit.index[idx_next], "Low"] = upper_lock_price
+    df_circuit.loc[df_circuit.index[idx_next], "Close"] = upper_lock_price
+    
+    bt = run_signal_backtest(df_circuit, symbol="TEST_CIRCUIT", use_next_day_open=True, enforce_circuit_limits=True)
+    assert "error" not in bt
+    # Order must be discarded due to Upper Circuit Lock
+    assert bt.get("circuit_lock_discards", 0) >= 1, "Must discard entry order when next bar opens locked at upper circuit"
+    print("  ✓ PSX Circuit Breaker rule passed (Upper-circuit locked open correctly rejected as unfillable).")
+
+
+def test_bootstrap_ci_and_sample_adequacy():
+    print("12. Testing Bootstrap Resampling (1,000 runs) & Sample Size Adequacy ($N < 30$)...")
+    from backtester import evaluate_sample_adequacy, run_bootstrap_simulation
+    
+    # 1. Sample Size Adequacy
+    s0 = evaluate_sample_adequacy(0)
+    assert s0["is_adequate"] is False and "No Trades" in s0["badge"]
+    s1 = evaluate_sample_adequacy(8)
+    assert s1["is_adequate"] is False and "Critically Low" in s1["badge"]
+    s2 = evaluate_sample_adequacy(22)
+    assert s2["is_adequate"] is False and "Low" in s2["badge"]
+    s3 = evaluate_sample_adequacy(35)
+    assert s3["is_adequate"] is True and "Adequate" in s3["badge"]
+
+    # 2. Bootstrap Resampling
+    dummy_trades = pd.DataFrame({
+        "net_pnl_pct": [3.2, -1.5, 4.0, -2.1, 1.8, -0.8, 5.1, -1.9, 2.7, -1.2],
+        "tp1_reached": [True, False, True, False, True, False, True, False, True, False],
+    })
+    boot = run_bootstrap_simulation(dummy_trades, n_iterations=1000)
+    assert boot["iterations"] == 1000
+    assert boot["win_rate_ci"][0] <= boot["win_rate_ci"][1], "Lower bound of CI must be <= upper bound"
+    assert boot["net_pnl_ci"][0] <= boot["net_pnl_ci"][1], "Lower bound of Net P&L CI must be <= upper bound"
+    print(f"  ✓ Bootstrap & Sample Size passed (Win Rate 95% CI: [{boot['win_rate_ci'][0]}% – {boot['win_rate_ci'][1]}%]).")
+
+
+def test_parameter_sensitivity_grid():
+    print("13. Testing 9-Point Parameter Sensitivity Grid & Stability Plateau...")
+    from backtester import run_sensitivity_grid
+    cache_sys = os.path.join(os.path.dirname(__file__), ".cache", "SYS_real.csv")
+    df_sys = pd.read_csv(cache_sys, index_col=0, parse_dates=True)
+
+    grid = run_sensitivity_grid(df_sys, symbol="SYS")
+    assert "grid_df" in grid and not grid["grid_df"].empty
+    assert len(grid["grid_df"]) == 9, "Sensitivity grid must evaluate all 9 parameter variations"
+    assert "stability_badge" in grid
+    assert 0.0 <= grid["profitable_pct"] <= 100.0
+    print(f"  ✓ Sensitivity Grid passed ({len(grid['grid_df'])} variations evaluated | Stability: {grid['stability_badge']}).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -332,4 +429,8 @@ if __name__ == "__main__":
     test_sqlite_wal_mode()
     test_kse100_macro_and_relative_strength(df_test)
     test_time_stop_exit()
+    test_microstructure_and_next_day_open()
+    test_circuit_breaker_locks()
+    test_bootstrap_ci_and_sample_adequacy()
+    test_parameter_sensitivity_grid()
     print("=== All Verification Tests Passed Successfully! ===")

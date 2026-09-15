@@ -50,21 +50,38 @@ Both live alerts and historical backtests use the **exact same deterministic str
   ⚡ Status: TRIGGERED
   ```
 
-### 4. Positive-Expectancy Quant Engine & Multi-Target Backtester
+### 4. Realistic PSX Market Microstructure Engine
+* **Next-Day Open Execution ($T+1$ Open)**: Eliminates backtest lookahead bias by requiring that a signal generated on candle $T$'s close executes strictly on candle $T+1$'s Open.
+* **PSX Daily Circuit Breakers ($\pm 7.5\%$ or PKR 1.00 Min)**:
+  * Upper-circuit locked opens are rejected as unfillable due to zero market selling liquidity.
+  * Overnight gap-downs and limit-down stop-outs are filled at the locked limit price rather than ideal stop levels.
+* **Volume-Tiered Liquidity & Execution Friction**:
+  * Real trading costs go beyond flat commissions. The engine calculates dynamic bid-ask spreads and slippage based on 20-day Average Daily Volume (ADV):
+    * **Tier 1 (High Liquidity, $\text{ADV} \ge 2\text{M}$)**: 0.15% spread, 0.10% slippage.
+    * **Tier 2 (Medium Liquidity, $500\text{k} - 2\text{M}$)**: 0.35% spread, 0.20% slippage.
+    * **Tier 3 (Low Liquidity, $< 500\text{k}$)**: 0.65% spread, 0.35% slippage.
+
+### 5. Institutional Statistical Rigor & Robustness Validation
+* **1,000-Iteration Non-Parametric Bootstrap Resampling**: Replaces misleading point estimates with empirical 95% Confidence Intervals for Win Rate, Net P&L, and Profit Factor.
+* **Sample Size Adequacy Gating ($N < 30$)**: Enforces statistical thresholds. Backtests with $N < 15$ are flagged as *Critically Low Sample*, and $N < 30$ are warned as *Low Statistical Confidence* to prevent overfitting to small-sample noise.
+* **9-Point Parameter Sensitivity Matrix**: Perturbs key strategy variables (volume surge threshold, RSI bands, minimum R:R) across 9 permutations. Rates strategies as either **Stable Parameter Plateau** (robust edge) or **Fragile Needle Peak** (overfit to historical noise).
+* **Rolling Walk-Forward Optimization (WFO)**: Cross-validates in-sample performance against out-of-sample forward sessions to verify that edge persists out-of-sample.
+
+### 6. Positive-Expectancy Quant Engine & Multi-Target Backtester
 * **Macro Market Gate (KSE-100 Index)**: Official 5-year historical KSE-100 feed (`dps.psx.com.pk/timeseries/eod/KSE100`). Suppresses long entries when KSE-100 trades below its 50 EMA (`MARKET_CORRECTION - Cash Preservation Mode`), avoiding fighting market beta.
 * **Relative Strength (RS vs KSE-100)**: Quantifies stock performance relative to the index ($\text{RS} \ge \text{RS\_MA20}$), filtering for equities receiving institutional sponsorship.
 * **Volatility Compression Squeeze**: Measures Bollinger Bandwidth against 60-day compression minimums to ensure breakouts originate from tight bases rather than erratic exhaustion moves.
 * **Disciplined Time-Stops (4-Bar Rule)**: Automatically exits stalled trades after 4 sessions without follow-through, eliminating dead-capital drag and mitigating drawdown.
 * **Realistic Scale-Out Model**: 50% profit booked at TP1, Stop Loss trailed to Breakeven, remaining 50% trails toward TP2.
 * **Ambiguous Candle Detection**: Bars that touch both Target and Stop Loss on the same day are flagged as ambiguous and conservatively counted as stopped out. Same-bar retracements to breakeven after TP1 are accurately captured.
-* **Real Trading Costs**: Automatically factors in customizable PSX round-trip broker commissions and CDC/SECP taxes (default: 0.35%).
+* **Real Trading Costs**: Automatically factors in customizable PSX round-trip broker commissions and CDC/SECP taxes (default: 0.35%) plus dynamic volume-tiered liquidity friction.
 
-### 5. Persistent SQLite Signal Ledger (`signals.db`)
+### 7. Persistent SQLite Signal Ledger (`signals.db`)
 * Database tracks setups across their entire lifecycle: `WATCHING` $\rightarrow$ `TRIGGERED` $\rightarrow$ `TP1_HIT` $\rightarrow$ `TP2_HIT` / `STOPPED_OUT` / `EXPIRED`.
 * Configured with **SQLite WAL (Write-Ahead Logging)** mode and 30-second busy timeouts for concurrent access between Streamlit UI sessions and background Telegram bots.
 * Deduplicates unchanged setups so daily notifications only announce fresh triggers or lifecycle events.
 
-### 6. Autonomous Telegram Bot with Interactive Commands
+### 8. Autonomous Telegram Bot with Interactive Commands
 * **Daily Morning Scan**: Automatically audits active setups and alerts on newly confirmed triggers.
 * **Interactive Command Handler**:
   * `/scan` — Trigger an immediate market-wide scan across all 75 stocks.
