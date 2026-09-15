@@ -105,12 +105,17 @@ def build_daily_psx_digest(symbols: list = None, lang: str = "roman_urdu") -> li
             else:
                 card = (
                     f"🟢 <b>${sym}</b> — {comp_name}\n"
+                    f"🏢 <b>Sector:</b> {watchlist.get(sym, {}).get('sector', 'Equities')}\n"
                     f"💰 <b>Price:</b> {sig['price']:.2f} PKR\n"
                     f"🎯 <b>Signal:</b> {sig['signal_type']} {sig['stars']}\n"
-                    f"🛒 <b>Buy Zone:</b> {sig['buy_zone_low']:.2f} – {sig['buy_zone_high']:.2f}\n"
-                    f"🛑 <b>Stop Loss:</b> {sig['stop_loss']:.2f}\n"
-                    f"🎯 <b>TP1:</b> {sig['tp1']:.2f} | <b>TP2:</b> {sig['tp2']:.2f}\n"
-                    f"⚖️ <b>R:R (TP1):</b> {sig['rr_tp1']}:1 | <b>RSI:</b> {sig['rsi']}\n"
+                    f"📊 <b>Analysis:</b> {sig.get('wajah_en', '')}\n"
+                    f"🛒 <b>Buy Zone:</b> {sig['buy_zone_low']:.2f} – {sig['buy_zone_high']:.2f} PKR\n"
+                    f"🛑 <b>Stop Loss:</b> {sig['stop_loss']:.2f} PKR (Risk: -{((sig['price'] - sig['stop_loss'])/sig['price'])*100:.1f}%)\n"
+                    f"🎯 <b>TP1 Target:</b> {sig['tp1']:.2f} PKR (R:R = {sig['rr_tp1']}:1)\n"
+                    f"🎯 <b>TP2 Target:</b> {sig['tp2']:.2f} PKR (R:R = {sig['rr_tp2']}:1)\n"
+                    f"🎯 <b>TP3 Target:</b> {sig['tp3']:.2f} PKR\n"
+                    f"📈 <b>RSI (14):</b> {sig['rsi']} | <b>ATR:</b> {sig['atr']:.2f}\n"
+                    f"⚠️ <i>Caution: {sig.get('caution_en', '')}</i>\n"
                 )
             messages.append(card)
 
@@ -129,7 +134,7 @@ def build_daily_psx_digest(symbols: list = None, lang: str = "roman_urdu") -> li
 def main():
     parser = argparse.ArgumentParser(description="PSX Telegram Trade Signal Notifier")
     parser.add_argument("--symbol", type=str, help="Specific PSX symbol to scan (e.g. IPAK)")
-    parser.add_argument("--lang", type=str, choices=["roman_urdu", "english"], default="roman_urdu")
+    parser.add_argument("--lang", type=str, choices=["roman_urdu", "english"], default="english")
     parser.add_argument("--dry-run", action="store_true", help="Print messages to console without sending to Telegram")
     args = parser.parse_args()
 

@@ -108,14 +108,16 @@ def generate_signal(symbol: str, df: pd.DataFrame) -> dict:
     rsi_oversold = rsi < 35
     volume_high = latest["Volume"] > (latest["Vol_MA20"] if not pd.isna(latest["Vol_MA20"]) else 0)
 
-    # 2. Signal Classification & Wajah (Reasoning)
+    # 2. Signal Classification & Reasoning
     if trend_bullish and not price_extended and macd_bullish and not macd_hist_cooling and (45 <= rsi <= 65):
         signal_type = "STRONG BUY"
         signal_ur = "BUY (Mazboot Momentum)"
         wajah_ur = "Price 20 EMA se upar hai, MACD bullish expansion mein hai aur RSI healthy range mein hai."
+        wajah_en = "Price above 20 EMA with bullish MACD expansion and healthy RSI."
         entry_advice_ur = "CURRENT PRICE PAR LE SAKTE HAIN"
         pullback_note_ur = "Momentum strong hai, breakout confirmation mil chuka hai."
         caution_ur = "Aam volume se zyada volume confirm karein aur stop loss lazmi follow karein."
+        caution_en = "Confirm above-average volume and strictly follow stop loss."
         stars = "★★★★☆"
         star_count = 4
 
@@ -124,9 +126,11 @@ def generate_signal(symbol: str, df: pd.DataFrame) -> dict:
         signal_type = "BUY (Risky / Extended)"
         signal_ur = "BUY (lekin abhi risky hai)"
         wajah_ur = "MACD bearish turn le chuka hai ya momentum cool ho raha hai (price extended hai)."
+        wajah_en = "Price is extended above 20 EMA and MACD momentum is cooling down."
         entry_advice_ur = "LE SAKTE HAIN (price extended hai)"
         pullback_note_ur = "Behtar entry Buy Zone mein milegi, lekin agar pullback ka wait nahi karna to abhi bhi partial lena reasonable hai."
         caution_ur = "MACD bearish turn le chuka hai (momentum cooling) — chhoti/partial position ya extra confirmation ke sath hi lein."
+        caution_en = "Wait for pullback to Buy Zone or trade only small/partial position."
         stars = "★★★☆☆"
         star_count = 3
 
@@ -134,9 +138,11 @@ def generate_signal(symbol: str, df: pd.DataFrame) -> dict:
         signal_type = "BUY ON PULLBACK"
         signal_ur = "BUY ON DIP (Support Zone)"
         wajah_ur = "Price key support aur Buy Zone ke qareeb test kar rahi hai. Risk/reward yahan sab se behtar hai."
+        wajah_en = "Price testing key support and Buy Zone. Optimal risk-to-reward setup."
         entry_advice_ur = "BUY ZONE ENTRY (Ideal Risk/Reward)"
         pullback_note_ur = "Support se bounce ka wait karein, confirmation par full quantity accumulate karein."
         caution_ur = "Agar support break ho jaye to fauran exit karein."
+        caution_en = "Wait for bounce confirmation. Exit immediately if support breaks."
         stars = "★★★★☆"
         star_count = 4
 
@@ -144,9 +150,11 @@ def generate_signal(symbol: str, df: pd.DataFrame) -> dict:
         signal_type = "SELL / TAKE PROFIT"
         signal_ur = "SELL / PROFIT BOOKING"
         wajah_ur = "RSI overbought zone mein hai ya moving average breakdown ho chuka hai."
+        wajah_en = "RSI in overbought zone or moving average breakdown confirmed."
         entry_advice_ur = "NAYA BUY MAT KAREIN (Risky Zone)"
         pullback_note_ur = "Mojooda holdings par munafa book karein aur consolidation ka intezar karein."
         caution_ur = "Greed se bachein, market distribution phase mein ho sakti hai."
+        caution_en = "Avoid new buys. Lock in profits on existing positions."
         stars = "★★☆☆☆"
         star_count = 2
 
@@ -154,9 +162,11 @@ def generate_signal(symbol: str, df: pd.DataFrame) -> dict:
         signal_type = "NEUTRAL / WAIT"
         signal_ur = "NEUTRAL (Intezar Karein)"
         wajah_ur = "Market consolidation / range-bound phase mein hai. Directional confirmation nahi hai."
+        wajah_en = "Market in consolidation / range-bound phase without directional bias."
         entry_advice_ur = "WAIT FOR BREAKOUT"
         pullback_note_ur = "Breakout ya support bounce ka intezar karein."
         caution_ur = "Range mein choppy trades se bachein."
+        caution_en = "Wait for breakout confirmation or key support test."
         stars = "★★☆☆☆"
         star_count = 2
 
@@ -231,7 +241,9 @@ TP4 Target  : {tp4:.2f} (+{((tp4 - price)/price)*100:.1f}%)
         "stars": stars,
         "star_count": star_count,
         "wajah_ur": wajah_ur,
+        "wajah_en": wajah_en,
         "caution_ur": caution_ur,
+        "caution_en": caution_en,
         "entry_advice_ur": entry_advice_ur,
         "buy_zone_low": bz_low,
         "buy_zone_high": bz_high,
