@@ -56,6 +56,19 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool:
+    """Delivers message to one or more recipients, groups, or channels (comma-separated)."""
+    if not token or not chat_ids_str:
+        return False
+    recipients = [c.strip() for c in str(chat_ids_str).split(",") if c.strip()]
+    success = True
+    for cid in recipients:
+        ok = send_telegram_message(token, cid, text)
+        if not ok:
+            success = False
+    return success
+
+
 def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_run: bool = False) -> list[str]:
     """
     Executes the complete daily workflow:
@@ -85,7 +98,7 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
     for upd in lifecycle_updates:
         messages.append(upd["text"])
         if not dry_run and token and chat_id:
-            send_telegram_message(token, chat_id, upd["text"])
+            broadcast_telegram_message(token, chat_id, upd["text"])
 
     # 3. Evaluate setups for new/updated triggers
     print("3. Evaluating setups across watchlist...")
@@ -103,7 +116,7 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
                 card = format_actionable_card(setup, company_name=comp_name)
                 new_setup_cards.append(card)
                 if not dry_run and token and chat_id:
-                    send_telegram_message(token, chat_id, card)
+                    broadcast_telegram_message(token, chat_id, card)
 
     # 4. Summary header
     today_str = datetime.date.today().strftime("%d-%b-%Y")
@@ -240,6 +253,7 @@ def poll_incoming_commands(token: str, chat_id: str):
         if not results:
             return
 
+        authorized_ids = [c.strip() for c in str(chat_id).split(",") if c.strip()] if chat_id else []
         max_update_id = 0
         for item in results:
             upd_id = item.get("update_id", 0)
@@ -250,9 +264,10 @@ def poll_incoming_commands(token: str, chat_id: str):
             sender_chat_id = str(msg.get("chat", {}).get("id"))
             text = msg.get("text", "")
 
-            # Security: Only respond to authorized chat_id
-            if sender_chat_id == str(chat_id) and text.startswith("/"):
-                print(f"Processing command from user: {text}")
+            # Security: Allow if sender is in authorized_ids list, or if chat_id contains '*'
+            is_authorized = not authorized_ids or "*" in authorized_ids or sender_chat_id in authorized_ids
+            if is_authorized and text.startswith("/"):
+                print(f"Processing command from user {sender_chat_id}: {text}")
                 handle_interactive_command(token, sender_chat_id, text)
 
         # Clear processed updates
