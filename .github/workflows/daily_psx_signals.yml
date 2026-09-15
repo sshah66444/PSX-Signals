@@ -1,0 +1,33 @@
+name: PSX Daily Telegram Signals
+
+on:
+  schedule:
+    # Runs Monday through Friday at 11:30 UTC (4:30 PM Pakistan Time - right after PSX closes)
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch: # Allows manual trigger anytime from GitHub UI or GitHub Mobile app
+
+jobs:
+  scan-and-notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PSX Screener & Send Telegram Signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python telegram_notifier.py --lang roman_urdu
