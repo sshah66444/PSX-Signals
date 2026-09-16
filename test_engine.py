@@ -417,6 +417,52 @@ def test_parameter_sensitivity_grid():
     print(f"  ✓ Sensitivity Grid passed ({len(grid['grid_df'])} variations evaluated | Stability: {grid['stability_badge']}).")
 
 
+def test_walk_forward_validation():
+    print("14. Testing Rolling Walk-Forward Out-of-Sample Validation...")
+    from backtester import run_walk_forward_analysis, MIN_OOS_WINDOW_BARS
+
+    # Self-contained: uses the quarantined synthetic generator directly rather than
+    # relying on a pre-warmed live-fetch cache, so this test doesn't depend on
+    # network access or another test having run first.
+    df = generate_isolated_test_data(days=400, base_price=120.0)
+
+    # 1. REGRESSION GUARD: the historical bug was that the default test_bars (25)
+    # sat below run_signal_backtest's own 30-bar floor, so every OOS window was
+    # silently discarded as "insufficient data" and total_oos_trades was always 0,
+    # which is easy to misread as "the strategy has no out-of-sample edge."
+    # With defaults restored to a valid window size, real data must produce
+    # evaluable windows and at least one genuine out-of-sample trade.
+    res = run_walk_forward_analysis(df, symbol="WFO_TEST")
+    assert res["status"] == "OK"
+    assert res["windows_evaluated"] > 0, "Default parameters must produce at least one evaluable window"
+    assert res["total_oos_trades"] > 0, (
+        "Default parameters produced zero OOS trades on data known to trigger setups — "
+        "this is the exact silent-failure mode the test_bars floor guards against"
+    )
+    if not res["oos_trades_df"].empty:
+        assert "wfo_window" in res["oos_trades_df"].columns
+        assert "net_pnl_pct" in res["oos_trades_df"].columns
+
+    # 2. Explicitly passing a stale/too-small test_bars must be clamped up to the
+    # floor rather than silently reproducing the zero-trade bug.
+    res_clamped = run_walk_forward_analysis(df, symbol="WFO_TEST", test_bars=10)
+    assert res_clamped["status"] == "OK"
+    assert res_clamped["windows_evaluated"] > 0
+    assert res_clamped["total_oos_trades"] > 0, "A too-small test_bars must be clamped to MIN_OOS_WINDOW_BARS, not silently zeroed out"
+
+    # 3. Insufficient total history must be reported explicitly, not silently
+    # zeroed out the same way an undersized window used to be.
+    short_df = df.iloc[:60]
+    res_short = run_walk_forward_analysis(short_df, symbol="WFO_TEST")
+    assert res_short["status"] == "INSUFFICIENT_HISTORY"
+    assert res_short["windows_evaluated"] == 0
+
+    print(
+        f"  ✓ Walk-Forward validation passed ({res['windows_evaluated']} windows, "
+        f"{res['total_oos_trades']} OOS trades, MIN_OOS_WINDOW_BARS={MIN_OOS_WINDOW_BARS})."
+    )
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -433,4 +479,5 @@ if __name__ == "__main__":
     test_circuit_breaker_locks()
     test_bootstrap_ci_and_sample_adequacy()
     test_parameter_sensitivity_grid()
+    test_walk_forward_validation()
     print("=== All Verification Tests Passed Successfully! ===")

@@ -656,17 +656,41 @@ def run_sensitivity_grid(
     }
 
 
+# run_signal_backtest's own hard floor (loop starts at bar index 25, plus a small
+# margin of evaluable bars). Any OOS window shorter than this is silently discarded
+# by run_signal_backtest as "Insufficient historical data" before a single bar is
+# evaluated -- which is exactly what happened with the old test_bars=25 default.
+MIN_OOS_WINDOW_BARS = 35
+
+
 def run_walk_forward_analysis(
     df: pd.DataFrame,
     symbol: str,
     df_kse: pd.DataFrame = None,
     train_bars: int = 70,
-    test_bars: int = 25,
+    test_bars: int = 35,
 ) -> dict:
     """
-    Executes a rolling Walk-Forward Optimization (WFO) simulation.
-    Tests whether in-sample performance holds up on unseen out-of-sample forward sessions.
+    Executes a rolling walk-forward validation of the strategy's fixed rule set.
+
+    NOTE ON NAMING: despite the "WFO" shorthand used elsewhere in this project,
+    this function does NOT refit or optimize strategy parameters on each in-sample
+    (train) window -- it applies the same fixed default rules to every out-of-sample
+    (test) window and reports how they performed on data the rules were never tuned
+    against. That is a genuine and useful out-of-sample robustness check, but it is
+    not parameter optimization; treat "in-sample" window boundaries as a training
+    corpus reserved for a future parameter-search extension, not as evidence that
+    parameters were actually re-fit here.
+
+    test_bars is clamped to MIN_OOS_WINDOW_BARS: run_signal_backtest refuses to
+    evaluate any window shorter than 30 bars, so a test_bars value below that would
+    silently produce zero out-of-sample trades in every window, which is easy to
+    misread as "the strategy has no out-of-sample edge" rather than "the window was
+    too short to run at all."
     """
+    if test_bars < MIN_OOS_WINDOW_BARS:
+        test_bars = MIN_OOS_WINDOW_BARS
+
     n = len(df)
     if n < (train_bars + test_bars):
         return {
@@ -688,6 +712,9 @@ def run_walk_forward_analysis(
         test_end = min(train_end + test_bars, n)
         window_count += 1
 
+        # df_train is the in-sample segment for this window; reserved for a future
+        # per-window parameter-fit step (see docstring). Not currently used to
+        # alter the rules applied to df_test.
         df_train = df.iloc[start:train_end]
         df_test = df.iloc[train_end:test_end]
 
