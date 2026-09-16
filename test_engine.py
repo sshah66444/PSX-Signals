@@ -463,6 +463,62 @@ def test_walk_forward_validation():
     )
 
 
+def test_trailing_ema_exit_mode():
+    print("15. Testing Macro-Gated Trailing Trend Exit Architecture (Trailing 20 EMA vs Fixed TP)...")
+    # 1. Backtest with trailing_ema mode (default)
+    df_test = generate_isolated_test_data(days=150, base_price=100.0)
+    bt_trail = run_signal_backtest(df_test, symbol="TEST_TRAIL", exit_mode="trailing_ema")
+    assert "error" not in bt_trail
+    assert bt_trail["microstructure"]["exit_mode"] == "trailing_ema"
+
+    # 2. Backtest with legacy fixed_tp mode
+    bt_fixed = run_signal_backtest(df_test, symbol="TEST_FIXED", exit_mode="fixed_tp")
+    assert "error" not in bt_fixed
+    assert bt_fixed["microstructure"]["exit_mode"] == "fixed_tp"
+
+    # 3. Check signal engine setup output includes trailing_stop_ema and trailing_rule
+    df_ind = compute_all_indicators(df_test)
+    for i in range(25, len(df_ind)):
+        setup = evaluate_bar_strategy(df_ind, bar_idx=i)
+        if setup.get("status") in ["TRIGGERED", "WATCHLIST"]:
+            assert "trailing_stop_ema" in setup, "Setup must contain trailing_stop_ema"
+            assert "trailing_rule" in setup, "Setup must contain trailing_rule"
+            break
+
+    # 4. Check actionable card formatting includes Exit Model
+    dummy_signal = {
+        "symbol": "TEST",
+        "status": "TRIGGERED",
+        "action": "BUY (MOMENTUM CONFIRMED)",
+        "strategy": "BREAKOUT",
+        "price": 105.0,
+        "entry_range": (104.0, 106.0),
+        "stop_loss": 98.0,
+        "tp1": 115.0,
+        "tp2": 125.0,
+        "trailing_stop_ema": 102.5,
+        "trailing_rule": "Trail daily stop along 20-day EMA",
+        "confidence": 85,
+        "rsi": 62.0,
+        "volume_surge": 1.8,
+        "vol_20ma": 1500000,
+        "spread_slippage_pct": 0.35,
+        "relative_strength": "OUTPERFORMING (+5.2%)",
+        "score": 88,
+        "checklist": {
+            "price_above_ema50": True,
+            "rsi_in_sweet_spot": True,
+            "macd_bullish": True,
+            "volume_surge_confirmed": True,
+            "favorable_risk_reward": True,
+        },
+        "market_regime": {"is_bullish": True, "regime": "BULL_MARKET"},
+    }
+    card_text = format_actionable_card(dummy_signal, "Test Company")
+    assert "Trailing 20 EMA" in card_text, "Actionable card must mention Trailing 20 EMA exit model"
+    print("  ✓ Trailing 20 EMA Exit Architecture passed (Trailing EMA + Structural Stops + Telegram Card).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -480,4 +536,5 @@ if __name__ == "__main__":
     test_bootstrap_ci_and_sample_adequacy()
     test_parameter_sensitivity_grid()
     test_walk_forward_validation()
+    test_trailing_ema_exit_mode()
     print("=== All Verification Tests Passed Successfully! ===")

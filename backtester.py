@@ -133,13 +133,14 @@ def run_bootstrap_simulation(
 def run_signal_backtest(
     df: pd.DataFrame,
     symbol: str,
-    holding_max_bars: int = 20,
+    holding_max_bars: int = 30,
     broker_fee_pct: float = 0.35,  # Round-trip commission + CDC/SECP charges
     df_kse: pd.DataFrame = None,
     time_stop_bars: int = 4,
     use_next_day_open: bool = True,
     enforce_circuit_limits: bool = True,
     strategy_params: dict = None,
+    exit_mode: str = "trailing_ema",  # "trailing_ema" (default, lets winners run) or "fixed_tp" (legacy)
 ) -> dict:
     """
     Backtests strategy performance bar-by-bar across historical data.
@@ -147,6 +148,9 @@ def run_signal_backtest(
     Strictly requires verified intraday High/Low data.
 
     Execution Realism:
+    - exit_mode:
+      * "trailing_ema" (default): Lets winners compound along 20 EMA trend; exits on daily close < 20 EMA.
+      * "fixed_tp": Legacy scale-out model (50% booked at TP1, SL moved to breakeven, remainder to TP2).
     - use_next_day_open: When True, signal at close of bar T triggers entry on Open of bar T+1.
     - enforce_circuit_limits: PSX ±7.5% (min PKR 1.00) limits enforce realistic fills:
       * Upper-circuit locked opens are discarded as unfillable.
@@ -267,75 +271,32 @@ def run_signal_backtest(
             # Circuit breaker check: Was the day locked at lower circuit?
             is_lower_locked = enforce_circuit_limits and (close_p <= limit_dn + 0.05 and high_p <= limit_dn + 0.05)
 
-            # Ambiguous candle check: touched both target and stop on the same bar
-            hit_tp1_this_bar = high_p >= tp1
-            hit_sl_this_bar = low_p <= sl
-
-            if hit_tp1_this_bar and hit_sl_this_bar and not active["tp1_hit"]:
-                active["ambiguous_bars"] += 1
-                actual_sl = min(sl, open_p)
-                if is_lower_locked:
-                    actual_sl = min(actual_sl, limit_dn)
-                gross_return = (actual_sl - entry) / entry
-                net_return = gross_return - (total_exit_friction / 100.0)
-                active.update({
-                    "exit_date": date,
-                    "exit_price": actual_sl,
-                    "outcome": "STOP LOSS HIT (Ambiguous Bar)",
-                    "tp1_reached": False,
-                    "tp2_reached": False,
-                    "gross_pnl_pct": round(gross_return * 100, 2),
-                    "net_pnl_pct": round(net_return * 100, 2),
-                    "is_ambiguous": True,
-                })
-                trades.append(active)
-                in_trade = False
-                continue
-
-            # Case 1: Stop Loss Hit (before TP1)
-            if low_p <= sl and not active["tp1_hit"]:
-                actual_sl = min(sl, open_p)
-                if is_lower_locked:
-                    actual_sl = min(actual_sl, limit_dn)
-                    outcome_msg = "STOP LOSS HIT (Lower Circuit Limit)"
-                else:
-                    outcome_msg = "STOP LOSS HIT"
-                gross_return = (actual_sl - entry) / entry
-                net_return = gross_return - (total_exit_friction / 100.0)
-                active.update({
-                    "exit_date": date,
-                    "exit_price": actual_sl,
-                    "outcome": outcome_msg,
-                    "tp1_reached": False,
-                    "tp2_reached": False,
-                    "gross_pnl_pct": round(gross_return * 100, 2),
-                    "net_pnl_pct": round(net_return * 100, 2),
-                    "is_ambiguous": False,
-                })
-                trades.append(active)
-                in_trade = False
-                continue
-
-            # Case 2: TP1 Reached (Scale-out model: 50% booked, SL moved to breakeven)
-            if high_p >= tp1 and not active["tp1_hit"]:
-                active["tp1_hit"] = True
-                active["stop_loss"] = entry  # Trailing stop to breakeven
-                tp1_fill = max(tp1, open_p)  # Account for favorable opening gaps
-
-                # Subcase 2a: If high also reached TP2 on same bar
+            # -----------------------------------------------------------------
+            # A. TRAILING 20 EMA EXIT MODE (PSX TREND MODEL)
+            # -----------------------------------------------------------------
+            if exit_mode == "trailing_ema":
+                # Milestone touch checks (track without capping upside prematurely)
+                if high_p >= tp1:
+                    active["tp1_hit"] = True
                 if high_p >= tp2:
                     active["tp2_hit"] = True
-                    tp2_fill = max(tp2, open_p)
-                    p1_ret = (tp1_fill - entry) / entry
-                    p2_ret = (tp2_fill - entry) / entry
-                    gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+
+                # Case 1: Hard Stop Loss Hit
+                if low_p <= sl:
+                    actual_sl = min(sl, open_p)
+                    if is_lower_locked:
+                        actual_sl = min(actual_sl, limit_dn)
+                        outcome_msg = "STOP LOSS HIT (Lower Circuit Limit)"
+                    else:
+                        outcome_msg = "STOP LOSS HIT"
+                    gross_return = (actual_sl - entry) / entry
                     net_return = gross_return - (total_exit_friction / 100.0)
                     active.update({
                         "exit_date": date,
-                        "exit_price": tp2_fill,
-                        "outcome": "TP1 & TP2 HIT (Full Target)",
-                        "tp1_reached": True,
-                        "tp2_reached": True,
+                        "exit_price": actual_sl,
+                        "outcome": outcome_msg,
+                        "tp1_reached": active["tp1_hit"],
+                        "tp2_reached": active["tp2_hit"],
                         "gross_pnl_pct": round(gross_return * 100, 2),
                         "net_pnl_pct": round(net_return * 100, 2),
                         "is_ambiguous": False,
@@ -344,18 +305,86 @@ def run_signal_backtest(
                     in_trade = False
                     continue
 
-                # Subcase 2b: Same-bar retracement to Breakeven (Low <= entry)
-                if low_p <= entry:
-                    active["ambiguous_bars"] += 1
-                    p1_ret = (tp1_fill - entry) / entry
-                    p2_ret = 0.0  # Breakeven on second half
-                    gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                # Case 2: Trailing 20 EMA Exit (after minimum 3-bar initial holding grace period)
+                ema20_val = float(bar["EMA_20"]) if "EMA_20" in bar and pd.notna(bar["EMA_20"]) else None
+                if active["bars_held"] >= 3 and ema20_val is not None and close_p < ema20_val:
+                    actual_exit = close_p
+                    gross_return = (actual_exit - entry) / entry
                     net_return = gross_return - (total_exit_friction / 100.0)
                     active.update({
                         "exit_date": date,
-                        "exit_price": entry,
-                        "outcome": "TP1 HIT + SAME-DAY BREAKEVEN",
-                        "tp1_reached": True,
+                        "exit_price": actual_exit,
+                        "outcome": "TRAIL_20EMA EXIT",
+                        "tp1_reached": active["tp1_hit"] or (net_return > 0),
+                        "tp2_reached": active["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": False,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
+
+                # Case 3: Optional Time-Stop Exit (if time_stop_bars > 0 explicitly requested)
+                if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
+                    stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
+                    if close_p <= stalled_threshold:
+                        exit_price = close_p
+                        gross_return = (exit_price - entry) / entry
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        active.update({
+                            "exit_date": date,
+                            "exit_price": exit_price,
+                            "outcome": "TIME-STOP EXIT (Stalled Momentum)",
+                            "tp1_reached": False,
+                            "tp2_reached": False,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "is_ambiguous": False,
+                        })
+                        trades.append(active)
+                        in_trade = False
+                        continue
+
+                # Case 4: Maximum Holding Limit Reached
+                if active["bars_held"] >= holding_max_bars:
+                    exit_price = close_p
+                    gross_return = (exit_price - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": exit_price,
+                        "outcome": "EXPIRED (Holding Limit)",
+                        "tp1_reached": active["tp1_hit"] or (net_return > 0),
+                        "tp2_reached": active["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": False,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
+
+            # -----------------------------------------------------------------
+            # B. LEGACY FIXED TP SCALE-OUT MODE ("fixed_tp")
+            # -----------------------------------------------------------------
+            else:
+                # Ambiguous candle check: touched both target and stop on the same bar
+                hit_tp1_this_bar = high_p >= tp1
+                hit_sl_this_bar = low_p <= sl
+
+                if hit_tp1_this_bar and hit_sl_this_bar and not active["tp1_hit"]:
+                    active["ambiguous_bars"] += 1
+                    actual_sl = min(sl, open_p)
+                    if is_lower_locked:
+                        actual_sl = min(actual_sl, limit_dn)
+                    gross_return = (actual_sl - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": actual_sl,
+                        "outcome": "STOP LOSS HIT (Ambiguous Bar)",
+                        "tp1_reached": False,
                         "tp2_reached": False,
                         "gross_pnl_pct": round(gross_return * 100, 2),
                         "net_pnl_pct": round(net_return * 100, 2),
@@ -365,58 +394,20 @@ def run_signal_backtest(
                     in_trade = False
                     continue
 
-            # Case 3: Already hit TP1, now checking TP2 or Breakeven
-            elif active["tp1_hit"]:
-                if high_p >= tp2:
-                    active["tp2_hit"] = True
-                    tp2_fill = max(tp2, open_p)
-                    p1_ret = (tp1 - entry) / entry
-                    p2_ret = (tp2_fill - entry) / entry
-                    gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                # Case 1: Stop Loss Hit (before TP1)
+                if low_p <= sl and not active["tp1_hit"]:
+                    actual_sl = min(sl, open_p)
+                    if is_lower_locked:
+                        actual_sl = min(actual_sl, limit_dn)
+                        outcome_msg = "STOP LOSS HIT (Lower Circuit Limit)"
+                    else:
+                        outcome_msg = "STOP LOSS HIT"
+                    gross_return = (actual_sl - entry) / entry
                     net_return = gross_return - (total_exit_friction / 100.0)
                     active.update({
                         "exit_date": date,
-                        "exit_price": tp2_fill,
-                        "outcome": "TP1 + TP2 HIT",
-                        "tp1_reached": True,
-                        "tp2_reached": True,
-                        "gross_pnl_pct": round(gross_return * 100, 2),
-                        "net_pnl_pct": round(net_return * 100, 2),
-                        "is_ambiguous": False,
-                    })
-                    trades.append(active)
-                    in_trade = False
-                    continue
-                elif low_p <= active["stop_loss"]:
-                    p1_ret = (tp1 - entry) / entry
-                    p2_ret = 0.0  # Stopped at Breakeven
-                    gross_return = 0.5 * p1_ret + 0.5 * p2_ret
-                    net_return = gross_return - (total_exit_friction / 100.0)
-                    active.update({
-                        "exit_date": date,
-                        "exit_price": active["stop_loss"],
-                        "outcome": "TP1 HIT (Trailing Stopped at BE)",
-                        "tp1_reached": True,
-                        "tp2_reached": False,
-                        "gross_pnl_pct": round(gross_return * 100, 2),
-                        "net_pnl_pct": round(net_return * 100, 2),
-                        "is_ambiguous": False,
-                    })
-                    trades.append(active)
-                    in_trade = False
-                    continue
-
-            # Case 4: Time-Stop Exit (Stalled Momentum before TP1)
-            if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
-                stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
-                if close_p <= stalled_threshold:
-                    exit_price = close_p
-                    gross_return = (exit_price - entry) / entry
-                    net_return = gross_return - (total_exit_friction / 100.0)
-                    active.update({
-                        "exit_date": date,
-                        "exit_price": exit_price,
-                        "outcome": "TIME-STOP EXIT (Stalled Momentum)",
+                        "exit_price": actual_sl,
+                        "outcome": outcome_msg,
                         "tp1_reached": False,
                         "tp2_reached": False,
                         "gross_pnl_pct": round(gross_return * 100, 2),
@@ -427,29 +418,140 @@ def run_signal_backtest(
                     in_trade = False
                     continue
 
-            # Case 5: Expiration (Holding limit reached)
-            if active["bars_held"] >= holding_max_bars:
-                exit_price = close_p
-                if active["tp1_hit"]:
-                    p1_ret = (tp1 - entry) / entry
-                    p2_ret = (exit_price - entry) / entry
-                    gross_return = 0.5 * p1_ret + 0.5 * p2_ret
-                else:
-                    gross_return = (exit_price - entry) / entry
-                net_return = gross_return - (total_exit_friction / 100.0)
-                active.update({
-                    "exit_date": date,
-                    "exit_price": exit_price,
-                    "outcome": "EXPIRED (Holding Limit)",
-                    "tp1_reached": active["tp1_hit"],
-                    "tp2_reached": False,
-                    "gross_pnl_pct": round(gross_return * 100, 2),
-                    "net_pnl_pct": round(net_return * 100, 2),
-                    "is_ambiguous": False,
-                })
-                trades.append(active)
-                in_trade = False
-                continue
+                # Case 2: TP1 Reached (Scale-out model: 50% booked, SL moved to breakeven)
+                if high_p >= tp1 and not active["tp1_hit"]:
+                    active["tp1_hit"] = True
+                    active["stop_loss"] = entry  # Trailing stop to breakeven
+                    tp1_fill = max(tp1, open_p)  # Account for favorable opening gaps
+
+                    # Subcase 2a: If high also reached TP2 on same bar
+                    if high_p >= tp2:
+                        active["tp2_hit"] = True
+                        tp2_fill = max(tp2, open_p)
+                        p1_ret = (tp1_fill - entry) / entry
+                        p2_ret = (tp2_fill - entry) / entry
+                        gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        active.update({
+                            "exit_date": date,
+                            "exit_price": tp2_fill,
+                            "outcome": "TP1 & TP2 HIT (Full Target)",
+                            "tp1_reached": True,
+                            "tp2_reached": True,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "is_ambiguous": False,
+                        })
+                        trades.append(active)
+                        in_trade = False
+                        continue
+
+                    # Subcase 2b: Same-bar retracement to Breakeven (Low <= entry)
+                    if low_p <= entry:
+                        active["ambiguous_bars"] += 1
+                        p1_ret = (tp1_fill - entry) / entry
+                        p2_ret = 0.0  # Breakeven on second half
+                        gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        active.update({
+                            "exit_date": date,
+                            "exit_price": entry,
+                            "outcome": "TP1 HIT + SAME-DAY BREAKEVEN",
+                            "tp1_reached": True,
+                            "tp2_reached": False,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "is_ambiguous": True,
+                        })
+                        trades.append(active)
+                        in_trade = False
+                        continue
+
+                # Case 3: Already hit TP1, now checking TP2 or Breakeven
+                elif active["tp1_hit"]:
+                    if high_p >= tp2:
+                        active["tp2_hit"] = True
+                        tp2_fill = max(tp2, open_p)
+                        p1_ret = (tp1 - entry) / entry
+                        p2_ret = (tp2_fill - entry) / entry
+                        gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        active.update({
+                            "exit_date": date,
+                            "exit_price": tp2_fill,
+                            "outcome": "TP1 + TP2 HIT",
+                            "tp1_reached": True,
+                            "tp2_reached": True,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "is_ambiguous": False,
+                        })
+                        trades.append(active)
+                        in_trade = False
+                        continue
+                    elif low_p <= active["stop_loss"]:
+                        p1_ret = (tp1 - entry) / entry
+                        p2_ret = 0.0  # Stopped at Breakeven
+                        gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        active.update({
+                            "exit_date": date,
+                            "exit_price": active["stop_loss"],
+                            "outcome": "TP1 HIT (Trailing Stopped at BE)",
+                            "tp1_reached": True,
+                            "tp2_reached": False,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "is_ambiguous": False,
+                        })
+                        trades.append(active)
+                        in_trade = False
+                        continue
+
+                # Case 4: Time-Stop Exit (Stalled Momentum before TP1)
+                if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
+                    stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
+                    if close_p <= stalled_threshold:
+                        exit_price = close_p
+                        gross_return = (exit_price - entry) / entry
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        active.update({
+                            "exit_date": date,
+                            "exit_price": exit_price,
+                            "outcome": "TIME-STOP EXIT (Stalled Momentum)",
+                            "tp1_reached": False,
+                            "tp2_reached": False,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "is_ambiguous": False,
+                        })
+                        trades.append(active)
+                        in_trade = False
+                        continue
+
+                # Case 5: Expiration (Holding limit reached)
+                if active["bars_held"] >= holding_max_bars:
+                    exit_price = close_p
+                    if active["tp1_hit"]:
+                        p1_ret = (tp1 - entry) / entry
+                        p2_ret = (exit_price - entry) / entry
+                        gross_return = 0.5 * p1_ret + 0.5 * p2_ret
+                    else:
+                        gross_return = (exit_price - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": exit_price,
+                        "outcome": "EXPIRED (Holding Limit)",
+                        "tp1_reached": active["tp1_hit"],
+                        "tp2_reached": False,
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": False,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
 
         # -------------------------------------------------------------------------
         # 3. EVALUATE BAR FOR NEW TRADE TRIGGER
@@ -578,6 +680,7 @@ def run_signal_backtest(
             "use_next_day_open": use_next_day_open,
             "enforce_circuit_limits": enforce_circuit_limits,
             "broker_fee_pct": broker_fee_pct,
+            "exit_mode": exit_mode,
         },
     }
 
@@ -588,6 +691,7 @@ def run_sensitivity_grid(
     df_kse: pd.DataFrame = None,
     holding_max_bars: int = 20,
     time_stop_bars: int = 4,
+    exit_mode: str = "trailing_ema",
 ) -> dict:
     """
     Evaluates strategy parameter sensitivity across a 9-point grid.
@@ -616,6 +720,7 @@ def run_sensitivity_grid(
             df_kse=df_kse,
             time_stop_bars=time_stop_bars,
             strategy_params=p_dict,
+            exit_mode=exit_mode,
         )
         records.append({
             "Variation": var["name"],
@@ -669,6 +774,7 @@ def run_walk_forward_analysis(
     df_kse: pd.DataFrame = None,
     train_bars: int = 70,
     test_bars: int = 35,
+    exit_mode: str = "trailing_ema",
 ) -> dict:
     """
     Executes a rolling walk-forward validation of the strategy's fixed rule set.
@@ -723,6 +829,7 @@ def run_walk_forward_analysis(
             df_test,
             symbol=symbol,
             df_kse=df_kse,
+            exit_mode=exit_mode,
         )
         if not bt_oos.get("trades_df", pd.DataFrame()).empty:
             t_df = bt_oos["trades_df"].copy()

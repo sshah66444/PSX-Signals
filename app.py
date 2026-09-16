@@ -331,6 +331,18 @@ with tab3:
         f"**Volume-Tiered Spread & Slippage**, and **{broker_fee}% commission**."
     )
 
+    exit_arch_choice = st.radio(
+        "Exit Architecture:",
+        options=[
+            "Trailing 20 EMA Trend Model (Recommended for PSX — lets winners run)",
+            "Fixed 1.35x TP1 Scale-Out (Legacy — takes 50% at TP1, stops at BE)",
+        ],
+        index=0,
+        horizontal=True,
+        help="Trailing 20 EMA rides cyclical momentum moves and exits when daily close breaks below 20 EMA with structural stop loss. Fixed TP1 scales out half at 1.35x TP1 and moves stop to entry.",
+    )
+    exit_mode = "trailing_ema" if "Trailing" in exit_arch_choice else "fixed_tp"
+
     if df_stock is None:
         st.warning("Cannot backtest without verified historical market data.")
     else:
@@ -343,6 +355,7 @@ with tab3:
             time_stop_bars=time_stop_limit,
             use_next_day_open=use_next_open,
             enforce_circuit_limits=enforce_circuit,
+            exit_mode=exit_mode,
         )
 
         if "error" in bt_results:
@@ -384,6 +397,7 @@ with tab3:
                 f"📊 **Profit Factor:** {bt_results.get('profit_factor', 0.0)} (95% CI: [{boot.get('profit_factor_ci', (0, 0))[0]} – {boot.get('profit_factor_ci', (0, 0))[1]}]) | "
                 f"**Max Drawdown:** {bt_results.get('max_drawdown_pct', 0.0)}% | "
                 f"**Avg Trade P&L:** {bt_results.get('avg_trade_pnl_pct', 0.0):+.2f}% | "
+                f"**Exit Mode:** {'Trailing 20 EMA Trend' if exit_mode == 'trailing_ema' else 'Fixed 1.35x TP1'} | "
                 f"**Execution Fill:** {'T+1 Open + Friction' if use_next_open else 'Bar Close'} | "
                 f"**Macro Filter:** {'Active (KSE-100)' if apply_macro_gate else 'Disabled'}"
             )
@@ -435,6 +449,7 @@ with tab3:
                         df_kse=df_kse if apply_macro_gate else None,
                         holding_max_bars=holding_limit,
                         time_stop_bars=time_stop_limit,
+                        exit_mode=exit_mode,
                     )
                 st.markdown(f"**Stability Rating:** {grid_res['stability_badge']}")
                 st.caption(
@@ -456,6 +471,7 @@ with tab3:
                         df_stock,
                         symbol=active_symbol,
                         df_kse=df_kse if apply_macro_gate else None,
+                        exit_mode=exit_mode,
                     )
                 if wfo_res["status"] == "INSUFFICIENT_HISTORY":
                     st.info(f"ℹ️ {wfo_res['message']}")

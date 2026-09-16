@@ -170,7 +170,8 @@ def evaluate_bar_strategy(
         strategy = "BREAKOUT"
         entry_min = round(max(res20 * 0.995, price - 0.3 * atr), 2)
         entry_max = round(max(price, res20 * 1.01), 2)
-        invalidation = round(res20 - 0.8 * atr, 2)
+        # Structural Invalidation: Below 50 EMA support (or res20 - 0.8*ATR, whichever is more defensive)
+        invalidation = round(min(res20 - 0.8 * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(res20 - 0.8 * atr, 2)
         risk = max(entry_max - invalidation, 0.01)
         tp1 = round(entry_max + max(1.35 * risk, 1.4 * atr), 2)
         tp2 = round(entry_max + max(2.5 * risk, 2.6 * atr), 2)
@@ -233,6 +234,8 @@ def evaluate_bar_strategy(
             "stop_loss": invalidation,
             "tp1": tp1,
             "tp2": tp2,
+            "trailing_stop_ema": round(ema20, 2),
+            "trailing_rule": "Exit on daily close below 20 EMA (Trailing Trend Model)",
             "risk_pct": round((risk / entry_max) * 100, 1),
             "rr_tp1": rr_tp1,
             "rr_tp2": rr_tp2,
@@ -253,7 +256,7 @@ def evaluate_bar_strategy(
         strategy = "PULLBACK"
         entry_min = round(min(ema20 - 0.2 * atr, price * 0.99), 2)
         entry_max = round(max(price, ema20 + 0.2 * atr), 2)
-        invalidation = round(ema20 - 0.8 * atr, 2)
+        invalidation = round(min(ema20 - 0.8 * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(ema20 - 0.8 * atr, 2)
         risk = max(entry_max - invalidation, 0.01)
         tp1 = round(entry_max + max(1.35 * risk, 1.4 * atr), 2)
         tp2 = round(entry_max + max(2.5 * risk, 2.6 * atr), 2)
@@ -311,6 +314,8 @@ def evaluate_bar_strategy(
             "stop_loss": invalidation,
             "tp1": tp1,
             "tp2": tp2,
+            "trailing_stop_ema": round(ema20, 2),
+            "trailing_rule": "Exit on daily close below 20 EMA (Trailing Trend Model)",
             "risk_pct": round((risk / entry_max) * 100, 1),
             "rr_tp1": rr_tp1,
             "rr_tp2": rr_tp2,
@@ -426,6 +431,7 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
         f"🛒 <b>Planned Entry:</b> {setup.get('entry_min', 0):.2f} – {setup.get('entry_max', 0):.2f} PKR\n"
         f"🛑 <b>Invalidation / SL:</b> {setup.get('stop_loss', 0):.2f} PKR (Risk: -{setup.get('risk_pct', 0)}%)\n"
         f"🎯 <b>Targets:</b> TP1: {setup.get('tp1', 0):.2f} PKR | TP2: {setup.get('tp2', 0):.2f} PKR\n"
+        f"📈 <b>Exit Model:</b> Trailing 20 EMA ({setup.get('trailing_stop_ema', 0):.2f} PKR) or Targets\n"
         f"⚖️ <b>Reward:Risk:</b> {setup.get('rr_tp1', 0)}:1 (to TP1) | {setup.get('rr_tp2', 0)}:1 (to TP2)\n"
         f"📋 <b>Condition Checklist:</b>\n{checklist_lines}\n"
         f"⚡ <b>Status:</b> <b>{status}</b>\n"

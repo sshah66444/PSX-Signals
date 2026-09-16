@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 *.db-shm
 *.db-wal
+.cache_2y/
