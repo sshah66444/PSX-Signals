@@ -118,6 +118,18 @@ def get_watchlist() -> dict:
     return PSX_WATCHLIST
 
 
+def get_symbol_sector(symbol: str) -> str:
+    clean = symbol.upper().replace(".KA", "").replace(".PSX", "")
+    info = PSX_WATCHLIST.get(clean, {})
+    return info.get("sector", "Other")
+
+
+def get_symbol_name(symbol: str) -> str:
+    clean = symbol.upper().replace(".KA", "").replace(".PSX", "")
+    info = PSX_WATCHLIST.get(clean, {})
+    return info.get("name", clean)
+
+
 def _fetch_from_yahoo(clean_symbol: str, period: str = "6mo") -> pd.DataFrame:
     """Fetches real market data from Yahoo Finance via .KA suffix."""
     import yfinance as yf

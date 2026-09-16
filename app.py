@@ -15,6 +15,7 @@ from backtester import (
     run_signal_backtest,
     run_sensitivity_grid,
     run_walk_forward_analysis,
+    run_portfolio_backtest,
 )
 from signal_tracker import get_active_signals, get_performance_summary
 
@@ -181,10 +182,11 @@ else:
     )
 
 # ----------------- TABS -----------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🎯 Actionable Setup & Checklist",
     "📊 Real PSX Watchlist Screener",
-    "🧪 Historical Backtester (Rigorous)",
+    "🧪 Single-Stock Backtester (Rigorous)",
+    "💼 Portfolio Simulator (Multi-Stock)",
     "📜 Live Bot Ledger (signals.db)",
     "📚 PSX Reality & Truth Guide",
 ])
@@ -488,8 +490,187 @@ with tab3:
                     else:
                         st.caption("No out-of-sample setups triggered in forward windows.")
 
-# ----------------- TAB 4: LIVE BOT LEDGER (SIGNALS.DB) -----------------
+# ----------------- TAB 4: PORTFOLIO SIMULATOR (MULTI-STOCK) -----------------
 with tab4:
+    st.markdown("### 💼 Multi-Stock Portfolio Simulation & Cash Allocation Engine")
+    st.markdown(
+        "Simulates real portfolio cash management across multiple PSX equities simultaneously. "
+        "Enforces **fixed cash slots**, **sector diversification limits**, "
+        "**true cash drag** (unallocated cash sits idle), and **multi-day circuit lock trapping**."
+    )
+
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        port_capital = st.number_input(
+            "Initial Portfolio Capital (PKR):",
+            min_value=100_000.0,
+            max_value=50_000_000.0,
+            value=1_000_000.0,
+            step=100_000.0,
+            format="%.0f",
+        )
+    with col_p2:
+        port_max_pos = st.slider(
+            "Max Concurrent Positions (Slots):",
+            min_value=2,
+            max_value=12,
+            value=5,
+            step=1,
+            help="Limits how many stocks can be held at once. Position size = Total Equity / Max Slots.",
+        )
+    with col_p3:
+        port_sec_cap = st.slider(
+            "Max Concentration per Sector:",
+            min_value=1,
+            max_value=4,
+            value=2,
+            step=1,
+            help="Prevents overconcentration (e.g. holding more than 2 banks or 2 energy stocks at once).",
+        )
+
+    col_p4, col_p5 = st.columns(2)
+    with col_p4:
+        port_exit_choice = st.radio(
+            "Portfolio Exit Model:",
+            options=[
+                "Trailing 20 EMA Trend Model (Recommended)",
+                "Fixed 1.35x TP1 Scale-Out (Legacy)",
+            ],
+            index=0,
+            horizontal=True,
+        )
+        port_exit_mode = "trailing_ema" if "Trailing" in port_exit_choice else "fixed_tp"
+    with col_p5:
+        sim_trapping = st.checkbox(
+            "Simulate Multi-Day Lower Circuit Trapping",
+            value=True,
+            help="When a stock drops limit-down with zero buyers, the trader is trapped until the circuit unlocks.",
+        )
+
+    # Symbol Selection for Portfolio
+    st.markdown("#### 📋 Portfolio Universe Selection")
+    core_12 = ["OGDC", "PPL", "SYS", "LUCK", "MLCF", "MEBL", "MCB", "UBL", "FFC", "EFERT", "HUBC", "ATRL"]
+    available_symbols = list(watchlist.keys())
+
+    universe_choice = st.radio(
+        "Select Universe to Simulate:",
+        options=[
+            f"Top 12 Core Blue Chips ({', '.join(core_12[:6])}...)",
+            "All Available Watchlist Stocks",
+        ],
+        index=0,
+        horizontal=True,
+    )
+
+    selected_portfolio_symbols = core_12 if "Top 12" in universe_choice else available_symbols
+
+    if st.button("🚀 Run Portfolio Simulation", type="primary"):
+        with st.spinner("Fetching market data and simulating multi-stock portfolio execution..."):
+            port_data = {}
+            for s in selected_portfolio_symbols:
+                s_res = get_cached_stock_data(s, period=period)
+                if s_res.get("status") == "OK" and s_res.get("has_true_ohlc"):
+                    port_data[s] = s_res["df"]
+
+            if not port_data:
+                st.error("No valid historical market data could be loaded for the selected universe.")
+            else:
+                p_res = run_portfolio_backtest(
+                    port_data,
+                    initial_capital=port_capital,
+                    max_positions=port_max_pos,
+                    max_sector_exposure=port_sec_cap,
+                    broker_fee_pct=broker_fee,
+                    df_kse=df_kse if apply_macro_gate else None,
+                    time_stop_bars=time_stop_limit,
+                    use_next_day_open=use_next_open,
+                    enforce_circuit_limits=enforce_circuit,
+                    simulate_circuit_trapping=sim_trapping,
+                    exit_mode=port_exit_mode,
+                )
+
+                if "error" in p_res:
+                    st.error(p_res["error"])
+                else:
+                    # Top Metrics
+                    pm1, pm2, pm3, pm4, pm5 = st.columns(5)
+                    with pm1:
+                        st.metric("Initial Capital", f"PKR {p_res['initial_capital']:,.0f}")
+                    with pm2:
+                        st.metric("Final Equity", f"PKR {p_res['final_equity']:,.0f}")
+                    with pm3:
+                        st.metric("Net Portfolio Return", f"{p_res['net_return_pct']:+.2f}%")
+                    with pm4:
+                        st.metric("CAGR (Annualized)", f"{p_res['cagr_pct']:+.2f}%")
+                    with pm5:
+                        st.metric("Max Drawdown", f"{p_res['max_drawdown_pct']:.2f}%")
+
+                    pm6, pm7, pm8, pm9, pm10 = st.columns(5)
+                    with pm6:
+                        st.metric("Sharpe Ratio", f"{p_res['sharpe_ratio']:.2f}")
+                    with pm7:
+                        st.metric("Sortino Ratio", f"{p_res['sortino_ratio']:.2f}")
+                    with pm8:
+                        st.metric("Profit Factor", f"{p_res['profit_factor']:.2f}")
+                    with pm9:
+                        st.metric("Win Rate", f"{p_res['win_rate_pct']:.1f}%")
+                        st.caption(f"{p_res['winning_trades']}W / {p_res['losing_trades']}L")
+                    with pm10:
+                        st.metric("Closed Trades", p_res['total_trades_closed'])
+
+                    # Equity Curve Chart
+                    eq_df = p_res.get("equity_df")
+                    if eq_df is not None and not eq_df.empty:
+                        st.markdown("#### 📈 Portfolio Total Equity Curve (PKR)")
+                        fig_eq = px.line(
+                            eq_df.reset_index(),
+                            x="Date",
+                            y="Total_Equity",
+                            template="plotly_dark",
+                            title=f"Portfolio Net Equity (Starting: PKR {p_res['initial_capital']:,.0f})",
+                        )
+                        fig_eq.update_traces(line_color="#00e676", line_width=2.5)
+                        fig_eq.update_layout(paper_bgcolor="#111722", plot_bgcolor="#161f30")
+                        st.plotly_chart(fig_eq, use_container_width=True)
+
+                        # Drawdown chart
+                        st.markdown("#### 📉 Underwater Portfolio Drawdown (%)")
+                        fig_dd = px.area(
+                            eq_df.reset_index(),
+                            x="Date",
+                            y="Drawdown_Pct",
+                            template="plotly_dark",
+                            title="Drawdown Profile (%)",
+                        )
+                        fig_dd.update_traces(line_color="#ff5252", fillcolor="rgba(255, 82, 82, 0.2)")
+                        fig_dd.update_layout(paper_bgcolor="#111722", plot_bgcolor="#161f30")
+                        st.plotly_chart(fig_dd, use_container_width=True)
+
+                    # Skipped Summary Notification
+                    skipped = p_res.get("skipped_summary", {})
+                    if skipped:
+                        st.info(
+                            f"🛡️ **Realistic Cash & Capacity Guards**: "
+                            + " | ".join(f"**{count}** skipped due to `{reason}`" for reason, count in skipped.items())
+                        )
+
+                    # Trade Log & Skipped Log
+                    tab_log1, tab_log2 = st.tabs(["📜 Closed Portfolio Trades", "🚫 Skipped / Discarded Signals"])
+                    with tab_log1:
+                        trades_df = p_res.get("trades_df")
+                        if trades_df is not None and not trades_df.empty:
+                            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No trades were closed during this simulation.")
+                    with tab_log2:
+                        skipped_df = p_res.get("skipped_df")
+                        if skipped_df is not None and not skipped_df.empty:
+                            st.dataframe(skipped_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("Zero signals were skipped.")
+
+# ----------------- TAB 5: LIVE BOT LEDGER (SIGNALS.DB) -----------------
+with tab5:
     st.markdown("### 📜 Live Persistent Signal Ledger (`signals.db`)")
     st.markdown(
         "Audited track record of real signals **actually issued by this bot** over time. "
@@ -522,8 +703,8 @@ with tab4:
     else:
         st.caption("No closed trades recorded in the live ledger yet.")
 
-# ----------------- TAB 5: EDUCATIONAL GUIDE -----------------
-with tab5:
+# ----------------- TAB 6: EDUCATIONAL GUIDE -----------------
+with tab6:
     st.markdown("### 📚 Realities & Quantitative Edge of PSX Trading")
     st.markdown("""
     #### 1. Why We Require Data Integrity

@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from signal_engine import compute_all_indicators, evaluate_bar_strategy
-from data_engine import check_has_true_ohlc
+from data_engine import check_has_true_ohlc, get_symbol_sector, get_symbol_name
 
 
 def calculate_execution_friction(adv_20: float) -> tuple[float, float, str]:
@@ -139,6 +139,7 @@ def run_signal_backtest(
     time_stop_bars: int = 4,
     use_next_day_open: bool = True,
     enforce_circuit_limits: bool = True,
+    simulate_circuit_trapping: bool = False,
     strategy_params: dict = None,
     exit_mode: str = "trailing_ema",  # "trailing_ema" (default, lets winners run) or "fixed_tp" (legacy)
 ) -> dict:
@@ -271,18 +272,108 @@ def run_signal_backtest(
             # Circuit breaker check: Was the day locked at lower circuit?
             is_lower_locked = enforce_circuit_limits and (close_p <= limit_dn + 0.05 and high_p <= limit_dn + 0.05)
 
+            # If active trade was trapped in a lower circuit lock in prior session(s)
+            if simulate_circuit_trapping and active.get("trapped_exit"):
+                if is_lower_locked:
+                    active["trapped_exit"]["lock_bars"] += 1
+                    continue
+                else:
+                    lock_bars = active["trapped_exit"]["lock_bars"]
+                    orig_reason = active["trapped_exit"]["reason"]
+                    actual_exit = min(open_p, limit_up)
+                    emergency_friction = total_exit_friction + 0.20
+                    gross_return = (actual_exit - entry) / entry
+                    net_return = gross_return - (emergency_friction / 100.0)
+                    outcome_msg = f"{orig_reason} (Trapped in Lower Lock {lock_bars} bar(s), Unlocked)"
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": actual_exit,
+                        "outcome": outcome_msg,
+                        "tp1_reached": active["tp1_hit"],
+                        "tp2_reached": active["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": False,
+                        "lock_bars_trapped": lock_bars,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
+
             # -----------------------------------------------------------------
             # A. TRAILING 20 EMA EXIT MODE (PSX TREND MODEL)
             # -----------------------------------------------------------------
             if exit_mode == "trailing_ema":
-                # Milestone touch checks (track without capping upside prematurely)
-                if high_p >= tp1:
+                # Snapshot milestone state from BEFORE this bar's touches are applied.
+                # This is what lets us tell "genuinely reached the target on an earlier,
+                # unambiguous bar" apart from "only touched it on the same bar the stop
+                # was also breached" -- the latter must not be credited as a target hit.
+                tp1_hit_before = active["tp1_hit"]
+                tp2_hit_before = active["tp2_hit"]
+
+                hit_tp1_this_bar = high_p >= tp1
+                hit_tp2_this_bar = high_p >= tp2
+                hit_sl_this_bar = low_p <= sl
+
+                # Ambiguous same-bar event: this bar is the FIRST time either target is
+                # touched AND the stop is also breached in the same session. Mirrors the
+                # legacy fixed_tp branch's conservative "stop hit first" assumption --
+                # without this check, a losing stopped-out trade could still be counted
+                # as a TP1/TP2 "hit" in the aggregate hit-rate stats.
+                newly_ambiguous = hit_sl_this_bar and (
+                    (hit_tp1_this_bar and not tp1_hit_before) or (hit_tp2_this_bar and not tp2_hit_before)
+                )
+
+                if newly_ambiguous:
+                    active["ambiguous_bars"] += 1
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "STOP LOSS HIT (Ambiguous Bar)",
+                            "lock_bars": 1,
+                        }
+                        continue
+                    actual_sl = min(sl, open_p)
+                    if is_lower_locked:
+                        actual_sl = min(actual_sl, limit_dn)
+                        outcome_msg = "STOP LOSS HIT (Ambiguous Bar, Lower Circuit)"
+                    else:
+                        outcome_msg = "STOP LOSS HIT (Ambiguous Bar)"
+                    gross_return = (actual_sl - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    active.update({
+                        "exit_date": date,
+                        "exit_price": actual_sl,
+                        "outcome": outcome_msg,
+                        # Only credit target touches confirmed on a strictly earlier,
+                        # non-ambiguous bar -- never the ambiguous bar's own touch.
+                        "tp1_reached": tp1_hit_before,
+                        "tp2_reached": tp2_hit_before,
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "is_ambiguous": True,
+                    })
+                    trades.append(active)
+                    in_trade = False
+                    continue
+
+                # Milestone touch checks (track without capping upside prematurely).
+                # Safe to apply now: reaching this point means any touch this bar did
+                # NOT coincide with a same-bar stop breach.
+                if hit_tp1_this_bar:
                     active["tp1_hit"] = True
-                if high_p >= tp2:
+                if hit_tp2_this_bar:
                     active["tp2_hit"] = True
 
-                # Case 1: Hard Stop Loss Hit
-                if low_p <= sl:
+                # Case 1: Hard Stop Loss Hit (unambiguous -- no new target touch this bar)
+                if hit_sl_this_bar:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "STOP LOSS HIT",
+                            "lock_bars": 1,
+                        }
+                        continue
                     actual_sl = min(sl, open_p)
                     if is_lower_locked:
                         actual_sl = min(actual_sl, limit_dn)
@@ -308,14 +399,25 @@ def run_signal_backtest(
                 # Case 2: Trailing 20 EMA Exit (after minimum 3-bar initial holding grace period)
                 ema20_val = float(bar["EMA_20"]) if "EMA_20" in bar and pd.notna(bar["EMA_20"]) else None
                 if active["bars_held"] >= 3 and ema20_val is not None and close_p < ema20_val:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "TRAIL_20EMA EXIT",
+                            "lock_bars": 1,
+                        }
+                        continue
                     actual_exit = close_p
+                    if is_lower_locked:
+                        actual_exit = min(actual_exit, limit_dn)
                     gross_return = (actual_exit - entry) / entry
                     net_return = gross_return - (total_exit_friction / 100.0)
                     active.update({
                         "exit_date": date,
                         "exit_price": actual_exit,
                         "outcome": "TRAIL_20EMA EXIT",
-                        "tp1_reached": active["tp1_hit"] or (net_return > 0),
+                        # Reflects only genuine price-level touches, never profitability --
+                        # a trade can be profitable at exit without ever reaching TP1.
+                        "tp1_reached": active["tp1_hit"],
                         "tp2_reached": active["tp2_hit"],
                         "gross_pnl_pct": round(gross_return * 100, 2),
                         "net_pnl_pct": round(net_return * 100, 2),
@@ -329,7 +431,16 @@ def run_signal_backtest(
                 if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
                     stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
                     if close_p <= stalled_threshold:
+                        if is_lower_locked and simulate_circuit_trapping:
+                            active["trapped_exit"] = {
+                                "trigger_date": date,
+                                "reason": "TIME-STOP EXIT (Stalled Momentum)",
+                                "lock_bars": 1,
+                            }
+                            continue
                         exit_price = close_p
+                        if is_lower_locked:
+                            exit_price = min(exit_price, limit_dn)
                         gross_return = (exit_price - entry) / entry
                         net_return = gross_return - (total_exit_friction / 100.0)
                         active.update({
@@ -348,14 +459,24 @@ def run_signal_backtest(
 
                 # Case 4: Maximum Holding Limit Reached
                 if active["bars_held"] >= holding_max_bars:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "EXPIRED (Holding Limit)",
+                            "lock_bars": 1,
+                        }
+                        continue
                     exit_price = close_p
+                    if is_lower_locked:
+                        exit_price = min(exit_price, limit_dn)
                     gross_return = (exit_price - entry) / entry
                     net_return = gross_return - (total_exit_friction / 100.0)
                     active.update({
                         "exit_date": date,
                         "exit_price": exit_price,
                         "outcome": "EXPIRED (Holding Limit)",
-                        "tp1_reached": active["tp1_hit"] or (net_return > 0),
+                        # Reflects only genuine price-level touches, never profitability.
+                        "tp1_reached": active["tp1_hit"],
                         "tp2_reached": active["tp2_hit"],
                         "gross_pnl_pct": round(gross_return * 100, 2),
                         "net_pnl_pct": round(net_return * 100, 2),
@@ -375,6 +496,13 @@ def run_signal_backtest(
 
                 if hit_tp1_this_bar and hit_sl_this_bar and not active["tp1_hit"]:
                     active["ambiguous_bars"] += 1
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "STOP LOSS HIT (Ambiguous Bar)",
+                            "lock_bars": 1,
+                        }
+                        continue
                     actual_sl = min(sl, open_p)
                     if is_lower_locked:
                         actual_sl = min(actual_sl, limit_dn)
@@ -396,6 +524,13 @@ def run_signal_backtest(
 
                 # Case 1: Stop Loss Hit (before TP1)
                 if low_p <= sl and not active["tp1_hit"]:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "STOP LOSS HIT",
+                            "lock_bars": 1,
+                        }
+                        continue
                     actual_sl = min(sl, open_p)
                     if is_lower_locked:
                         actual_sl = min(actual_sl, limit_dn)
@@ -490,6 +625,13 @@ def run_signal_backtest(
                         in_trade = False
                         continue
                     elif low_p <= active["stop_loss"]:
+                        if is_lower_locked and simulate_circuit_trapping:
+                            active["trapped_exit"] = {
+                                "trigger_date": date,
+                                "reason": "TP1 HIT (Trailing Stopped at BE)",
+                                "lock_bars": 1,
+                            }
+                            continue
                         p1_ret = (tp1 - entry) / entry
                         p2_ret = 0.0  # Stopped at Breakeven
                         gross_return = 0.5 * p1_ret + 0.5 * p2_ret
@@ -512,7 +654,16 @@ def run_signal_backtest(
                 if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
                     stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
                     if close_p <= stalled_threshold:
+                        if is_lower_locked and simulate_circuit_trapping:
+                            active["trapped_exit"] = {
+                                "trigger_date": date,
+                                "reason": "TIME-STOP EXIT (Stalled Momentum)",
+                                "lock_bars": 1,
+                            }
+                            continue
                         exit_price = close_p
+                        if is_lower_locked:
+                            exit_price = min(exit_price, limit_dn)
                         gross_return = (exit_price - entry) / entry
                         net_return = gross_return - (total_exit_friction / 100.0)
                         active.update({
@@ -531,7 +682,16 @@ def run_signal_backtest(
 
                 # Case 5: Expiration (Holding limit reached)
                 if active["bars_held"] >= holding_max_bars:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        active["trapped_exit"] = {
+                            "trigger_date": date,
+                            "reason": "EXPIRED (Holding Limit)",
+                            "lock_bars": 1,
+                        }
+                        continue
                     exit_price = close_p
+                    if is_lower_locked:
+                        exit_price = min(exit_price, limit_dn)
                     if active["tp1_hit"]:
                         p1_ret = (tp1 - entry) / entry
                         p2_ret = (exit_price - entry) / entry
@@ -605,11 +765,31 @@ def run_signal_backtest(
 
     # If trade remained active up to the final historical bar
     if in_trade:
-        unresolved_trade = active
-        unresolved_trade["current_price"] = float(df_ind["Close"].iloc[-1])
-        unresolved_trade["unrealized_pnl_pct"] = round(
-            ((unresolved_trade["current_price"] - unresolved_trade["entry_price"]) / unresolved_trade["entry_price"]) * 100, 2
-        )
+        if simulate_circuit_trapping and active.get("trapped_exit"):
+            lock_bars = active["trapped_exit"]["lock_bars"]
+            orig_reason = active["trapped_exit"]["reason"]
+            actual_exit = float(df_ind["Close"].iloc[-1])
+            gross_return = (actual_exit - active["entry_price"]) / active["entry_price"]
+            net_return = gross_return - (total_exit_friction / 100.0)
+            active.update({
+                "exit_date": df_ind.index[-1],
+                "exit_price": actual_exit,
+                "outcome": f"{orig_reason} (Trapped in Lower Lock {lock_bars} bar(s) at End of History)",
+                "tp1_reached": active["tp1_hit"],
+                "tp2_reached": active["tp2_hit"],
+                "gross_pnl_pct": round(gross_return * 100, 2),
+                "net_pnl_pct": round(net_return * 100, 2),
+                "is_ambiguous": False,
+                "lock_bars_trapped": lock_bars,
+            })
+            trades.append(active)
+            in_trade = False
+        else:
+            unresolved_trade = active
+            unresolved_trade["current_price"] = float(df_ind["Close"].iloc[-1])
+            unresolved_trade["unrealized_pnl_pct"] = round(
+                ((unresolved_trade["current_price"] - unresolved_trade["entry_price"]) / unresolved_trade["entry_price"]) * 100, 2
+            )
 
     df_trades = pd.DataFrame(trades) if trades else pd.DataFrame()
     resolved_count = len(df_trades)
@@ -666,6 +846,7 @@ def run_signal_backtest(
         "ambiguous_trades": ambiguous_hits,
         "circuit_lock_discards": circuit_lock_discards,
         "gap_discards": gap_discards,
+        "trapped_lock_trades": int(df_trades["lock_bars_trapped"].fillna(0).gt(0).sum()) if ("lock_bars_trapped" in df_trades.columns and not df_trades.empty) else 0,
         "tp1_hit_rate_pct": win_rate_tp1,
         "tp2_hit_rate_pct": win_rate_tp2,
         "stop_loss_rate_pct": sl_rate,
@@ -679,6 +860,7 @@ def run_signal_backtest(
         "microstructure": {
             "use_next_day_open": use_next_day_open,
             "enforce_circuit_limits": enforce_circuit_limits,
+            "simulate_circuit_trapping": simulate_circuit_trapping,
             "broker_fee_pct": broker_fee_pct,
             "exit_mode": exit_mode,
         },
@@ -853,4 +1035,616 @@ def run_walk_forward_analysis(
         "total_oos_net_pnl": total_oos_pnl,
         "oos_win_rate_pct": oos_win_rate,
         "oos_trades_df": df_oos_all,
+    }
+
+
+def run_portfolio_backtest(
+    data_dict: dict[str, pd.DataFrame],
+    initial_capital: float = 1_000_000.0,
+    max_positions: int = 5,
+    max_sector_exposure: int = 2,
+    broker_fee_pct: float = 0.35,
+    df_kse: pd.DataFrame = None,
+    use_next_day_open: bool = True,
+    enforce_circuit_limits: bool = True,
+    simulate_circuit_trapping: bool = True,
+    exit_mode: str = "trailing_ema",
+    time_stop_bars: int = 4,
+    holding_max_bars: int = 30,
+    strategy_params: dict = None,
+) -> dict:
+    """
+    Multi-symbol portfolio simulation with realistic account cash management,
+    sector diversification caps, dynamic position sizing, and PSX market microstructure.
+
+    Key Features:
+    - Account Cash Constraints: Fixed slot allocation (equity / max_positions).
+      New setups are skipped or queued if all slots are filled.
+    - Sector Exposure Limits: Restricts concurrent holdings in any single sector (e.g. max 2 banks).
+    - True Cash Drag: Unallocated cash earns 0% while awaiting setups, producing realistic account equity.
+    - Portfolio Metrics: Equity curve, CAGR, Sharpe ratio, Sortino ratio, Calmar ratio, and Max Drawdown.
+    """
+    if not data_dict:
+        return {"error": "No market data provided for portfolio simulation."}
+
+    # 1. Validate datasets and filter to true OHLC
+    valid_data = {}
+    for sym, df in data_dict.items():
+        if df is not None and len(df) >= 30 and check_has_true_ohlc(df):
+            valid_data[sym] = df
+
+    if not valid_data:
+        return {"error": "No symbols passed true OHLC data validation."}
+
+    # 2. Precompute indicators and map sectors
+    processed_data = {}
+    symbol_sectors = {}
+    for sym, df in valid_data.items():
+        processed_data[sym] = compute_all_indicators(df, df_kse=df_kse)
+        symbol_sectors[sym] = get_symbol_sector(sym)
+
+    # 4. Synchronize unified chronological calendar
+    all_dates = sorted(list(set.union(*[set(df.index) for df in processed_data.values()])))
+
+    # 3. Pre-align KSE-100 series if provided
+    kse_close_series = None
+    kse_ema50_series = None
+    if df_kse is not None and not df_kse.empty:
+        df_kse_aligned = df_kse.copy()
+        first_tz = all_dates[0].tz if len(all_dates) > 0 and hasattr(all_dates[0], "tz") else None
+        if df_kse_aligned.index.tz is not None and first_tz is None:
+            df_kse_aligned.index = df_kse_aligned.index.tz_localize(None)
+        elif df_kse_aligned.index.tz is None and first_tz is not None:
+            df_kse_aligned.index = df_kse_aligned.index.tz_localize(first_tz)
+        elif df_kse_aligned.index.tz != first_tz:
+            df_kse_aligned.index = df_kse_aligned.index.tz_convert(first_tz)
+
+        if "EMA_50" not in df_kse_aligned.columns:
+            df_kse_aligned["EMA_50"] = df_kse_aligned["Close"].ewm(span=50, adjust=False).mean()
+        kse_close_series = df_kse_aligned["Close"]
+        kse_ema50_series = df_kse_aligned["EMA_50"]
+
+    cash = float(initial_capital)
+    open_positions = {}
+    pending_entries = []
+    closed_trades = []
+    skipped_signals = []
+    equity_records = []
+    circuit_lock_discards = 0
+    gap_discards = 0
+
+    for current_date in all_dates:
+        # Determine KSE-100 Macro Regime for this session
+        hist_regime = None
+        if kse_close_series is not None and current_date in kse_close_series.index:
+            kse_c = kse_close_series.loc[current_date]
+            kse_e50 = kse_ema50_series.loc[current_date]
+            if pd.notna(kse_c) and pd.notna(kse_e50):
+                is_bull = bool(kse_c >= kse_e50)
+                hist_regime = {
+                    "is_bullish": is_bull,
+                    "regime": "BULL_MARKET" if is_bull else "MARKET_CORRECTION",
+                }
+
+        # -----------------------------------------------------------------
+        # A. PROCESS PENDING ENTRIES ON TODAY'S OPEN
+        # -----------------------------------------------------------------
+        for pending in pending_entries:
+            sym = pending["symbol"]
+            df_sym = processed_data[sym]
+            if current_date not in df_sym.index:
+                continue
+
+            bar = df_sym.loc[current_date]
+            open_p = float(bar["Open"])
+            low_p = float(bar["Low"])
+            prev_c = pending["prev_close"]
+            adv_p = float(bar["Vol_MA20"]) if (not pd.isna(bar["Vol_MA20"]) and bar["Vol_MA20"] > 0) else 100_000.0
+
+            limit_offset = max(prev_c * 0.075, 1.0)
+            limit_up = prev_c + limit_offset
+            limit_dn = max(prev_c - limit_offset, 0.01)
+
+            # Check Upper Circuit Lock
+            if enforce_circuit_limits and (open_p >= limit_up - 0.05 and low_p >= limit_up - 0.05):
+                circuit_lock_discards += 1
+                skipped_signals.append({
+                    "date": current_date,
+                    "symbol": sym,
+                    "reason": "UPPER_CIRCUIT_LOCKED",
+                    "sector": pending["sector"],
+                })
+                continue
+
+            # Check Gap Discards
+            if open_p >= pending["tp1"] or open_p <= pending["stop_loss"]:
+                gap_discards += 1
+                skipped_signals.append({
+                    "date": current_date,
+                    "symbol": sym,
+                    "reason": "GAP_DISCARD",
+                    "sector": pending["sector"],
+                })
+                continue
+
+            # Check Portfolio Capacity
+            if len(open_positions) >= max_positions:
+                skipped_signals.append({
+                    "date": current_date,
+                    "symbol": sym,
+                    "reason": "MAX_POSITIONS_REACHED",
+                    "sector": pending["sector"],
+                })
+                continue
+
+            # Check Sector Exposure Cap
+            sec = pending["sector"]
+            sec_count = sum(1 for p in open_positions.values() if p["sector"] == sec)
+            if sec_count >= max_sector_exposure:
+                skipped_signals.append({
+                    "date": current_date,
+                    "symbol": sym,
+                    "reason": "SECTOR_LIMIT_EXCEEDED",
+                    "sector": sec,
+                })
+                continue
+
+            # Dynamic Position Sizing based on current total portfolio equity
+            curr_invested = sum(
+                p["shares"] * float(processed_data[s].loc[current_date]["Open"] if current_date in processed_data[s].index else p["entry_price"])
+                for s, p in open_positions.items()
+            )
+            curr_equity = cash + curr_invested
+            target_alloc = curr_equity / max_positions
+            alloc_cash = min(target_alloc, cash)
+
+            if alloc_cash < 5_000.0:
+                skipped_signals.append({
+                    "date": current_date,
+                    "symbol": sym,
+                    "reason": "INSUFFICIENT_CASH",
+                    "sector": sec,
+                })
+                continue
+
+            spread_pct, slip_pct, tier = calculate_execution_friction(adv_p)
+            entry_friction_pct = (spread_pct / 2.0) + slip_pct
+            fill_price = round(open_p * (1.0 + entry_friction_pct / 100.0), 2)
+            sl = pending["stop_loss"]
+
+            if fill_price <= sl:
+                continue
+
+            shares = int(alloc_cash / (fill_price * (1.0 + broker_fee_pct / 100.0)))
+            if shares <= 0:
+                continue
+
+            trade_cost = shares * fill_price * (1.0 + broker_fee_pct / 100.0)
+            cash -= trade_cost
+
+            risk = fill_price - sl
+            tp1 = round(fill_price + max(1.35 * risk, 1.4 * pending["atr"]), 2)
+            tp2 = round(fill_price + max(2.5 * risk, 2.6 * pending["atr"]), 2)
+
+            open_positions[sym] = {
+                "symbol": sym,
+                "strategy": pending["strategy"],
+                "sector": sec,
+                "signal_date": pending["signal_date"],
+                "entry_date": current_date,
+                "entry_price": fill_price,
+                "raw_open": open_p,
+                "shares": shares,
+                "capital_allocated": round(trade_cost, 2),
+                "spread_pct": spread_pct,
+                "slippage_pct": slip_pct,
+                "liquidity_tier": tier,
+                "stop_loss": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "atr": pending["atr"],
+                "bars_held": 0,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "ambiguous_bars": 0,
+            }
+
+        pending_entries = []
+
+        # -----------------------------------------------------------------
+        # B. MANAGE ACTIVE POSITIONS ON TODAY'S BAR
+        # -----------------------------------------------------------------
+        for sym in list(open_positions.keys()):
+            pos = open_positions[sym]
+            df_sym = processed_data[sym]
+            if current_date not in df_sym.index:
+                continue
+
+            bar = df_sym.loc[current_date]
+            open_p = float(bar["Open"])
+            high_p = float(bar["High"])
+            low_p = float(bar["Low"])
+            close_p = float(bar["Close"])
+            adv_p = float(bar["Vol_MA20"]) if (not pd.isna(bar["Vol_MA20"]) and bar["Vol_MA20"] > 0) else 100_000.0
+
+            idx_in_sym = df_sym.index.get_loc(current_date)
+            prev_c = float(df_sym["Close"].iloc[idx_in_sym - 1]) if idx_in_sym > 0 else open_p
+
+            limit_offset = max(prev_c * 0.075, 1.0)
+            limit_up = prev_c + limit_offset
+            limit_dn = max(prev_c - limit_offset, 0.01)
+            is_lower_locked = enforce_circuit_limits and (close_p <= limit_dn + 0.05 and high_p <= limit_dn + 0.05)
+
+            pos["bars_held"] += 1
+            tp1 = pos["tp1"]
+            tp2 = pos["tp2"]
+            sl = pos["stop_loss"]
+            entry = pos["entry_price"]
+            shares = pos["shares"]
+
+            exit_spread, exit_slip, _ = calculate_execution_friction(adv_p)
+            total_exit_friction = broker_fee_pct + (exit_spread / 2.0) + exit_slip
+
+            # 1. Check Trapped Circuit Exit from prior session
+            if simulate_circuit_trapping and pos.get("trapped_exit"):
+                if is_lower_locked:
+                    pos["trapped_exit"]["lock_bars"] += 1
+                    continue
+                else:
+                    lock_bars = pos["trapped_exit"]["lock_bars"]
+                    orig_reason = pos["trapped_exit"]["reason"]
+                    actual_exit = min(open_p, limit_up)
+                    emergency_friction = total_exit_friction + 0.20
+                    gross_return = (actual_exit - entry) / entry
+                    net_return = gross_return - (emergency_friction / 100.0)
+                    net_proceeds = shares * actual_exit * (1.0 - emergency_friction / 100.0)
+                    cash += net_proceeds
+                    pos.update({
+                        "exit_date": current_date,
+                        "exit_price": actual_exit,
+                        "outcome": f"{orig_reason} (Trapped in Lower Lock {lock_bars} bar(s), Unlocked)",
+                        "tp1_reached": pos["tp1_hit"],
+                        "tp2_reached": pos["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+                        "is_ambiguous": False,
+                        "lock_bars_trapped": lock_bars,
+                    })
+                    closed_trades.append(pos)
+                    del open_positions[sym]
+                    continue
+
+            # 2. Check Strategy Exits
+            if exit_mode == "trailing_ema":
+                tp1_hit_before = pos["tp1_hit"]
+                tp2_hit_before = pos["tp2_hit"]
+                hit_tp1_this_bar = high_p >= tp1
+                hit_tp2_this_bar = high_p >= tp2
+                hit_sl_this_bar = low_p <= sl
+
+                newly_ambiguous = hit_sl_this_bar and (
+                    (hit_tp1_this_bar and not tp1_hit_before) or (hit_tp2_this_bar and not tp2_hit_before)
+                )
+
+                if newly_ambiguous:
+                    pos["ambiguous_bars"] += 1
+                    if is_lower_locked and simulate_circuit_trapping:
+                        pos["trapped_exit"] = {
+                            "trigger_date": current_date,
+                            "reason": "STOP LOSS HIT (Ambiguous Bar)",
+                            "lock_bars": 1,
+                        }
+                        continue
+                    actual_sl = min(sl, open_p)
+                    if is_lower_locked:
+                        actual_sl = min(actual_sl, limit_dn)
+                        outcome_msg = "STOP LOSS HIT (Ambiguous Bar, Lower Circuit)"
+                    else:
+                        outcome_msg = "STOP LOSS HIT (Ambiguous Bar)"
+                    gross_return = (actual_sl - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    net_proceeds = shares * actual_sl * (1.0 - total_exit_friction / 100.0)
+                    cash += net_proceeds
+                    pos.update({
+                        "exit_date": current_date,
+                        "exit_price": actual_sl,
+                        "outcome": outcome_msg,
+                        "tp1_reached": tp1_hit_before,
+                        "tp2_reached": tp2_hit_before,
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+                        "is_ambiguous": True,
+                    })
+                    closed_trades.append(pos)
+                    del open_positions[sym]
+                    continue
+
+                if hit_tp1_this_bar:
+                    pos["tp1_hit"] = True
+                if hit_tp2_this_bar:
+                    pos["tp2_hit"] = True
+
+                if hit_sl_this_bar:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        pos["trapped_exit"] = {
+                            "trigger_date": current_date,
+                            "reason": "STOP LOSS HIT",
+                            "lock_bars": 1,
+                        }
+                        continue
+                    actual_sl = min(sl, open_p)
+                    if is_lower_locked:
+                        actual_sl = min(actual_sl, limit_dn)
+                        outcome_msg = "STOP LOSS HIT (Lower Circuit Limit)"
+                    else:
+                        outcome_msg = "STOP LOSS HIT"
+                    gross_return = (actual_sl - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    net_proceeds = shares * actual_sl * (1.0 - total_exit_friction / 100.0)
+                    cash += net_proceeds
+                    pos.update({
+                        "exit_date": current_date,
+                        "exit_price": actual_sl,
+                        "outcome": outcome_msg,
+                        "tp1_reached": pos["tp1_hit"],
+                        "tp2_reached": pos["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+                        "is_ambiguous": False,
+                    })
+                    closed_trades.append(pos)
+                    del open_positions[sym]
+                    continue
+
+                ema20_val = float(bar["EMA_20"]) if "EMA_20" in bar and pd.notna(bar["EMA_20"]) else None
+                if pos["bars_held"] >= 3 and ema20_val is not None and close_p < ema20_val:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        pos["trapped_exit"] = {
+                            "trigger_date": current_date,
+                            "reason": "TRAIL_20EMA EXIT",
+                            "lock_bars": 1,
+                        }
+                        continue
+                    actual_exit = close_p
+                    if is_lower_locked:
+                        actual_exit = min(actual_exit, limit_dn)
+                    gross_return = (actual_exit - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    net_proceeds = shares * actual_exit * (1.0 - total_exit_friction / 100.0)
+                    cash += net_proceeds
+                    pos.update({
+                        "exit_date": current_date,
+                        "exit_price": actual_exit,
+                        "outcome": "TRAIL_20EMA EXIT",
+                        "tp1_reached": pos["tp1_hit"],
+                        "tp2_reached": pos["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+                        "is_ambiguous": False,
+                    })
+                    closed_trades.append(pos)
+                    del open_positions[sym]
+                    continue
+
+                if time_stop_bars > 0 and not pos["tp1_hit"] and pos["bars_held"] >= time_stop_bars:
+                    stalled_threshold = entry + (0.15 * pos.get("atr", 0.0))
+                    if close_p <= stalled_threshold:
+                        if is_lower_locked and simulate_circuit_trapping:
+                            pos["trapped_exit"] = {
+                                "trigger_date": current_date,
+                                "reason": "TIME-STOP EXIT (Stalled Momentum)",
+                                "lock_bars": 1,
+                            }
+                            continue
+                        exit_price = close_p
+                        if is_lower_locked:
+                            exit_price = min(exit_price, limit_dn)
+                        gross_return = (exit_price - entry) / entry
+                        net_return = gross_return - (total_exit_friction / 100.0)
+                        net_proceeds = shares * exit_price * (1.0 - total_exit_friction / 100.0)
+                        cash += net_proceeds
+                        pos.update({
+                            "exit_date": current_date,
+                            "exit_price": exit_price,
+                            "outcome": "TIME-STOP EXIT (Stalled Momentum)",
+                            "tp1_reached": False,
+                            "tp2_reached": False,
+                            "gross_pnl_pct": round(gross_return * 100, 2),
+                            "net_pnl_pct": round(net_return * 100, 2),
+                            "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+                            "is_ambiguous": False,
+                        })
+                        closed_trades.append(pos)
+                        del open_positions[sym]
+                        continue
+
+                if pos["bars_held"] >= holding_max_bars:
+                    if is_lower_locked and simulate_circuit_trapping:
+                        pos["trapped_exit"] = {
+                            "trigger_date": current_date,
+                            "reason": "EXPIRED (Holding Limit)",
+                            "lock_bars": 1,
+                        }
+                        continue
+                    exit_price = close_p
+                    if is_lower_locked:
+                        exit_price = min(exit_price, limit_dn)
+                    gross_return = (exit_price - entry) / entry
+                    net_return = gross_return - (total_exit_friction / 100.0)
+                    net_proceeds = shares * exit_price * (1.0 - total_exit_friction / 100.0)
+                    cash += net_proceeds
+                    pos.update({
+                        "exit_date": current_date,
+                        "exit_price": exit_price,
+                        "outcome": "EXPIRED (Holding Limit)",
+                        "tp1_reached": pos["tp1_hit"],
+                        "tp2_reached": pos["tp2_hit"],
+                        "gross_pnl_pct": round(gross_return * 100, 2),
+                        "net_pnl_pct": round(net_return * 100, 2),
+                        "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+                        "is_ambiguous": False,
+                    })
+                    closed_trades.append(pos)
+                    del open_positions[sym]
+                    continue
+
+        # -----------------------------------------------------------------
+        # C. SCAN FOR NEW SIGNALS AT TODAY'S CLOSE
+        # -----------------------------------------------------------------
+        for sym, df_sym in processed_data.items():
+            if sym in open_positions or any(p["symbol"] == sym for p in pending_entries):
+                continue
+            if current_date not in df_sym.index:
+                continue
+            bar_idx = df_sym.index.get_loc(current_date)
+            if bar_idx < 25:
+                continue
+
+            setup = evaluate_bar_strategy(
+                df_sym,
+                bar_idx=bar_idx,
+                market_regime=hist_regime,
+                params=strategy_params,
+            )
+            if setup.get("status") == "TRIGGERED":
+                pending_entries.append({
+                    "symbol": sym,
+                    "strategy": setup["strategy"],
+                    "sector": symbol_sectors[sym],
+                    "signal_date": current_date,
+                    "stop_loss": setup["stop_loss"],
+                    "tp1": setup["tp1"],
+                    "tp2": setup["tp2"],
+                    "atr": setup.get("atr", 0.0),
+                    "prev_close": float(df_sym["Close"].iloc[bar_idx]),
+                })
+
+        # -----------------------------------------------------------------
+        # D. RECORD DAILY PORTFOLIO VALUATION (MARK TO MARKET)
+        # -----------------------------------------------------------------
+        daily_invested = sum(
+            pos["shares"] * float(processed_data[s].loc[current_date]["Close"] if current_date in processed_data[s].index else pos["entry_price"])
+            for s, pos in open_positions.items()
+        )
+        total_equity = cash + daily_invested
+        equity_records.append({
+            "Date": current_date,
+            "Cash": round(cash, 2),
+            "Invested": round(daily_invested, 2),
+            "Total_Equity": round(total_equity, 2),
+            "Open_Positions": len(open_positions),
+        })
+
+    # Close any positions remaining open at end of data
+    for sym, pos in list(open_positions.items()):
+        df_sym = processed_data[sym]
+        last_c = float(df_sym["Close"].iloc[-1])
+        adv_val = float(df_sym["Vol_MA20"].iloc[-1]) if ("Vol_MA20" in df_sym and pd.notna(df_sym["Vol_MA20"].iloc[-1])) else 100_000.0
+        exit_spread, exit_slip, _ = calculate_execution_friction(adv_val)
+        total_exit_friction = broker_fee_pct + (exit_spread / 2.0) + exit_slip
+        gross_return = (last_c - pos["entry_price"]) / pos["entry_price"]
+        net_return = gross_return - (total_exit_friction / 100.0)
+        net_proceeds = pos["shares"] * last_c * (1.0 - total_exit_friction / 100.0)
+        cash += net_proceeds
+        pos.update({
+            "exit_date": df_sym.index[-1],
+            "exit_price": last_c,
+            "outcome": "UNRESOLVED_AT_END (Mark-to-Market)",
+            "tp1_reached": pos["tp1_hit"],
+            "tp2_reached": pos["tp2_hit"],
+            "gross_pnl_pct": round(gross_return * 100, 2),
+            "net_pnl_pct": round(net_return * 100, 2),
+            "net_pnl_pkr": round(net_proceeds - pos["capital_allocated"], 2),
+            "is_ambiguous": False,
+        })
+        closed_trades.append(pos)
+
+    open_positions = {}
+    df_trades = pd.DataFrame(closed_trades) if closed_trades else pd.DataFrame()
+    df_skipped = pd.DataFrame(skipped_signals) if skipped_signals else pd.DataFrame()
+    df_equity = pd.DataFrame(equity_records).set_index("Date") if equity_records else pd.DataFrame()
+
+    final_equity = round(float(df_equity["Total_Equity"].iloc[-1]) if not df_equity.empty else initial_capital, 2)
+    net_pnl_pkr = round(final_equity - initial_capital, 2)
+    net_return_pct = round((net_pnl_pkr / initial_capital) * 100.0, 2)
+
+    # Calculate Drawdown
+    if not df_equity.empty:
+        peak = df_equity["Total_Equity"].cummax()
+        dd_pkr = df_equity["Total_Equity"] - peak
+        dd_pct = (dd_pkr / peak) * 100.0
+        df_equity["Drawdown_Pct"] = round(dd_pct, 2)
+        max_dd_pct = round(float(dd_pct.min()), 2)
+        max_dd_pkr = round(float(dd_pkr.min()), 2)
+
+        # Sharpe, Sortino, CAGR
+        days_span = max((df_equity.index[-1] - df_equity.index[0]).days, 1)
+        years = days_span / 365.25
+        cagr_pct = round(((final_equity / initial_capital) ** (1.0 / max(years, 0.1)) - 1.0) * 100.0, 2) if final_equity > 0 else -100.0
+
+        daily_returns = df_equity["Total_Equity"].pct_change().dropna()
+        if len(daily_returns) > 1 and daily_returns.std() > 0:
+            sharpe_ratio = round(float(daily_returns.mean() / daily_returns.std() * np.sqrt(252)), 2)
+            downside_ret = daily_returns[daily_returns < 0]
+            sortino_ratio = round(float(daily_returns.mean() / downside_ret.std() * np.sqrt(252)), 2) if (len(downside_ret) > 0 and downside_ret.std() > 0) else sharpe_ratio
+        else:
+            sharpe_ratio = 0.0
+            sortino_ratio = 0.0
+        calmar_ratio = round(abs(cagr_pct / max_dd_pct), 2) if max_dd_pct < 0 else 0.0
+    else:
+        max_dd_pct = max_dd_pkr = cagr_pct = sharpe_ratio = sortino_ratio = calmar_ratio = 0.0
+
+    # Trade stats
+    if not df_trades.empty:
+        winning = df_trades[df_trades["net_pnl_pct"] > 0]
+        losing = df_trades[df_trades["net_pnl_pct"] <= 0]
+        win_count = len(winning)
+        loss_count = len(losing)
+        win_rate_pct = round((win_count / len(df_trades)) * 100.0, 1)
+        gross_profit_pkr = float(winning["net_pnl_pkr"].sum()) if not winning.empty else 0.0
+        gross_loss_pkr = abs(float(losing["net_pnl_pkr"].sum())) if not losing.empty else 1e-6
+        profit_factor = round(gross_profit_pkr / gross_loss_pkr, 2) if gross_loss_pkr > 0 else 99.0
+        avg_trade_pnl = round(float(df_trades["net_pnl_pct"].mean()), 2)
+    else:
+        win_count = loss_count = 0
+        win_rate_pct = profit_factor = avg_trade_pnl = 0.0
+
+    skipped_counts = df_skipped["reason"].value_counts().to_dict() if not df_skipped.empty else {}
+
+    return {
+        "initial_capital": initial_capital,
+        "final_equity": final_equity,
+        "net_pnl_pkr": net_pnl_pkr,
+        "net_return_pct": net_return_pct,
+        "cagr_pct": cagr_pct,
+        "max_drawdown_pct": max_dd_pct,
+        "max_drawdown_pkr": max_dd_pkr,
+        "sharpe_ratio": sharpe_ratio,
+        "sortino_ratio": sortino_ratio,
+        "calmar_ratio": calmar_ratio,
+        "total_trades_closed": len(df_trades),
+        "winning_trades": win_count,
+        "losing_trades": loss_count,
+        "win_rate_pct": win_rate_pct,
+        "profit_factor": profit_factor,
+        "avg_trade_pnl_pct": avg_trade_pnl,
+        "total_signals_triggered": len(df_trades) + len(df_skipped),
+        "executed_trades": len(df_trades),
+        "skipped_summary": skipped_counts,
+        "equity_df": df_equity,
+        "trades_df": df_trades,
+        "skipped_df": df_skipped,
+        "microstructure": {
+            "max_positions": max_positions,
+            "max_sector_exposure": max_sector_exposure,
+            "use_next_day_open": use_next_day_open,
+            "enforce_circuit_limits": enforce_circuit_limits,
+            "simulate_circuit_trapping": simulate_circuit_trapping,
+            "broker_fee_pct": broker_fee_pct,
+            "exit_mode": exit_mode,
+        },
     }

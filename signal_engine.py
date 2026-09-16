@@ -82,7 +82,14 @@ def compute_all_indicators(df: pd.DataFrame, df_kse: pd.DataFrame = None) -> pd.
 
     # Relative Strength vs KSE-100 Benchmark
     if df_kse is not None and not df_kse.empty:
-        kse_aligned = df_kse["Close"].reindex(df.index, method="ffill")
+        kse_series = df_kse["Close"].copy()
+        if kse_series.index.tz is not None and df.index.tz is None:
+            kse_series.index = kse_series.index.tz_localize(None)
+        elif kse_series.index.tz is None and df.index.tz is not None:
+            kse_series.index = kse_series.index.tz_localize(df.index.tz)
+        elif kse_series.index.tz != df.index.tz:
+            kse_series.index = kse_series.index.tz_convert(df.index.tz)
+        kse_aligned = kse_series.reindex(df.index, method="ffill")
         df["RS_Ratio"] = df["Close"] / (kse_aligned + 1e-6)
         df["RS_MA20"] = df["RS_Ratio"].rolling(20, min_periods=10).mean()
         df["Is_RS_Leader"] = df["RS_Ratio"] >= df["RS_MA20"]

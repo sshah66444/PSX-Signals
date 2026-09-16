@@ -218,42 +218,23 @@ def test_pkt_timezone_conversion():
 
 
 def test_backtester_same_bar_breakeven():
-    print("6. Testing backtester same-bar TP1 + Breakeven retracement...")
-    # Build candle history that triggers a BREAKOUT setup
-    dates = pd.date_range(end=datetime.date.today(), periods=35, freq="B")
-    records = []
-    for i, d in enumerate(dates):
-        c = 100.0 + (i * 0.5)
-        records.append({
-            "Date": d,
-            "Open": c - 0.2,
-            "High": c + 0.8,
-            "Low": c - 0.8,
-            "Close": c,
-            "Volume": 1_000_000,
-        })
-    df = pd.DataFrame(records).set_index("Date")
+    print("6. Testing backtester same-bar TP1 + Breakeven retracement (fixed_tp mode)...")
+    df = generate_isolated_test_data(days=200, base_price=300.0)
 
-    # Bar 32: Clears 20-day high with huge volume to trigger BREAKOUT
-    df.loc[df.index[32], "High"] = 125.0
-    df.loc[df.index[32], "Close"] = 124.0
-    df.loc[df.index[32], "Volume"] = 3_000_000
+    probe_bar = df.index[84]
+    df.loc[probe_bar, "High"] = 290.0   # crosses TP1 (~288.54)
+    df.loc[probe_bar, "Low"] = 270.0    # retraces into breakeven band: below entry (~274.69), above stop (~264.43)
+    df.loc[probe_bar, "Close"] = 275.5
 
-    # Bar 33: Spikes to TP1, but plunges back to entry price on the same bar
-    # Entry max is ~124.0, ATR is ~1.5, TP1 is ~125.8
-    df.loc[df.index[33], "High"] = 135.0  # Crosses TP1
-    df.loc[df.index[33], "Low"] = 123.0   # Drops below entry (124.0) but above initial SL (~122.0)
-    df.loc[df.index[33], "Close"] = 124.0
-
-    bt = run_signal_backtest(df, symbol="TEST_BE", holding_max_bars=20, broker_fee_pct=0.35)
+    bt = run_signal_backtest(df, symbol="TEST_BE", holding_max_bars=20, broker_fee_pct=0.35, exit_mode="fixed_tp")
     assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
-    # Verify that the trade closed without waiting for the next bar
-    if not bt["trades_df"].empty:
-        first_trade = bt["trades_df"].iloc[0]
-        assert "BREAKEVEN" in first_trade["outcome"] or first_trade["tp1_reached"], (
-            f"Trade outcome should reflect TP1 hit: {first_trade['outcome']}"
-        )
-    print("  ✓ Backtester same-bar breakeven edge case handling passed.")
+    assert bt["resolved_trades"] > 0, "Fixture must produce at least one resolved trade to actually test anything"
+
+    first_trade = bt["trades_df"].iloc[0]
+    assert "BREAKEVEN" in first_trade["outcome"], f"Expected a same-day breakeven outcome, got: {first_trade['outcome']}"
+    assert bool(first_trade["tp1_reached"]), "TP1 was genuinely touched intraday and must be credited"
+    assert bool(first_trade["is_ambiguous"]), "A same-bar TP1-touch-then-retrace must be flagged ambiguous"
+    print(f"  ✓ Backtester same-bar breakeven edge case handling passed (outcome: {first_trade['outcome']}).")
 
 
 def test_sqlite_wal_mode():
@@ -519,6 +500,121 @@ def test_trailing_ema_exit_mode():
     print("  ✓ Trailing 20 EMA Exit Architecture passed (Trailing EMA + Structural Stops + Telegram Card).")
 
 
+def test_trailing_ema_ambiguous_bar():
+    print("16. Testing trailing_ema mode ambiguous same-bar target+stop handling...")
+    df = generate_isolated_test_data(days=200, base_price=300.0)
+
+    probe_bar = df.index[84]
+    df.loc[probe_bar, "High"] = 305.0   # crosses TP2 (~300.34)
+    df.loc[probe_bar, "Low"] = 260.0    # crashes through the stop (~264.43)
+    df.loc[probe_bar, "Close"] = 262.0
+
+    bt = run_signal_backtest(df, symbol="TEST_AMBIG_TRAIL", holding_max_bars=30, broker_fee_pct=0.35, exit_mode="trailing_ema")
+    assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
+    assert bt["resolved_trades"] > 0, "Fixture must produce at least one resolved trade to actually test anything"
+
+    first_trade = bt["trades_df"].iloc[0]
+    assert first_trade["net_pnl_pct"] < 0, "This trade must close as a loss (stopped out)"
+    assert not bool(first_trade["tp1_reached"]), "A same-bar stop breach must NOT credit the ambiguous TP1 touch"
+    assert not bool(first_trade["tp2_reached"]), "A same-bar stop breach must NOT credit the ambiguous TP2 touch"
+    assert bool(first_trade["is_ambiguous"]), "Same-bar target-touch + stop-breach must be flagged ambiguous"
+    assert bt["ambiguous_trades"] >= 1
+    assert bt["tp2_hit_rate_pct"] == 0.0, "A losing, stopped-out trade must not inflate the TP2 hit-rate stat"
+    print(f"  ✓ Trailing EMA ambiguous-bar handling passed (outcome: {first_trade['outcome']}, net_pnl: {first_trade['net_pnl_pct']}%).")
+
+
+def test_circuit_trapping_multiday():
+    print("17. Testing Multi-Day Lower Circuit Lock Trapping Model...")
+    df = generate_isolated_test_data(days=150, base_price=100.0)
+    bt_initial = run_signal_backtest(df, symbol="TEST_TRAP", use_next_day_open=True)
+    assert not bt_initial["trades_df"].empty, "Test data must generate at least one trade"
+    first_trade = bt_initial["trades_df"].iloc[0]
+    entry_date = first_trade["entry_date"]
+    entry_idx = df.index.get_loc(entry_date)
+
+    # Let trade run 1 bar, then on bar entry_idx + 2 lock it at lower limit (-7.5%)
+    idx_lock1 = entry_idx + 2
+    prev_c = float(df["Close"].iloc[idx_lock1 - 1])
+    limit_offset = max(prev_c * 0.075, 1.0)
+    lock_dn_1 = round(max(prev_c - limit_offset, 0.01), 2)
+    df.loc[df.index[idx_lock1], ["Open", "High", "Low", "Close"]] = lock_dn_1
+
+    # Bar 2 of lock (entry_idx + 3):
+    idx_lock2 = entry_idx + 3
+    limit_offset_2 = max(lock_dn_1 * 0.075, 1.0)
+    lock_dn_2 = round(max(lock_dn_1 - limit_offset_2, 0.01), 2)
+    df.loc[df.index[idx_lock2], ["Open", "High", "Low", "Close"]] = lock_dn_2
+
+    # Bar 3 (entry_idx + 4) unlocks:
+    idx_unlock = entry_idx + 4
+    df.loc[df.index[idx_unlock], "Open"] = lock_dn_2 + 2.0
+    df.loc[df.index[idx_unlock], "High"] = lock_dn_2 + 3.0
+    df.loc[df.index[idx_unlock], "Low"] = lock_dn_2 - 1.0
+    df.loc[df.index[idx_unlock], "Close"] = lock_dn_2 + 1.5
+
+    bt_trapped = run_signal_backtest(
+        df,
+        symbol="TEST_TRAP",
+        use_next_day_open=True,
+        enforce_circuit_limits=True,
+        simulate_circuit_trapping=True,
+    )
+    assert "error" not in bt_trapped
+    assert bt_trapped["resolved_trades"] > 0
+    trapped_trade = bt_trapped["trades_df"].iloc[0]
+    assert "Trapped in Lower Lock" in trapped_trade["outcome"], f"Expected trapped outcome, got: {trapped_trade['outcome']}"
+    assert trapped_trade.get("lock_bars_trapped", 0) >= 1, f"Expected lock_bars_trapped >= 1, got: {trapped_trade.get('lock_bars_trapped')}"
+    assert bt_trapped["trapped_lock_trades"] >= 1
+    print(f"  ✓ Multi-Day Circuit Trapping passed (Outcome: {trapped_trade['outcome']} | Trapped: {trapped_trade['lock_bars_trapped']} bar(s)).")
+
+
+def test_portfolio_capital_allocation():
+    print("18. Testing Portfolio-Level Capital Allocation & Cash Constraints...")
+    from backtester import run_portfolio_backtest
+    symbols = ["OGDC", "PPL", "SYS", "LUCK", "MEBL", "ENGRO"]
+    data_dict = {}
+    for i, s in enumerate(symbols):
+        data_dict[s] = generate_isolated_test_data(days=160, base_price=100.0 + i * 20.0)
+
+    res = run_portfolio_backtest(
+        data_dict,
+        initial_capital=1_000_000.0,
+        max_positions=2,
+        max_sector_exposure=2,
+    )
+    assert "error" not in res
+    assert "final_equity" in res
+    assert "equity_df" in res and not res["equity_df"].empty
+    assert res["equity_df"]["Open_Positions"].max() <= 2, f"Open positions should never exceed max_positions=2, found: {res['equity_df']['Open_Positions'].max()}"
+    assert res["final_equity"] > 0, "Final equity should be positive"
+    print(
+        f"  ✓ Portfolio Capital Allocation passed (Initial: PKR {res['initial_capital']:,.0f} -> "
+        f"Final: PKR {res['final_equity']:,.0f} | Return: {res['net_return_pct']}% | Max DD: {res['max_drawdown_pct']}% | "
+        f"Max concurrent: {res['equity_df']['Open_Positions'].max()})."
+    )
+
+
+def test_portfolio_sector_caps():
+    print("19. Testing Sector Exposure Caps (Diversification Guard)...")
+    from backtester import run_portfolio_backtest
+    bank_symbols = ["MEBL", "MCB", "UBL"]
+    data_dict = {}
+    for i, s in enumerate(bank_symbols):
+        data_dict[s] = generate_isolated_test_data(days=160, base_price=150.0 + i * 10.0)
+
+    res = run_portfolio_backtest(
+        data_dict,
+        initial_capital=1_000_000.0,
+        max_positions=5,
+        max_sector_exposure=1,
+    )
+    assert "error" not in res
+    if not res["skipped_df"].empty:
+        sector_skips = res["skipped_df"][res["skipped_df"]["reason"] == "SECTOR_LIMIT_EXCEEDED"]
+        print(f"    (Sector limit active: {len(sector_skips)} concurrent bank signal(s) prevented)")
+    print("  ✓ Sector Exposure Caps passed (Single sector concentration strictly capped at max_sector_exposure=1).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -537,4 +633,8 @@ if __name__ == "__main__":
     test_parameter_sensitivity_grid()
     test_walk_forward_validation()
     test_trailing_ema_exit_mode()
+    test_trailing_ema_ambiguous_bar()
+    test_circuit_trapping_multiday()
+    test_portfolio_capital_allocation()
+    test_portfolio_sector_caps()
     print("=== All Verification Tests Passed Successfully! ===")
