@@ -19,6 +19,7 @@ from data_engine import (
     generate_isolated_test_data,
     get_watchlist,
     check_has_true_ohlc,
+    get_symbol_sector,
 )
 from signal_engine import (
     compute_all_indicators,
@@ -587,6 +588,20 @@ def test_portfolio_capital_allocation():
     assert "equity_df" in res and not res["equity_df"].empty
     assert res["equity_df"]["Open_Positions"].max() <= 2, f"Open positions should never exceed max_positions=2, found: {res['equity_df']['Open_Positions'].max()}"
     assert res["final_equity"] > 0, "Final equity should be positive"
+
+    # REGRESSION GUARD: the equity curve's last row previously went stale after
+    # forcibly closing any positions still open at the end of the backtest --
+    # those closures deduct real exit friction from cash, but the equity curve
+    # (and everything derived from it: net_pnl_pkr, CAGR, Sharpe/Sortino/Calmar,
+    # max drawdown) was built BEFORE that closure ran, so it never reflected the
+    # unwind cost. The headline final_equity/net_pnl_pkr must reconcile exactly
+    # with the sum of what the trade log itself reports.
+    trades_df = res.get("trades_df")
+    trade_pnl_sum = float(trades_df["net_pnl_pkr"].sum()) if trades_df is not None and not trades_df.empty else 0.0
+    assert abs(res["net_pnl_pkr"] - trade_pnl_sum) < 1.0, (
+        f"Reported net_pnl_pkr ({res['net_pnl_pkr']}) must reconcile with the sum of "
+        f"individual trade net_pnl_pkr ({round(trade_pnl_sum, 2)}) -- gap: {round(res['net_pnl_pkr'] - trade_pnl_sum, 2)}"
+    )
     print(
         f"  ✓ Portfolio Capital Allocation passed (Initial: PKR {res['initial_capital']:,.0f} -> "
         f"Final: PKR {res['final_equity']:,.0f} | Return: {res['net_return_pct']}% | Max DD: {res['max_drawdown_pct']}% | "
@@ -609,10 +624,30 @@ def test_portfolio_sector_caps():
         max_sector_exposure=1,
     )
     assert "error" not in res
+
+    # REGRESSION GUARD: previously this test only printed the skip count and never
+    # actually asserted the cap held. Reconstruct concurrent same-sector holdings
+    # directly from the closed-trade log's entry/exit windows and confirm no two
+    # positions in the same sector ever overlapped in time.
+    trades_df = res.get("trades_df")
+    if trades_df is not None and not trades_df.empty:
+        trades_df = trades_df.copy()
+        trades_df["sector"] = trades_df["symbol"].map(get_symbol_sector)
+        for _, row in trades_df.iterrows():
+            overlapping = trades_df[
+                (trades_df["sector"] == row["sector"])
+                & (trades_df["entry_date"] <= row["exit_date"])
+                & (trades_df["exit_date"] >= row["entry_date"])
+            ]
+            assert len(overlapping) <= 1, (
+                f"Sector cap violated: {len(overlapping)} concurrent '{row['sector']}' positions "
+                f"overlapped between {row['entry_date']} and {row['exit_date']} with max_sector_exposure=1"
+            )
+
     if not res["skipped_df"].empty:
         sector_skips = res["skipped_df"][res["skipped_df"]["reason"] == "SECTOR_LIMIT_EXCEEDED"]
         print(f"    (Sector limit active: {len(sector_skips)} concurrent bank signal(s) prevented)")
-    print("  ✓ Sector Exposure Caps passed (Single sector concentration strictly capped at max_sector_exposure=1).")
+    print("  ✓ Sector Exposure Caps passed (verified against the closed-trade log: no same-sector overlap at max_sector_exposure=1).")
 
 
 if __name__ == "__main__":

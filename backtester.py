@@ -1540,6 +1540,7 @@ def run_portfolio_backtest(
         })
 
     # Close any positions remaining open at end of data
+    had_unresolved_positions = bool(open_positions)
     for sym, pos in list(open_positions.items()):
         df_sym = processed_data[sym]
         last_c = float(df_sym["Close"].iloc[-1])
@@ -1562,6 +1563,25 @@ def run_portfolio_backtest(
             "is_ambiguous": False,
         })
         closed_trades.append(pos)
+
+    # The equity curve built during the day-by-day loop marks any still-open
+    # positions at their raw close price with NO exit friction applied (that's
+    # correct for a running mark-to-market view). But the forced closure above
+    # DOES deduct real exit friction from `cash` for those same positions -- so
+    # if we left the equity curve's last row untouched, `final_equity` (and
+    # everything derived from it: net_pnl_pkr, CAGR, Sharpe/Sortino/Calmar,
+    # max drawdown) would be systematically optimistic by exactly the unwind
+    # cost of whatever was still open when the simulation ended, while the
+    # trade log itself would correctly show that cost. Overwrite the last
+    # equity row with the now fully-liquidated cash position so the two agree.
+    if had_unresolved_positions and equity_records:
+        equity_records[-1] = {
+            "Date": equity_records[-1]["Date"],
+            "Cash": round(cash, 2),
+            "Invested": 0.0,
+            "Total_Equity": round(cash, 2),
+            "Open_Positions": 0,
+        }
 
     open_positions = {}
     df_trades = pd.DataFrame(closed_trades) if closed_trades else pd.DataFrame()
