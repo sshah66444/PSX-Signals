@@ -149,7 +149,13 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
     messages.extend(new_setup_cards)
 
     if len(new_setup_cards) == 0 and len(lifecycle_updates) == 0:
-        messages.append("ℹ️ <i>No new triggered setups or active updates today. Existing positions held.</i>")
+        no_signals_note = "ℹ️ <i>No new triggered setups today. Broad market remains in correction: standing aside to preserve cash.</i>"
+        messages.append(no_signals_note)
+        if not dry_run and token and chat_id:
+            broadcast_telegram_message(token, chat_id, f"{header}\n{no_signals_note}")
+    else:
+        if not dry_run and token and chat_id:
+            broadcast_telegram_message(token, chat_id, header)
 
     return messages
 
