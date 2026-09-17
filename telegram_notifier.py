@@ -69,6 +69,20 @@ def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool
     return success
 
 
+def build_no_signals_note(is_bullish: bool) -> str:
+    """
+    Builds the fallback message for a scan cycle that found nothing to report.
+    Only claims the market is in a correction when the KSE-100 regime actually
+    says so -- a bull-market day can easily produce zero fresh triggers for
+    reasons that have nothing to do with the broad market (RSI/R:R filters,
+    nothing near resistance, etc.), so that case must not assert a correction
+    that isn't happening.
+    """
+    if not is_bullish:
+        return "ℹ️ <i>No new triggered setups today. Broad market remains in correction: standing aside to preserve cash.</i>"
+    return "ℹ️ <i>No new triggered setups or active updates today. Existing positions held.</i>"
+
+
 def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_run: bool = False) -> list[str]:
     """
     Executes the complete daily workflow:
@@ -102,15 +116,15 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
         else:
             skipped_symbols.append((sym, res.get("error", "Data unavailable")))
 
-    # 3. Audit existing open setups
+    # 3. Audit existing open setups. Collected only -- broadcasting happens
+    # after the header is built (see step 6), so subscribers always see the
+    # summary banner before the detail alerts it summarizes, not after.
     print("3. Auditing open setups in signals.db...")
     lifecycle_updates = audit_active_signals(market_data)
     for upd in lifecycle_updates:
         messages.append(upd["text"])
-        if not dry_run and token and chat_id:
-            broadcast_telegram_message(token, chat_id, upd["text"])
 
-    # 4. Evaluate setups for new/updated triggers
+    # 4. Evaluate setups for new/updated triggers. Collected only, same reason.
     print("4. Evaluating setups across watchlist...")
     new_setup_cards = []
     for sym, m_info in market_data.items():
@@ -125,8 +139,6 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
                 comp_name = watchlist.get(sym, {}).get("name", sym)
                 card = format_actionable_card(setup, company_name=comp_name)
                 new_setup_cards.append(card)
-                if not dry_run and token and chat_id:
-                    broadcast_telegram_message(token, chat_id, card)
 
     # 5. Summary header
     today_str = datetime.date.today().strftime("%d-%b-%Y")
@@ -144,18 +156,28 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
     if skipped_symbols:
         header += f"<i>Note: {len(skipped_symbols)} symbols skipped due to data unavailability.</i>\n"
 
-    # Prepend header
+    no_signals_note = None
+    if len(new_setup_cards) == 0 and len(lifecycle_updates) == 0:
+        no_signals_note = build_no_signals_note(is_bullish)
+
+    # Prepend header, then every detail message, in the exact order they will
+    # be broadcast below -- so the returned list (used for the dry-run
+    # preview) always matches what a live subscriber actually receives.
     messages.insert(0, header)
     messages.extend(new_setup_cards)
-
-    if len(new_setup_cards) == 0 and len(lifecycle_updates) == 0:
-        no_signals_note = "ℹ️ <i>No new triggered setups today. Broad market remains in correction: standing aside to preserve cash.</i>"
+    if no_signals_note:
         messages.append(no_signals_note)
-        if not dry_run and token and chat_id:
-            broadcast_telegram_message(token, chat_id, f"{header}\n{no_signals_note}")
-    else:
-        if not dry_run and token and chat_id:
-            broadcast_telegram_message(token, chat_id, header)
+
+    # 6. Broadcast in banner-first order: header, then lifecycle updates, then
+    # new setup cards, then the no-signals fallback if there was nothing else.
+    if not dry_run and token and chat_id:
+        broadcast_telegram_message(token, chat_id, header)
+        for upd in lifecycle_updates:
+            broadcast_telegram_message(token, chat_id, upd["text"])
+        for card in new_setup_cards:
+            broadcast_telegram_message(token, chat_id, card)
+        if no_signals_note:
+            broadcast_telegram_message(token, chat_id, no_signals_note)
 
     return messages
 

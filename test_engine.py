@@ -650,6 +650,29 @@ def test_portfolio_sector_caps():
     print("  ✓ Sector Exposure Caps passed (verified against the closed-trade log: no same-sector overlap at max_sector_exposure=1).")
 
 
+def test_telegram_no_signals_note_matches_regime():
+    print("20. Testing Telegram no-signals fallback message matches actual market regime...")
+    # REGRESSION GUARD: this fallback message previously hardcoded a claim that
+    # "the broad market remains in correction" any time a scan produced zero
+    # new setups and zero lifecycle updates -- regardless of the actual KSE-100
+    # regime. A bull-market day with simply no fresh triggers is common and has
+    # nothing to do with a correction, so the message must only make that claim
+    # when the regime genuinely says so.
+    from telegram_notifier import build_no_signals_note
+
+    bullish_note = build_no_signals_note(is_bullish=True)
+    bearish_note = build_no_signals_note(is_bullish=False)
+
+    assert "correction" not in bullish_note.lower(), (
+        f"Bull-market fallback must not claim a market correction: {bullish_note}"
+    )
+    assert "correction" in bearish_note.lower(), (
+        f"Bear-market/correction fallback should say so: {bearish_note}"
+    )
+    assert bullish_note != bearish_note, "The two regime cases must produce distinct messages"
+    print("  ✓ Telegram no-signals fallback correctly tracks the actual market regime.")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -672,4 +695,6 @@ if __name__ == "__main__":
     test_circuit_trapping_multiday()
     test_portfolio_capital_allocation()
     test_portfolio_sector_caps()
+    test_telegram_no_signals_note_matches_regime()
     print("=== All Verification Tests Passed Successfully! ===")
+
