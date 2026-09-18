@@ -231,7 +231,9 @@ def test_backtester_same_bar_breakeven():
     assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
     assert bt["resolved_trades"] > 0, "Fixture must produce at least one resolved trade to actually test anything"
 
-    first_trade = bt["trades_df"].iloc[0]
+    be_matches = bt["trades_df"][bt["trades_df"]["exit_date"] == probe_bar]
+    assert not be_matches.empty, f"Expected a trade to resolve on probe_bar ({probe_bar})"
+    first_trade = be_matches.iloc[0]
     assert "BREAKEVEN" in first_trade["outcome"], f"Expected a same-day breakeven outcome, got: {first_trade['outcome']}"
     assert bool(first_trade["tp1_reached"]), "TP1 was genuinely touched intraday and must be credited"
     assert bool(first_trade["is_ambiguous"]), "A same-bar TP1-touch-then-retrace must be flagged ambiguous"
@@ -503,7 +505,7 @@ def test_trailing_ema_exit_mode():
 
 def test_trailing_ema_ambiguous_bar():
     print("16. Testing trailing_ema mode ambiguous same-bar target+stop handling...")
-    df = generate_isolated_test_data(days=200, base_price=300.0)
+    df = generate_isolated_test_data(days=200, base_price=300.0).iloc[:90].copy()
 
     probe_bar = df.index[84]
     df.loc[probe_bar, "High"] = 305.0   # crosses TP2 (~300.34)
@@ -514,7 +516,9 @@ def test_trailing_ema_ambiguous_bar():
     assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
     assert bt["resolved_trades"] > 0, "Fixture must produce at least one resolved trade to actually test anything"
 
-    first_trade = bt["trades_df"].iloc[0]
+    ambig_matches = bt["trades_df"][bt["trades_df"]["exit_date"] == probe_bar]
+    assert not ambig_matches.empty, f"Expected a trade to resolve on probe_bar ({probe_bar})"
+    first_trade = ambig_matches.iloc[0]
     assert first_trade["net_pnl_pct"] < 0, "This trade must close as a loss (stopped out)"
     assert not bool(first_trade["tp1_reached"]), "A same-bar stop breach must NOT credit the ambiguous TP1 touch"
     assert not bool(first_trade["tp2_reached"]), "A same-bar stop breach must NOT credit the ambiguous TP2 touch"
@@ -529,8 +533,8 @@ def test_circuit_trapping_multiday():
     df = generate_isolated_test_data(days=150, base_price=100.0)
     bt_initial = run_signal_backtest(df, symbol="TEST_TRAP", use_next_day_open=True)
     assert not bt_initial["trades_df"].empty, "Test data must generate at least one trade"
-    first_trade = bt_initial["trades_df"].iloc[0]
-    entry_date = first_trade["entry_date"]
+    target_trade = next(tr for _, tr in bt_initial["trades_df"].iterrows() if df.index.get_loc(tr["exit_date"]) - df.index.get_loc(tr["entry_date"]) >= 2)
+    entry_date = target_trade["entry_date"]
     entry_idx = df.index.get_loc(entry_date)
 
     # Let trade run 1 bar, then on bar entry_idx + 2 lock it at lower limit (-7.5%)
@@ -562,7 +566,9 @@ def test_circuit_trapping_multiday():
     )
     assert "error" not in bt_trapped
     assert bt_trapped["resolved_trades"] > 0
-    trapped_trade = bt_trapped["trades_df"].iloc[0]
+    trapped_trades = bt_trapped["trades_df"][bt_trapped["trades_df"]["outcome"].str.contains("Trapped in Lower Lock")]
+    assert not trapped_trades.empty, "Expected at least one trapped trade in lower lock"
+    trapped_trade = trapped_trades.iloc[0]
     assert "Trapped in Lower Lock" in trapped_trade["outcome"], f"Expected trapped outcome, got: {trapped_trade['outcome']}"
     assert trapped_trade.get("lock_bars_trapped", 0) >= 1, f"Expected lock_bars_trapped >= 1, got: {trapped_trade.get('lock_bars_trapped')}"
     assert bt_trapped["trapped_lock_trades"] >= 1
@@ -673,6 +679,64 @@ def test_telegram_no_signals_note_matches_regime():
     print("  ✓ Telegram no-signals fallback correctly tracks the actual market regime.")
 
 
+def test_mean_reversion_strategy():
+    print("21. Testing Mean-Reversion / Oversold Rebound Model (Broker Strategy)...")
+    df = generate_isolated_test_data(days=120, base_price=100.0)
+    df_ind = compute_all_indicators(df)
+
+    # 1. Classical Floor Pivots verification
+    assert "Pivot" in df_ind.columns and "Pivot_S1" in df_ind.columns and "Pivot_S2" in df_ind.columns
+    assert "Pivot_R1" in df_ind.columns and "Pivot_R2" in df_ind.columns
+
+    last_idx = len(df_ind) - 1
+    prev_h = df["High"].iloc[last_idx - 1]
+    prev_l = df["Low"].iloc[last_idx - 1]
+    prev_c = df["Close"].iloc[last_idx - 1]
+    expected_p = (prev_h + prev_l + prev_c) / 3.0
+    expected_s1 = (2.0 * expected_p) - prev_h
+    expected_r1 = (2.0 * expected_p) - prev_l
+    assert abs(df_ind["Pivot"].iloc[last_idx] - expected_p) < 1e-4
+    assert abs(df_ind["Pivot_S1"].iloc[last_idx] - expected_s1) < 1e-4
+    assert abs(df_ind["Pivot_R1"].iloc[last_idx] - expected_r1) < 1e-4
+
+    # 2. Fabricate an oversold condition near support with a reversal candle
+    df_mr = df_ind.copy()
+    probe_idx = len(df_mr) - 1
+    s1_level = float(df_mr["Pivot_S1"].iloc[probe_idx])
+
+    # Price testing S1 with oversold RSI and bullish green close
+    df_mr.loc[df_mr.index[probe_idx - 1], "RSI"] = 28.0
+    df_mr.loc[df_mr.index[probe_idx], "RSI"] = 32.0  # curling up
+    df_mr.loc[df_mr.index[probe_idx], "Low"] = s1_level * 0.995
+    df_mr.loc[df_mr.index[probe_idx], "Open"] = s1_level * 1.002
+    df_mr.loc[df_mr.index[probe_idx], "Close"] = s1_level * 1.010  # green close off support
+    df_mr.loc[df_mr.index[probe_idx], "High"] = s1_level * 1.015
+    df_mr.loc[df_mr.index[probe_idx], "Volume"] = 200_000
+    df_mr.loc[df_mr.index[probe_idx], "Vol_MA20"] = 150_000
+
+    setup = evaluate_bar_strategy(df_mr, bar_idx=-1, has_true_ohlc=True)
+    assert setup["strategy"] == "MEAN_REVERSION", f"Expected MEAN_REVERSION, got {setup.get('strategy')}"
+    assert "checklist" in setup
+    assert setup["status"] == "TRIGGERED", f"Expected TRIGGERED, got {setup['status']} (note: {setup.get('trigger_note')})"
+    assert setup["checklist"][list(setup["checklist"].keys())[0]] is True
+
+    # 3. Actionable card verification
+    card = format_actionable_card(setup, company_name="Test Mean Reversion Co")
+    assert "Mean_Reversion" in card or "Mean-Reversion" in card
+    assert "3-Day Time Stop" in card
+
+    # 4. Red candle should disqualify from TRIGGERED to WATCHING
+    df_mr_red = df_mr.copy()
+    df_mr_red.loc[df_mr_red.index[probe_idx], "Close"] = s1_level * 0.994  # red close below open
+    df_mr_red.loc[df_mr_red.index[probe_idx], "Open"] = s1_level * 1.010
+    df_mr_red.loc[df_mr_red.index[probe_idx], "Low"] = s1_level * 0.993
+    setup_red = evaluate_bar_strategy(df_mr_red, bar_idx=-1, has_true_ohlc=True)
+    if setup_red["strategy"] == "MEAN_REVERSION":
+        assert setup_red["status"] == "WATCHING", "Red candle without absorption must be WATCHING, not TRIGGERED"
+
+    print("  ✓ Mean-Reversion / Oversold Rebound Model passed (Pivots, Oversold Gating, Reversal Candle & Card).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -696,5 +760,7 @@ if __name__ == "__main__":
     test_portfolio_capital_allocation()
     test_portfolio_sector_caps()
     test_telegram_no_signals_note_matches_regime()
+    test_mean_reversion_strategy()
     print("=== All Verification Tests Passed Successfully! ===")
+
 

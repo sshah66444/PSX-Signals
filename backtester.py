@@ -427,14 +427,17 @@ def run_signal_backtest(
                     in_trade = False
                     continue
 
-                # Case 3: Optional Time-Stop Exit (if time_stop_bars > 0 explicitly requested)
-                if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
+                # Case 3: Optional Time-Stop Exit (if time_stop_bars > 0 explicitly requested or MEAN_REVERSION 3-day limit)
+                is_mr_stalled = (active.get("strategy") == "MEAN_REVERSION" and active["bars_held"] >= 3)
+                if (time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars) or is_mr_stalled:
                     stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
-                    if close_p <= stalled_threshold:
+                    should_exit_stalled = is_mr_stalled or (close_p <= stalled_threshold)
+                    if should_exit_stalled:
+                        reason_label = "TIME-STOP EXIT (Mean Reversion 3-Day Limit)" if is_mr_stalled else "TIME-STOP EXIT (Stalled Momentum)"
                         if is_lower_locked and simulate_circuit_trapping:
                             active["trapped_exit"] = {
                                 "trigger_date": date,
-                                "reason": "TIME-STOP EXIT (Stalled Momentum)",
+                                "reason": reason_label,
                                 "lock_bars": 1,
                             }
                             continue
@@ -446,9 +449,9 @@ def run_signal_backtest(
                         active.update({
                             "exit_date": date,
                             "exit_price": exit_price,
-                            "outcome": "TIME-STOP EXIT (Stalled Momentum)",
-                            "tp1_reached": False,
-                            "tp2_reached": False,
+                            "outcome": reason_label,
+                            "tp1_reached": active.get("tp1_hit", False),
+                            "tp2_reached": active.get("tp2_hit", False),
                             "gross_pnl_pct": round(gross_return * 100, 2),
                             "net_pnl_pct": round(net_return * 100, 2),
                             "is_ambiguous": False,
@@ -650,14 +653,17 @@ def run_signal_backtest(
                         in_trade = False
                         continue
 
-                # Case 4: Time-Stop Exit (Stalled Momentum before TP1)
-                if time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars:
+                # Case 4: Time-Stop Exit (Stalled Momentum before TP1 or MEAN_REVERSION 3-day limit)
+                is_mr_stalled_fix = (active.get("strategy") == "MEAN_REVERSION" and active["bars_held"] >= 3)
+                if (time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars) or is_mr_stalled_fix:
                     stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
-                    if close_p <= stalled_threshold:
+                    should_exit_stalled = is_mr_stalled_fix or (close_p <= stalled_threshold)
+                    if should_exit_stalled:
+                        reason_label = "TIME-STOP EXIT (Mean Reversion 3-Day Limit)" if is_mr_stalled_fix else "TIME-STOP EXIT (Stalled Momentum)"
                         if is_lower_locked and simulate_circuit_trapping:
                             active["trapped_exit"] = {
                                 "trigger_date": date,
-                                "reason": "TIME-STOP EXIT (Stalled Momentum)",
+                                "reason": reason_label,
                                 "lock_bars": 1,
                             }
                             continue
@@ -669,8 +675,8 @@ def run_signal_backtest(
                         active.update({
                             "exit_date": date,
                             "exit_price": exit_price,
-                            "outcome": "TIME-STOP EXIT (Stalled Momentum)",
-                            "tp1_reached": False,
+                            "outcome": reason_label,
+                            "tp1_reached": active.get("tp1_hit", False),
                             "tp2_reached": False,
                             "gross_pnl_pct": round(gross_return * 100, 2),
                             "net_pnl_pct": round(net_return * 100, 2),

@@ -311,7 +311,7 @@ with tab2:
         with c_filter2:
             strategy_filter = st.selectbox(
                 "Filter by Strategy:",
-                ["All", "BREAKOUT", "PULLBACK", "NONE"]
+                ["All", "BREAKOUT", "PULLBACK", "MEAN_REVERSION", "NONE"]
             )
 
         df_filtered = df_scan.copy()
