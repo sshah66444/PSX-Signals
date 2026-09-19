@@ -181,6 +181,7 @@ def run_signal_backtest(
         kse_close_series = df_kse["Close"].reindex(df_ind.index, method="ffill")
         kse_ema50_series = df_kse["EMA_50"].reindex(df_ind.index, method="ffill")
 
+    mr_time_stop_bars = strategy_params.get("mr_time_stop_bars", 2) if strategy_params else 2
     trades = []
     in_trade = False
     active = {}
@@ -427,13 +428,13 @@ def run_signal_backtest(
                     in_trade = False
                     continue
 
-                # Case 3: Optional Time-Stop Exit (if time_stop_bars > 0 explicitly requested or MEAN_REVERSION 3-day limit)
-                is_mr_stalled = (active.get("strategy") == "MEAN_REVERSION" and active["bars_held"] >= 3)
+                # Case 3: Optional Time-Stop Exit (if time_stop_bars > 0 explicitly requested or MEAN_REVERSION limit)
+                is_mr_stalled = (active.get("strategy") == "MEAN_REVERSION" and active["bars_held"] >= mr_time_stop_bars)
                 if (time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars) or is_mr_stalled:
                     stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
                     should_exit_stalled = is_mr_stalled or (close_p <= stalled_threshold)
                     if should_exit_stalled:
-                        reason_label = "TIME-STOP EXIT (Mean Reversion 3-Day Limit)" if is_mr_stalled else "TIME-STOP EXIT (Stalled Momentum)"
+                        reason_label = f"TIME-STOP EXIT (Mean Reversion {mr_time_stop_bars}-Day Limit)" if is_mr_stalled else "TIME-STOP EXIT (Stalled Momentum)"
                         if is_lower_locked and simulate_circuit_trapping:
                             active["trapped_exit"] = {
                                 "trigger_date": date,
@@ -653,13 +654,13 @@ def run_signal_backtest(
                         in_trade = False
                         continue
 
-                # Case 4: Time-Stop Exit (Stalled Momentum before TP1 or MEAN_REVERSION 3-day limit)
-                is_mr_stalled_fix = (active.get("strategy") == "MEAN_REVERSION" and active["bars_held"] >= 3)
+                # Case 4: Time-Stop Exit (Stalled Momentum before TP1 or MEAN_REVERSION limit)
+                is_mr_stalled_fix = (active.get("strategy") == "MEAN_REVERSION" and active["bars_held"] >= mr_time_stop_bars)
                 if (time_stop_bars > 0 and not active["tp1_hit"] and active["bars_held"] >= time_stop_bars) or is_mr_stalled_fix:
                     stalled_threshold = entry + (0.15 * active.get("atr", 0.0))
                     should_exit_stalled = is_mr_stalled_fix or (close_p <= stalled_threshold)
                     if should_exit_stalled:
-                        reason_label = "TIME-STOP EXIT (Mean Reversion 3-Day Limit)" if is_mr_stalled_fix else "TIME-STOP EXIT (Stalled Momentum)"
+                        reason_label = f"TIME-STOP EXIT (Mean Reversion {mr_time_stop_bars}-Day Limit)" if is_mr_stalled_fix else "TIME-STOP EXIT (Stalled Momentum)"
                         if is_lower_locked and simulate_circuit_trapping:
                             active["trapped_exit"] = {
                                 "trigger_date": date,

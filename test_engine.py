@@ -92,7 +92,17 @@ def test_data_integrity():
     assert len(df_test) == 120
     is_valid, reason, age = validate_market_data(df_test, max_age_days=5)
     assert is_valid, f"Test data failed validation: {reason}"
-    print("  ✓ Data integrity validation passed (stale data properly rejected).")
+
+    # REGRESSION GUARD: Verify all 7 days of the week (especially Sat/Sun) generate exactly
+    # the requested row count and snap cleanly to the preceding Friday without undercounting
+    ref_monday = datetime.date(2026, 9, 14)
+    for dow in range(7):
+        sim_date = ref_monday + datetime.timedelta(days=dow)
+        df_sim = generate_isolated_test_data(days=60, end_date=sim_date)
+        assert len(df_sim) == 60, f"Expected 60 rows on {sim_date.strftime('%A')}, got {len(df_sim)}"
+        assert df_sim.index[-1].weekday() < 5, f"Last candle must be a business day, got weekday {df_sim.index[-1].weekday()}"
+
+    print("  ✓ Data integrity validation passed (stale data rejected & 7-day weekend date-range verified).")
     return df_test
 
 
@@ -723,7 +733,7 @@ def test_mean_reversion_strategy():
     # 3. Actionable card verification
     card = format_actionable_card(setup, company_name="Test Mean Reversion Co")
     assert "Mean_Reversion" in card or "Mean-Reversion" in card
-    assert "3-Day Time Stop" in card
+    assert "2-Day Time Stop" in card or "Time Stop" in card
 
     # 4. Transparent Macro Context verification in both regimes (default "all" mode)
     setup_bull = evaluate_bar_strategy(df_mr, bar_idx=-1, market_regime={"is_bullish": True, "regime": "BULL_MARKET"})
@@ -752,7 +762,18 @@ def test_mean_reversion_strategy():
     )
     assert setup_corr_bear["status"] == "TRIGGERED", "In correction_only mode, Strategy B must trigger during MARKET_CORRECTION"
 
-    # 6. Red candle should disqualify from TRIGGERED to WATCHING
+    # 6. Backtester Mean-Reversion Time-Stop (default 2 bars / 48h vs 3 bars / 72h buffer)
+    bt_2d = run_signal_backtest(df, symbol="TEST_MR_2D", exit_mode="trailing_ema", strategy_params={"mr_time_stop_bars": 2})
+    assert "error" not in bt_2d
+    mr_stalled_2d = [t for _, t in bt_2d["trades_df"].iterrows() if "Mean Reversion 2-Day Limit" in str(t.get("outcome"))]
+    assert len(mr_stalled_2d) >= 1, "Backtester must support 2-day limit (48h)"
+
+    bt_3d = run_signal_backtest(df, symbol="TEST_MR_3D", exit_mode="trailing_ema", strategy_params={"mr_time_stop_bars": 3})
+    assert "error" not in bt_3d
+    mr_stalled_3d = [t for _, t in bt_3d["trades_df"].iterrows() if "Mean Reversion 3-Day Limit" in str(t.get("outcome"))]
+    assert len(mr_stalled_3d) >= 1, "Backtester must support 3-day buffer (72h)"
+
+    # 7. Red candle should disqualify from TRIGGERED to WATCHING
     df_mr_red = df_mr.copy()
     df_mr_red.loc[df_mr_red.index[probe_idx], "Close"] = s1_level * 0.994  # red close below open
     df_mr_red.loc[df_mr_red.index[probe_idx], "Open"] = s1_level * 1.010

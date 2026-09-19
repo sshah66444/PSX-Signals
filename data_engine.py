@@ -468,13 +468,32 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
     }
 
 
-def generate_isolated_test_data(days: int = 120, base_price: float = 100.0) -> pd.DataFrame:
+def generate_isolated_test_data(
+    days: int = 120,
+    base_price: float = 100.0,
+    end_date: datetime.date | str | None = None,
+) -> pd.DataFrame:
     """
     Quarantined synthetic dataset generator strictly for automated unit tests.
     Never imported or used in production alert pipelines.
+    Explicitly handles weekends: if end_date falls on Saturday/Sunday, snaps
+    to the preceding Friday so that date generation is deterministic, avoids
+    calendar gaps, and guarantees exactly `days` rows without weekend under-counting.
     """
     import numpy as np
-    dates = pd.date_range(end=datetime.date.today(), periods=days, freq="B")
+    if end_date is None:
+        end_date = datetime.date.today()
+    elif isinstance(end_date, str):
+        end_date = datetime.date.fromisoformat(end_date)
+
+    # Snap weekend end_date to preceding Friday to ensure clean business day calendar
+    if hasattr(end_date, "weekday"):
+        if end_date.weekday() == 5:  # Saturday
+            end_date = end_date - datetime.timedelta(days=1)
+        elif end_date.weekday() == 6:  # Sunday
+            end_date = end_date - datetime.timedelta(days=2)
+
+    dates = pd.date_range(end=end_date, periods=days, freq="B")
     np.random.seed(42)
     returns = np.random.normal(0.001, 0.018, size=len(dates))
     prices = base_price * np.cumprod(1 + returns)

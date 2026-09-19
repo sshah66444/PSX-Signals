@@ -136,6 +136,7 @@ def evaluate_bar_strategy(
     p_pb_rsi_max = params.get("pullback_rsi_max", 58.0) if params else 58.0
     p_oversold_rsi_max = params.get("oversold_rsi_max", 38.0) if params else 38.0
     p_mr_regime = params.get("mean_rev_regime", "all") if params else "all"
+    p_mr_time_stop = params.get("mr_time_stop_bars", 2) if params else 2
     p_rr_min = params.get("rr_min", 1.20) if params else 1.20
 
     # Normalize negative index
@@ -459,7 +460,7 @@ def evaluate_bar_strategy(
             "tp1": tp1,
             "tp2": tp2,
             "trailing_stop_ema": round(ema20, 2),
-            "trailing_rule": "Exit at Target 1 (Scalp) / Target 2 (20 EMA) or 3-Day Time Stop",
+            "trailing_rule": f"Exit at Target 1 (Scalp) / Target 2 (20 EMA) or {p_mr_time_stop}-Day Time Stop ({p_mr_time_stop * 24}h)",
             "risk_pct": round((risk / entry_max) * 100, 1),
             "rr_tp1": rr_tp1,
             "rr_tp2": rr_tp2,
@@ -571,7 +572,7 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
     company_esc = esc(company_name)
 
     if strategy == "MEAN_REVERSION":
-        exit_model_str = setup.get("trailing_rule", "Exit at Target 1 (Scalp) / Target 2 (20 EMA) or 3-Day Time Stop")
+        exit_model_str = setup.get("trailing_rule", "Exit at Target 1 (Scalp) / Target 2 (20 EMA) or 2-Day Time Stop (48h)")
     else:
         exit_model_str = f"Trailing 20 EMA ({setup.get('trailing_stop_ema', 0):.2f} PKR) or Targets"
 
