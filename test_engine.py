@@ -725,7 +725,34 @@ def test_mean_reversion_strategy():
     assert "Mean_Reversion" in card or "Mean-Reversion" in card
     assert "3-Day Time Stop" in card
 
-    # 4. Red candle should disqualify from TRIGGERED to WATCHING
+    # 4. Transparent Macro Context verification in both regimes (default "all" mode)
+    setup_bull = evaluate_bar_strategy(df_mr, bar_idx=-1, market_regime={"is_bullish": True, "regime": "BULL_MARKET"})
+    assert setup_bull["status"] == "TRIGGERED"
+    assert any("BULL_MARKET" in k for k in setup_bull["checklist"].keys()), "Bull market regime must be transparently tagged"
+
+    setup_bear = evaluate_bar_strategy(df_mr, bar_idx=-1, market_regime={"is_bullish": False, "regime": "MARKET_CORRECTION"})
+    assert setup_bear["status"] == "TRIGGERED"
+    assert any("MARKET_CORRECTION" in k for k in setup_bear["checklist"].keys()), "Correction regime must be transparently tagged"
+
+    # 5. Configurable "correction_only" mode verification
+    setup_corr_bull = evaluate_bar_strategy(
+        df_mr,
+        bar_idx=-1,
+        market_regime={"is_bullish": True, "regime": "BULL_MARKET"},
+        params={"mean_rev_regime": "correction_only"},
+    )
+    assert setup_corr_bull["status"] == "WATCHING", "In correction_only mode, Strategy B must be suppressed during BULL_MARKET"
+    assert "correction_only mode" in setup_corr_bull["trigger_note"]
+
+    setup_corr_bear = evaluate_bar_strategy(
+        df_mr,
+        bar_idx=-1,
+        market_regime={"is_bullish": False, "regime": "MARKET_CORRECTION"},
+        params={"mean_rev_regime": "correction_only"},
+    )
+    assert setup_corr_bear["status"] == "TRIGGERED", "In correction_only mode, Strategy B must trigger during MARKET_CORRECTION"
+
+    # 6. Red candle should disqualify from TRIGGERED to WATCHING
     df_mr_red = df_mr.copy()
     df_mr_red.loc[df_mr_red.index[probe_idx], "Close"] = s1_level * 0.994  # red close below open
     df_mr_red.loc[df_mr_red.index[probe_idx], "Open"] = s1_level * 1.010
@@ -734,7 +761,7 @@ def test_mean_reversion_strategy():
     if setup_red["strategy"] == "MEAN_REVERSION":
         assert setup_red["status"] == "WATCHING", "Red candle without absorption must be WATCHING, not TRIGGERED"
 
-    print("  ✓ Mean-Reversion / Oversold Rebound Model passed (Pivots, Oversold Gating, Reversal Candle & Card).")
+    print("  ✓ Mean-Reversion / Oversold Rebound Model passed (Pivots, Macro Context Gating, Reversal Candle & Card).")
 
 
 if __name__ == "__main__":

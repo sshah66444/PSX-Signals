@@ -135,6 +135,7 @@ def evaluate_bar_strategy(
     p_rsi_max = params.get("rsi_max", 68.0) if params else 68.0
     p_pb_rsi_max = params.get("pullback_rsi_max", 58.0) if params else 58.0
     p_oversold_rsi_max = params.get("oversold_rsi_max", 38.0) if params else 38.0
+    p_mr_regime = params.get("mean_rev_regime", "all") if params else "all"
     p_rr_min = params.get("rr_min", 1.20) if params else 1.20
 
     # Normalize negative index
@@ -401,7 +402,17 @@ def evaluate_bar_strategy(
         # Momentum curl: MACD histogram rising OR RSI hooking up from low
         c_momentum_turn = (macd_hist > prev_macd_hist) or (rsi > prev_rsi)
 
+        # Macro Regime Context & Gating
+        if p_mr_regime == "correction_only":
+            c_mr_macro = not is_market_bullish
+            macro_rule_label = "Macro Regime Gate (Market in Correction)"
+        else:
+            c_mr_macro = True
+            macro_tag = "BULL_MARKET (High Probability Dip)" if is_market_bullish else "MARKET_CORRECTION (Counter-Trend Scalp)"
+            macro_rule_label = f"Macro Context ({macro_tag})"
+
         checklist = {
+            macro_rule_label: c_mr_macro,
             f"Oversold Momentum (RSI <= {p_oversold_rsi_max:.0f} or Lower BB)": is_oversold,
             "Classical Support Confluence (Near S1/S2/20-Low)": is_near_support,
             "Intraday Reversal / Bounce Confirmation": c_bounce_candle,
@@ -413,7 +424,11 @@ def evaluate_bar_strategy(
 
         if all(checklist.values()):
             status = "TRIGGERED"
-            trigger_note = f"All criteria verified: oversold rebound (RSI {rsi:.1f}) off support ({pivot_s1:.2f}) with reversal candle, curling momentum, and R:R {rr_tp1}:1 to TP1 ({tp1:.2f})."
+            macro_desc = "bull-market dip" if is_market_bullish else "counter-trend relief bounce"
+            trigger_note = f"All criteria verified: oversold {macro_desc} (RSI {rsi:.1f}) off support ({pivot_s1:.2f}) with reversal candle, curling momentum, and R:R {rr_tp1}:1 to TP1 ({tp1:.2f})."
+        elif not c_mr_macro:
+            status = "WATCHING"
+            trigger_note = f"Disqualified from TRIGGERED: Strategy B configured for correction_only mode, but KSE-100 is in {regime_name}."
         elif not c_true_ohlc:
             status = "WATCHING"
             trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. Support levels cannot be reliably calculated."
