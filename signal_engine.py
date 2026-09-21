@@ -532,10 +532,26 @@ def generate_signal(
         setup["source"] = data_meta.get("source", "PSX Direct")
         setup["last_date"] = data_meta.get("last_date", str(df.index[-1].date()))
         setup["data_age_days"] = data_meta.get("data_age_days", 0)
+        setup["is_settled"] = data_meta.get("is_settled", True)
+        setup["expected_date"] = data_meta.get("expected_date", setup["last_date"])
+        setup["freshness_note"] = data_meta.get("freshness_note", "")
     else:
         setup["source"] = "PSX Direct"
         setup["last_date"] = str(df.index[-1].date())
         setup["data_age_days"] = 0
+        setup["is_settled"] = True
+        setup["expected_date"] = setup["last_date"]
+        setup["freshness_note"] = ""
+
+    # Strict Session Freshness Guard:
+    # If today's market has already closed, but the feed is still on the previous session,
+    # prevent triggering fresh entry alerts on stale data.
+    if not setup["is_settled"] and setup.get("status") == "TRIGGERED":
+        setup["status"] = "WATCHING"
+        setup["trigger_note"] = (
+            f"Setup matched on {setup['last_date']} close, but today's EOD bar ({setup['expected_date']}) "
+            f"is pending exchange settlement. Order execution paused pending latest bar."
+        )
 
     return setup
 
@@ -551,6 +567,8 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
     source = setup.get("source", "PSX Feed")
     last_date = setup.get("last_date", "Today")
     age = setup.get("data_age_days", 0)
+    is_settled = setup.get("is_settled", True)
+    expected_date = setup.get("expected_date", "")
 
     if status == "NEUTRAL" or strategy == "NONE":
         return f"⚪ <b>${sym}</b> — {company_name}\nStatus: NEUTRAL (No high-probability setup)."
@@ -576,9 +594,17 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
     else:
         exit_model_str = f"Trailing 20 EMA ({setup.get('trailing_stop_ema', 0):.2f} PKR) or Targets"
 
+    pending_banner = ""
+    if not is_settled:
+        pending_banner = (
+            f"⏳ <b>NOTICE:</b> Today's ({esc(expected_date)}) EOD settlement is pending. "
+            f"Showing {esc(last_date)} data.\n"
+        )
+
     card = (
         f"{badge_emoji} <b>${sym} — {status_label}</b>\n"
         f"🏢 {company_esc}\n"
+        f"{pending_banner}"
         f"📅 <b>Data:</b> {last_date} Close ({source_esc}) | Age: {age}d\n"
         f"🎯 <b>Strategy:</b> {strategy.title()} Setup\n"
         f"📍 <b>Trigger Condition:</b> {trigger_note}\n"

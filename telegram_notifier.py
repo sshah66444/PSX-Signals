@@ -83,14 +83,21 @@ def build_no_signals_note(is_bullish: bool) -> str:
     return "ℹ️ <i>No new triggered setups or active updates today. Existing positions held.</i>"
 
 
-def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_run: bool = False) -> list[str]:
+def run_daily_market_cycle(
+    token: str,
+    chat_id: str,
+    symbols: list = None,
+    dry_run: bool = False,
+    strict_freshness: bool = True,
+) -> list[str]:
     """
     Executes the complete daily workflow:
     1. Fetches KSE-100 index and macro market regime.
-    2. Fetches real market data.
-    3. Audits existing open signals (checks TP/SL hits, sends updates).
-    4. Scans for new or triggered setups.
-    5. Records them in signals.db without repeating unchanged setups.
+    2. Evaluates session settlement (Strict Freshness Guard).
+    3. Fetches real market data.
+    4. Audits existing open signals (checks TP/SL hits, sends updates).
+    5. Scans for new or triggered setups.
+    6. Records them in signals.db without repeating unchanged setups.
     """
     watchlist = get_watchlist()
     target_symbols = symbols if symbols else list(watchlist.keys())
@@ -103,7 +110,31 @@ def run_daily_market_cycle(token: str, chat_id: str, symbols: list = None, dry_r
     is_bullish = regime_info.get("is_bullish", True)
     kse_close = regime_info.get("close", 0.0)
     kse_ema50 = regime_info.get("ema50", 0.0)
-    print(f"   KSE-100 Regime: {regime_name} (Close: {kse_close:,.0f} vs 50 EMA: {kse_ema50:,.0f})")
+    is_kse_settled = regime_info.get("is_settled", True)
+    expected_sess_date = regime_info.get("expected_date", "")
+    kse_last_date = regime_info.get("last_date", "")
+    print(f"   KSE-100 Regime: {regime_name} (Close: {kse_close:,.0f} vs 50 EMA: {kse_ema50:,.0f}) | Settled: {is_kse_settled} (Expected: {expected_sess_date})")
+
+    # Strict Session Freshness Guard:
+    # If today's market session has concluded, but upstream data feeds (Yahoo Finance) have not yet published
+    # today's closing settlement candle, pause to prevent emitting buy signals on stale prior-session data.
+    if strict_freshness and not is_kse_settled:
+        today_str = datetime.date.today().strftime("%d-%b-%Y")
+        pending_msg = (
+            f"⏳ <b>PSX AlphaSignals — EOD Settlement Pending</b>\n"
+            f"📅 Date: <b>{today_str}</b>\n"
+            f"────────────────────────\n"
+            f"The PSX market session for today (<b>{expected_sess_date}</b>) has concluded, "
+            f"but upstream data feeds (Yahoo Finance) have not yet finalized today's closing settlement.\n\n"
+            f"• Latest available session: <b>{kse_last_date}</b>\n"
+            f"• Daily scan paused to protect execution integrity (no trades on stale data).\n"
+            f"• Scans will evaluate once today's closing candles are ingested (typically by 7:30 PM PKT).\n\n"
+            f"<i>Execution integrity guard active: no stale trades emitted.</i>"
+        )
+        print(f"   [FRESHNESS GUARD] Session {expected_sess_date} pending EOD settlement (latest bar: {kse_last_date}). Halting daily scan.")
+        if not dry_run and token and chat_id:
+            broadcast_telegram_message(token, chat_id, pending_msg)
+        return [pending_msg]
 
     print(f"2. Fetching real market data for {len(target_symbols)} symbols...")
     market_data = {}
@@ -325,6 +356,7 @@ def main():
     parser.add_argument("--symbol", type=str, help="Specific symbol to scan")
     parser.add_argument("--dry-run", action="store_true", help="Print output without delivering to Telegram")
     parser.add_argument("--check-commands", action="store_true", help="Poll and execute interactive Telegram commands")
+    parser.add_argument("--allow-stale", action="store_true", help="Bypass strict session freshness guard (e.g. for holidays/backtests)")
     args = parser.parse_args()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -336,7 +368,13 @@ def main():
         return
 
     symbols = [args.symbol.upper()] if args.symbol else None
-    messages = run_daily_market_cycle(token, chat_id, symbols=symbols, dry_run=args.dry_run)
+    messages = run_daily_market_cycle(
+        token,
+        chat_id,
+        symbols=symbols,
+        dry_run=args.dry_run,
+        strict_freshness=not args.allow_stale,
+    )
 
     if args.dry_run or not token or not chat_id:
         print("\n=== [ACTIONABLE MARKET CARDS PREVIEW] ===")

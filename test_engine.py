@@ -20,6 +20,9 @@ from data_engine import (
     get_watchlist,
     check_has_true_ohlc,
     get_symbol_sector,
+    get_expected_session_date,
+    is_session_settled,
+    PKT_TZ,
 )
 from signal_engine import (
     compute_all_indicators,
@@ -785,6 +788,83 @@ def test_mean_reversion_strategy():
     print("  ✓ Mean-Reversion / Oversold Rebound Model passed (Pivots, Macro Context Gating, Reversal Candle & Card).")
 
 
+def test_session_freshness_guard():
+    print("22. Testing Session Freshness Guard (Option 2: Stale EOD Detection)...")
+    from telegram_notifier import run_daily_market_cycle
+
+    # 1. Test get_expected_session_date across various times & weekdays in PKT
+    # A. Monday morning (2026-09-21 10:00 PKT) -> expected session is Friday 2026-09-18
+    as_of_mon_morning = datetime.datetime(2026, 9, 21, 10, 0, tzinfo=PKT_TZ)
+    exp_mon_morning = get_expected_session_date(as_of_mon_morning)
+    assert exp_mon_morning == datetime.date(2026, 9, 18), f"Expected 2026-09-18, got {exp_mon_morning}"
+
+    # B. Monday post-close (2026-09-21 16:30 PKT) -> expected session is Monday 2026-09-21
+    as_of_mon_post = datetime.datetime(2026, 9, 21, 16, 30, tzinfo=PKT_TZ)
+    exp_mon_post = get_expected_session_date(as_of_mon_post)
+    assert exp_mon_post == datetime.date(2026, 9, 21), f"Expected 2026-09-21, got {exp_mon_post}"
+
+    # C. Friday pre-close (2026-09-25 14:00 PKT) -> expected session is Thursday 2026-09-24
+    as_of_fri_pre = datetime.datetime(2026, 9, 25, 14, 0, tzinfo=PKT_TZ)
+    exp_fri_pre = get_expected_session_date(as_of_fri_pre)
+    assert exp_fri_pre == datetime.date(2026, 9, 24), f"Expected 2026-09-24, got {exp_fri_pre}"
+
+    # D. Friday post-close (2026-09-25 17:30 PKT) -> expected session is Friday 2026-09-25
+    as_of_fri_post = datetime.datetime(2026, 9, 25, 17, 30, tzinfo=PKT_TZ)
+    exp_fri_post = get_expected_session_date(as_of_fri_post)
+    assert exp_fri_post == datetime.date(2026, 9, 25), f"Expected 2026-09-25, got {exp_fri_post}"
+
+    # E. Saturday (2026-09-26 12:00 PKT) -> expected session is Friday 2026-09-25
+    as_of_sat = datetime.datetime(2026, 9, 26, 12, 0, tzinfo=PKT_TZ)
+    exp_sat = get_expected_session_date(as_of_sat)
+    assert exp_sat == datetime.date(2026, 9, 25), f"Expected 2026-09-25, got {exp_sat}"
+
+    # F. Sunday (2026-09-27 18:00 PKT) -> expected session is Friday 2026-09-25
+    as_of_sun = datetime.datetime(2026, 9, 27, 18, 0, tzinfo=PKT_TZ)
+    exp_sun = get_expected_session_date(as_of_sun)
+    assert exp_sun == datetime.date(2026, 9, 25), f"Expected 2026-09-25, got {exp_sun}"
+
+    # 2. Test is_session_settled
+    # Friday candle evaluated on Monday post-close -> UNSETTLED (False)
+    is_settled, exp_d, msg = is_session_settled("2026-09-18", as_of=as_of_mon_post)
+    assert is_settled is False, "Friday candle on Monday post-close must be unsettled"
+    assert exp_d == datetime.date(2026, 9, 21)
+    assert "pending EOD update" in msg
+
+    # Monday candle evaluated on Monday post-close -> SETTLED (True)
+    is_settled_ok, _, _ = is_session_settled("2026-09-21", as_of=as_of_mon_post)
+    assert is_settled_ok is True, "Monday candle on Monday post-close must be settled"
+
+    # 3. Test validate_market_data with require_settled_session=True
+    df_sample = generate_isolated_test_data(days=30, end_date="2026-09-18")
+    valid, reason, _ = validate_market_data(
+        df_sample, require_settled_session=True, as_of=as_of_mon_post
+    )
+    assert not valid, "validate_market_data must fail when require_settled_session=True and candle is stale"
+    assert "pending EOD update" in reason
+
+    valid_ok, _, _ = validate_market_data(
+        df_sample, require_settled_session=True, as_of=as_of_mon_morning
+    )
+    assert valid_ok, "validate_market_data must pass on Monday morning when latest candle is Friday"
+
+    # 4. Test signal_engine protection: Unsettled data must NEVER produce TRIGGERED status
+    meta_unsettled = {
+        "source": "Yahoo Finance (MTL.KA)",
+        "has_true_ohlc": True,
+        "last_date": "2026-09-18",
+        "data_age_days": 3,
+        "is_settled": False,
+        "expected_date": "2026-09-21",
+        "freshness_note": "Data pending EOD update",
+    }
+    setup_unsettled = generate_signal("MTL", df_sample, data_meta=meta_unsettled)
+    assert setup_unsettled.get("status") != "TRIGGERED", "Signal engine must downgrade TRIGGERED to WATCHING on unsettled data"
+    card_unsettled = format_actionable_card(setup_unsettled, company_name="Millat Tractors")
+    assert "EOD settlement is pending" in card_unsettled, "Actionable card must prominently display pending EOD notice"
+
+    print("  ✓ Session Freshness Guard passed (Deterministic session cutoff, validation rejection, status downgrade & card notice).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -809,6 +889,7 @@ if __name__ == "__main__":
     test_portfolio_sector_caps()
     test_telegram_no_signals_note_matches_regime()
     test_mean_reversion_strategy()
+    test_session_freshness_guard()
     print("=== All Verification Tests Passed Successfully! ===")
 
 

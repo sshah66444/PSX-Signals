@@ -2,8 +2,9 @@ name: PSX Daily Telegram Signals
 
 on:
   schedule:
-    # Runs Monday through Friday at 11:21 UTC (4:21 PM Pakistan Time - off-peak minute to bypass GitHub queue delays)
-    - cron: '21 11 * * 1-5'
+    # Runs Monday through Friday at 14:30 UTC (7:30 PM Pakistan Time)
+    # when Yahoo Finance has ingested and settled PSX closing market candles
+    - cron: '30 14 * * 1-5'
   workflow_dispatch: # Allows manual trigger anytime from GitHub UI or mobile app
 
 permissions:

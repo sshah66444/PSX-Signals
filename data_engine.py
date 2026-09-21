@@ -131,11 +131,15 @@ def get_symbol_name(symbol: str) -> str:
 
 
 def _fetch_from_yahoo(clean_symbol: str, period: str = "6mo") -> pd.DataFrame:
-    """Fetches real market data from Yahoo Finance via .KA suffix."""
+    """
+    Fetches real market data from Yahoo Finance via .KA suffix.
+    Uses auto_adjust=False to preserve raw unadjusted spot prices matching broker terminals (KATS),
+    preventing dividend/split back-adjustments from distorting price levels.
+    """
     import yfinance as yf
     ticker_str = f"{clean_symbol}.KA"
     ticker = yf.Ticker(ticker_str)
-    df = ticker.history(period=period, interval="1d")
+    df = ticker.history(period=period, interval="1d", auto_adjust=False)
     if df is not None and not df.empty and len(df) >= 20:
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -167,6 +171,90 @@ def check_has_true_ohlc(df: pd.DataFrame) -> bool:
 
 # Pakistan Standard Time (PKT = UTC+5) for deterministic date conversion on all servers
 PKT_TZ = datetime.timezone(datetime.timedelta(hours=5))
+
+
+def get_expected_session_date(as_of: datetime.datetime | None = None) -> datetime.date:
+    """
+    Returns the most recent completed/expected trading session date for the PSX.
+    Uses Pakistan Standard Time (PKT = UTC+5).
+
+    PSX Trading Hours (PKT):
+      - Monday - Thursday: 09:15 - 15:30 (Closing auction ends by 16:15 PKT)
+      - Friday: 09:00 - 12:00, 14:30 - 16:30 (Closing auction ends by 17:00 PKT)
+      - Saturday & Sunday: Closed
+
+    Rules:
+      - Saturday or Sunday: Preceding Friday is the expected completed session.
+      - Monday:
+          - After 16:15 PKT: Today (Monday) is the expected completed session.
+          - Before 16:15 PKT: Previous Friday (3 days prior) is the latest completed session.
+      - Tuesday - Thursday:
+          - After 16:15 PKT: Today is the expected completed session.
+          - Before 16:15 PKT: Yesterday (1 day prior) is the latest completed session.
+      - Friday:
+          - After 17:00 PKT: Today (Friday) is the expected completed session.
+          - Before 17:00 PKT: Thursday (1 day prior) is the latest completed session.
+    """
+    if as_of is None:
+        now_pkt = datetime.datetime.now(PKT_TZ)
+    else:
+        if as_of.tzinfo is None:
+            now_pkt = as_of.replace(tzinfo=PKT_TZ)
+        else:
+            now_pkt = as_of.astimezone(PKT_TZ)
+
+    weekday = now_pkt.weekday()  # 0: Mon, 1: Tue, 2: Wed, 3: Thu, 4: Fri, 5: Sat, 6: Sun
+    hour = now_pkt.hour
+    minute = now_pkt.minute
+    time_float = hour + minute / 60.0
+
+    # Market close cutoff in PKT
+    cutoff = 17.0 if weekday == 4 else 16.25
+
+    if weekday == 5:  # Saturday -> Friday
+        return (now_pkt - datetime.timedelta(days=1)).date()
+    elif weekday == 6:  # Sunday -> Friday
+        return (now_pkt - datetime.timedelta(days=2)).date()
+    elif weekday == 0:  # Monday
+        if time_float >= cutoff:
+            return now_pkt.date()
+        else:
+            return (now_pkt - datetime.timedelta(days=3)).date()
+    else:  # Tuesday - Friday
+        if time_float >= cutoff:
+            return now_pkt.date()
+        else:
+            return (now_pkt - datetime.timedelta(days=1)).date()
+
+
+def is_session_settled(
+    latest_candle_date: datetime.date | datetime.datetime | str,
+    as_of: datetime.datetime | None = None,
+) -> tuple[bool, datetime.date, str]:
+    """
+    Evaluates whether the provided candle date represents the expected completed PSX session.
+    Returns:
+        (is_settled, expected_date, explanation)
+    """
+    if isinstance(latest_candle_date, str):
+        candle_date = datetime.datetime.strptime(latest_candle_date[:10], "%Y-%m-%d").date()
+    elif isinstance(latest_candle_date, datetime.datetime):
+        candle_date = latest_candle_date.date()
+    else:
+        candle_date = latest_candle_date
+
+    expected_date = get_expected_session_date(as_of)
+
+    if candle_date >= expected_date:
+        return True, expected_date, f"Session data is up-to-date ({candle_date.strftime('%Y-%m-%d')})."
+    else:
+        days_behind = (expected_date - candle_date).days
+        return (
+            False,
+            expected_date,
+            f"Data pending EOD update: latest candle is {candle_date.strftime('%Y-%m-%d')}, "
+            f"expected settled session is {expected_date.strftime('%Y-%m-%d')} ({days_behind}d behind).",
+        )
 
 
 def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
@@ -220,11 +308,19 @@ def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     return df
 
 
-def validate_market_data(df: pd.DataFrame, max_age_days: int = 5, require_true_ohlc: bool = False) -> tuple[bool, str, int]:
+def validate_market_data(
+    df: pd.DataFrame,
+    max_age_days: int = 5,
+    require_true_ohlc: bool = False,
+    require_settled_session: bool = False,
+    as_of: datetime.datetime | None = None,
+) -> tuple[bool, str, int]:
     """
     Validates that market data is fresh, non-empty, and has reasonable integrity.
     Accounts for weekends (up to 4-5 days gap over holiday/long weekends).
     If require_true_ohlc is True, rejects datasets lacking true intraday wicks.
+    If require_settled_session is True, rejects datasets whose latest candle predates
+    the expected completed trading session.
     Returns (is_valid, reason, data_age_days).
     """
     if df is None or df.empty or len(df) < 20:
@@ -252,6 +348,11 @@ def validate_market_data(df: pd.DataFrame, max_age_days: int = 5, require_true_o
     if require_true_ohlc and not check_has_true_ohlc(df):
         return False, "Data lacks verified intraday High/Low wicks (OHLC approximated)", age_days
 
+    if require_settled_session:
+        is_settled, expected_date, freshness_note = is_session_settled(latest_date, as_of=as_of)
+        if not is_settled:
+            return False, freshness_note, age_days
+
     return True, "Data valid and verified", age_days
 
 
@@ -260,6 +361,7 @@ def fetch_psx_stock(
     period: str = "6mo",
     max_age_days: int = 5,
     force_refresh: bool = False,
+    require_settled_session: bool = False,
 ) -> dict:
     """
     Fetches real PSX market data with rigorous source attribution and integrity flags.
@@ -274,11 +376,15 @@ def fetch_psx_stock(
         "has_true_ohlc": bool,
         "last_date": str,
         "data_age_days": int,
+        "is_settled": bool,
+        "expected_date": str,
+        "freshness_note": str,
         "error": str | None
       }
     """
     clean_symbol = symbol.strip().upper()
     cache_file = os.path.join(CACHE_DIR, f"{clean_symbol}_real.csv")
+    expected_sess_date = get_expected_session_date()
 
     df = None
     source = "None"
@@ -288,7 +394,11 @@ def fetch_psx_stock(
     try:
         df_yf = _fetch_from_yahoo(clean_symbol, period=period)
         if df_yf is not None:
-            is_valid, reason, age = validate_market_data(df_yf, max_age_days=max_age_days)
+            is_valid, reason, age = validate_market_data(
+                df_yf,
+                max_age_days=max_age_days,
+                require_settled_session=require_settled_session,
+            )
             if is_valid:
                 df = df_yf
                 has_true_ohlc = check_has_true_ohlc(df_yf)
@@ -297,15 +407,23 @@ def fetch_psx_stock(
     except Exception:
         df = None
 
-    # 2. Try Local Cache (only if force_refresh is False, recently updated and valid with true OHLC)
+    # 2. Try Local Cache (only if not force_refresh, cache is settled to expected date, and valid)
     if df is None and not force_refresh and os.path.exists(cache_file):
         try:
             df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-            is_valid, reason, age = validate_market_data(df_cache, max_age_days=max_age_days)
-            if is_valid:
-                df = df_cache
-                has_true_ohlc = check_has_true_ohlc(df_cache)
-                source = f"Verified Local Cache ({clean_symbol}) — {'True OHLC' if has_true_ohlc else 'OHLC approximated'}"
+            cached_dt = df_cache.index[-1].date() if hasattr(df_cache.index[-1], "date") else df_cache.index[-1]
+            # If cache is from a previous session and we require settled session or expect a newer session,
+            # do not accept prematurely unless network sources have failed
+            if cached_dt >= expected_sess_date or not require_settled_session:
+                is_valid, reason, age = validate_market_data(
+                    df_cache,
+                    max_age_days=max_age_days,
+                    require_settled_session=require_settled_session,
+                )
+                if is_valid:
+                    df = df_cache
+                    has_true_ohlc = check_has_true_ohlc(df_cache)
+                    source = f"Verified Local Cache ({clean_symbol}) — {'True OHLC' if has_true_ohlc else 'OHLC approximated'}"
         except Exception:
             df = None
 
@@ -316,7 +434,11 @@ def fetch_psx_stock(
         try:
             df_dps = _fetch_from_psx_dps(clean_symbol)
             if df_dps is not None:
-                is_valid, reason, age = validate_market_data(df_dps, max_age_days=max_age_days)
+                is_valid, reason, age = validate_market_data(
+                    df_dps,
+                    max_age_days=max_age_days,
+                    require_settled_session=require_settled_session,
+                )
                 if is_valid:
                     df = df_dps
                     has_true_ohlc = False  # DPS schema lacks true intraday High/Low wicks
@@ -325,11 +447,15 @@ def fetch_psx_stock(
         except Exception:
             df = None
 
-    # 4. Fallback to Local Cache if force_refresh was requested but network failed
-    if df is None and force_refresh and os.path.exists(cache_file):
+    # 4. Fallback to Local Cache if force_refresh or network failed and cache exists
+    if df is None and os.path.exists(cache_file):
         try:
             df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-            is_valid, reason, age = validate_market_data(df_cache, max_age_days=max_age_days)
+            is_valid, reason, age = validate_market_data(
+                df_cache,
+                max_age_days=max_age_days,
+                require_settled_session=require_settled_session,
+            )
             if is_valid:
                 df = df_cache
                 has_true_ohlc = check_has_true_ohlc(df_cache)
@@ -337,10 +463,12 @@ def fetch_psx_stock(
         except Exception:
             df = None
 
-    # 4. Final Validation & Return
+    # 5. Final Validation & Return
     if df is not None:
         latest_date_str = df.index[-1].strftime("%Y-%m-%d")
-        age_days = (datetime.date.today() - df.index[-1].date()).days
+        latest_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
+        age_days = (datetime.date.today() - latest_date).days
+        is_settled, expected_date, freshness_note = is_session_settled(latest_date)
         return {
             "symbol": clean_symbol,
             "status": "OK",
@@ -349,6 +477,9 @@ def fetch_psx_stock(
             "has_true_ohlc": has_true_ohlc,
             "last_date": latest_date_str,
             "data_age_days": max(0, age_days),
+            "is_settled": is_settled,
+            "expected_date": str(expected_date),
+            "freshness_note": freshness_note,
             "error": None,
         }
 
@@ -361,6 +492,9 @@ def fetch_psx_stock(
         "has_true_ohlc": False,
         "last_date": None,
         "data_age_days": 999,
+        "is_settled": False,
+        "expected_date": str(expected_sess_date),
+        "freshness_note": f"Data unavailable for session {expected_sess_date}.",
         "error": f"Real market data unavailable for {clean_symbol}. Alert skipped to maintain data integrity.",
     }
 
@@ -375,15 +509,16 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
       (df_kse, regime_info_dict)
     """
     cache_file = os.path.join(CACHE_DIR, "KSE100_real.csv")
+    expected_sess_date = get_expected_session_date()
     df_kse = None
 
-    # 1. Try Local Cache if valid and not force_refresh
+    # 1. Try Local Cache if valid, settled to expected date, and not force_refresh
     if not force_refresh and os.path.exists(cache_file):
         try:
             df_cached = pd.read_csv(cache_file, index_col=0, parse_dates=True)
             if df_cached is not None and not df_cached.empty and len(df_cached) >= 50:
                 latest_dt = df_cached.index[-1].date()
-                if (datetime.date.today() - latest_dt).days <= 5:
+                if (datetime.date.today() - latest_dt).days <= 5 and latest_dt >= expected_sess_date:
                     df_kse = df_cached
         except Exception:
             df_kse = None
@@ -431,6 +566,9 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
             "ema50": 0.0,
             "ema200": 0.0,
             "last_date": "N/A",
+            "is_settled": False,
+            "expected_date": str(expected_sess_date),
+            "freshness_note": "Benchmark data feed offline.",
             "note": "KSE-100 benchmark feed offline.",
         }
 
@@ -442,6 +580,8 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
     latest_ema50 = float(df_kse["EMA_50"].iloc[-1])
     latest_ema200 = float(df_kse["EMA_200"].iloc[-1])
     last_date = df_kse.index[-1].strftime("%Y-%m-%d")
+    kse_latest_dt = df_kse.index[-1].date() if hasattr(df_kse.index[-1], "date") else df_kse.index[-1]
+    is_settled, expected_date, freshness_note = is_session_settled(kse_latest_dt)
 
     # Regime Determination:
     if latest_close >= latest_ema50 and latest_ema50 >= latest_ema200:
@@ -464,6 +604,9 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
         "ema50": round(latest_ema50, 2),
         "ema200": round(latest_ema200, 2),
         "last_date": last_date,
+        "is_settled": is_settled,
+        "expected_date": str(expected_date),
+        "freshness_note": freshness_note,
         "note": note,
     }
 

@@ -152,6 +152,8 @@ with col_status:
     if stock_res.get("status") == "OK":
         st.caption(f"Stock Data: **{data_source}**")
         st.caption(f"Last Session: **{last_session}** (Age: {data_age}d)")
+        if not stock_res.get("is_settled", True):
+            st.warning(f"⏳ **EOD Settlement Pending**: Market has closed session for **{stock_res.get('expected_date')}**, but latest candle is from **{last_session}**. Today's close pending ingestion.")
         if not stock_res.get("has_true_ohlc", True):
             st.warning("⚠️ **Approximated OHLC**: Data source provides Close/Open only. Setups requiring true intraday ranges (ATR, SL) are disqualified from TRIGGERED.")
     else:
