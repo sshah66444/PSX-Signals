@@ -1,48 +1,10 @@
-name: PSX Daily Telegram Signals
-
+# Legacy workflow disabled when the next-session briefing is installed.
+# The new schedule is in next_day_briefing.yml.
+name: Legacy PSX Scan (Disabled)
 on:
-  schedule:
-    # Primary evening run: 14:41 UTC (7:41 PM Pakistan Time) - off-peak minute to avoid GitHub runner queue delays
-    - cron: '41 14 * * 1-5'
-    # Redundant evening run: 16:17 UTC (9:17 PM Pakistan Time) - catches late Yahoo Finance PSX settlement
-    - cron: '17 16 * * 1-5'
-  workflow_dispatch: # Allows manual trigger anytime from GitHub UI or mobile app
-
-permissions:
-  contents: write
-
+  workflow_dispatch:
 jobs:
-  scan-and-notify:
+  notice:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Check Interactive Commands & Run PSX Daily Scan
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          # Process any pending interactive user commands first
-          python telegram_notifier.py --check-commands
-          # Execute daily market scan and lifecycle audit
-          python telegram_notifier.py
-
-      - name: Persist Signal Ledger (signals.db)
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add signals.db
-          git diff --staged --quiet || (git commit -m "Update persistent signal ledger [skip ci]" && git push)
+      - run: echo 'Use PSX Next-Trading-Day Briefing instead.'
