@@ -209,8 +209,9 @@ def build_snapshot(config,now=None):
                 candidate=evaluate_candidate(symbol,df,summary)
                 if candidate:candidates.append(candidate)
                 elif watch:=evaluate_dip_watch(symbol,df):watches.append(watch)
-            except (ValueError,OSError,requests.RequestException,KeyError,TypeError,IndexError) as exc:
-                errors[symbol]=str(exc)[:160]
+            except Exception as exc:
+                # One vendor/cache failure must not discard every other verified bar.
+                errors[symbol]=f'{type(exc).__name__}: {exc}'[:160]
     candidates.sort(key=lambda x:x['rr_tp1'],reverse=True)
     watches.sort(key=lambda x:(x['price']-x['support'])/x['price'])
     coverage=valid/len(config['symbols'])
@@ -344,7 +345,8 @@ def safe_snapshot(config,now):
     except Exception as exc:
         return dict(session=now.date().isoformat(),for_session=next_session(now.date(),config).isoformat(),generated_at=now.isoformat(),ready=False,
                     source='Official PSX market summary + Yahoo prior history',total=len(config['symbols']),valid=0,
-                    benchmark_ok=False,regime='UNVERIFIED',candidates=[],errors={'scan':type(exc).__name__})
+                    benchmark_ok=False,regime='UNVERIFIED',candidates=[],
+                    errors={'scan':f'{type(exc).__name__}: {exc}'[:160]})
 
 
 def load_credentials():

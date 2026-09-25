@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime,date
 import tempfile
+import sqlite3
 from pathlib import Path
 import pandas as pd
 import daily_briefing as b
@@ -133,6 +134,16 @@ class BriefingTests(unittest.TestCase):
             snap=b.build_snapshot(c,self.now('19:30'))
         self.assertFalse(snap['ready'])
         self.assertEqual(snap['dip_watches'],[])
+    def test_one_vendor_cache_error_does_not_abort_scan(self):
+        c=dict(self.c,symbols=['OGDC','PPL'],min_coverage=.5)
+        with patch.object(b,'market_summary',return_value=self.summary()), \
+             patch.object(b,'get_stock',side_effect=[(self.fixture(),'PSX + Yahoo'),sqlite3.OperationalError('cache unavailable')]), \
+             patch.object(b,'evaluate_candidate',return_value=None), \
+             patch.object(b,'evaluate_dip_watch',return_value=None):
+            snap=b.build_snapshot(c,self.now('19:30'))
+        self.assertTrue(snap['ready'])
+        self.assertEqual(snap['valid'],1)
+        self.assertEqual(len(snap['errors']),1)
     def test_prior_session_missing_is_rejected(self):
         c=dict(self.c,symbols=['OGDC'])
         prior=self.fixture().iloc[:-2]
