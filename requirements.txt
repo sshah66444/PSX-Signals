@@ -4,3 +4,5 @@ pandas>=2.0.0
 numpy>=1.24.0
 yfinance>=0.2.35
 requests>=2.31.0
+beautifulsoup4>=4.12.0
+cryptography>=42.0.0

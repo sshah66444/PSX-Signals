@@ -1,0 +1,8 @@
+[
+  {"id":"2026-09-21-BOP","report_date":"2026-09-21","symbol":"BOP","target1":32.08,"target2":33.37,"stop":30.66,"source":"Pakistan_Market_Technical_Outlook_21_Sep_2026.pdf"},
+  {"id":"2026-09-21-DGKC","report_date":"2026-09-21","symbol":"DGKC","target1":201.72,"target2":206.29,"stop":189.20,"source":"Pakistan_Market_Technical_Outlook_21_Sep_2026.pdf"},
+  {"id":"2026-09-23-PPL","report_date":"2026-09-23","symbol":"PPL","target1":233.65,"target2":240.84,"stop":225.77,"source":"Pakistan_Market_Technical_Outlook_23_Sep_2026.pdf"},
+  {"id":"2026-09-23-DGKC","report_date":"2026-09-23","symbol":"DGKC","target1":202.98,"target2":206.03,"stop":195.53,"source":"Pakistan_Market_Technical_Outlook_23_Sep_2026.pdf"},
+  {"id":"2026-09-24-PPL","report_date":"2026-09-24","symbol":"PPL","target1":233.65,"target2":240.84,"stop":229.56,"source":"Pakistan_Market_Technical_Outlook_24_Sep_2026.pdf"},
+  {"id":"2026-09-24-UBL","report_date":"2026-09-24","symbol":"UBL","target1":436.56,"target2":441.90,"stop":429.40,"source":"Pakistan_Market_Technical_Outlook_24_Sep_2026.pdf"}
+]
