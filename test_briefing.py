@@ -55,6 +55,10 @@ class BriefingTests(unittest.TestCase):
         s=self.snapshot(False);s['generated_at']=self.now('19:40').isoformat();self.j.save(s)
         self.assertIsNone(b.tick(self.c,self.j,self.sender,self.now('19:45')))
         self.assertTrue(b.tick(self.c,self.j,self.sender,self.now('19:55')))
+    def test_urgent_retry_before_cutoff(self):
+        s=self.snapshot(False);s['generated_at']=self.now('20:52').isoformat();self.j.save(s)
+        self.assertIsNone(b.tick(self.c,self.j,self.sender,self.now('20:53')))
+        self.assertTrue(b.tick(self.c,self.j,self.sender,self.now('20:55')))
     def test_ambiguous_delivery_not_blindly_retried(self):
         def fail(text):raise RuntimeError('network uncertainty')
         with self.assertRaises(RuntimeError):self.j.deliver('key','plan',fail)

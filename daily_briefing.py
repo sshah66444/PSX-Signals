@@ -335,7 +335,9 @@ def tick(config,journal,sender,now=None):
         journal.deliver(session+':pending',f"PSX plan for {next_session(day,config)} — {session} data is not fully verified yet. No entries suggested. Retrying until {config['cutoff_time']} Pakistan time.",sender)
     if snapshot:
         last=datetime.fromisoformat(snapshot['generated_at'])
-        if (now-last).total_seconds() < config['retry_minutes']*60: return
+        elapsed=(now-last).total_seconds()
+        urgent_retry=(clock>='20:45' and not snapshot['ready'] and elapsed>=120)
+        if elapsed < config['retry_minutes']*60 and not urgent_retry: return
     return True  # Main schedules background preparation without blocking delivery.
 
 
