@@ -87,7 +87,7 @@ repository or sent Telegram messages. To activate on `sshah66444/PSX-Signals`, a
 - `state_crypto.py`, `test_state_crypto.py`
 - `.github/workflows/next_day_briefing.yml`
 - `.github/workflows/briefing_tests.yml`
-- `.github/workflows/daily_psx_signals.yml` (disables the old scheduled sender)
+- `.github/workflows/daily_psx_signals.yml` (retains command polling but removes the old scheduled daily scan)
 - `NEXT_DAY_SETUP.md`
 
 Keep the existing `data_engine.py`, `signal_engine.py`, dashboard, and live ledger.
@@ -103,7 +103,9 @@ The workflow warms data at **19:05 and 19:35 PKT**, attempts delivery at **20:00
 retries at **20:20, 20:40, and 20:55**. GitHub may start any of these late or drop a
 scheduled job. Install/setup time also shifts receipt slightly. This is an 8 p.m.
 target, not a guaranteed deadline. An always-on worker is needed for tighter timing.
-Only the new workflow should be scheduled, or the old bot can still send stale digests.
+The companion command workflow polls Telegram at its former times without running
+the old daily scan. Interactive `/scan` replies still use the legacy command
+engine; the new dated evening briefing is the scheduled market report.
 
 The workflow encrypts the delivery journal and commits only
 `.state/briefing.sqlite3.enc` after each run. It contains prepared reports,
