@@ -1,7 +1,7 @@
 name: PSX Next-Trading-Day Briefing
 on:
   schedule:
-    # Warm the official monthly caches at 19:05 and 19:35 Pakistan time.
+    # Prepare the completed-session snapshot at 19:05 and refresh at 19:35 PKT.
     - cron: '5,35 14 * * 1-5'
     # Target 20:00 PKT; retry at 20:20, 20:40 and 20:55 if delivery/data failed.
     - cron: '0,20,40,55 15 * * 1-5'
@@ -22,30 +22,34 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Restore official price cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .cache
-          key: psx-official-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: psx-official-v1-
+      - name: Unlock delivery journal
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python state_crypto.py decrypt
       - name: Prepare or deliver next-session plan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python daily_briefing.py --tick
-      - name: Save cache
+      - name: Lock delivery journal
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .cache
-          key: psx-official-v1-${{ github.run_id }}-${{ github.run_attempt }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python state_crypto.py encrypt
+      - name: Record official prices for broker scorecard
+        if: always()
+        continue-on-error: true
+        run: python broker_scorecard.py --record-session
       - name: Persist delivery journal
         if: always()
         run: |
-          if [ -f .state/briefing.sqlite3 ]; then
+          if [ -f .state/briefing.sqlite3.enc ] || [ -f broker_prices.csv ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add -f .state/briefing.sqlite3
+            if [ -f .state/briefing.sqlite3.enc ]; then git add -f .state/briefing.sqlite3.enc; fi
+            if [ -f broker_prices.csv ]; then git add broker_prices.csv; fi
             if ! git diff --staged --quiet; then
               git commit -m "Persist PSX briefing delivery state [skip ci]"
               git pull --rebase origin "${GITHUB_REF_NAME}"

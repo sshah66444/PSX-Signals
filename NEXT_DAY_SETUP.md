@@ -10,25 +10,63 @@
 - Show both the source session and the intended trading session. Never relabel old
   prices as today’s report. No entry plan after the 21:00 Pakistan cutoff.
 - Maximum three candidates, with conditional entry band, stop, two targets,
-  reward/risk, plain-language reasoning and no-chasing instruction. WATCHING means
-  no entry until missing conditions are confirmed on a later completed close.
+  reward/risk, plain-language reasoning and no-chasing instruction.
 
 ## What changed
 
-`daily_briefing.py` is a separate reporting path using your current signal engine.
+`daily_briefing.py` is a separate reporting path using your current indicator engine.
 It does not import or mutate `signals.db` or claim that a setup is an executed trade.
 Every evening repeats the relevant shortlist, rather than suppressing an otherwise
 useful briefing because a setup already exists in the trade ledger.
 
-`psx_provider.py` reads the official PSX monthly historical table with real daily
-OPEN/HIGH/LOW/CLOSE/VOLUME. It does not manufacture highs/lows from open and close.
-The new path does not wait for Yahoo's individual-stock feed. The KSE-100 index uses
-your existing DPS index adapter, with an exact source-session date check.
+The official PSX market-summary page supplies the completed session's real
+OPEN/HIGH/LOW/CLOSE/VOLUME and current KSE-100 close/breadth. Yahoo supplies only
+earlier daily bars for indicators. The prior Yahoo close must match PSX's LDCP,
+and missing or conflicting stocks are excluded. If the official page is not marked
+closed with the expected date, the bot withholds all entry plans. The report does
+not claim historical KSE-100 relative strength, because that feed was unavailable
+in the live review.
 
-The configurable universe starts with 30 established symbols from your watchlist,
+A candidate needs a fresh 20-session closing breakout, rising EMA20/EMA50,
+improving MACD, bounded RSI, volume at least 1.2 times its 20-session average,
+and nonnegative market breadth. These are conditional short-horizon setups, not
+predictions or orders. On the 2026-09-24 live validation of the original
+30-symbol list, 27 stocks were verified and no setup qualified; three stocks
+had missing or conflicting history. BOP was subsequently added to the watchlist,
+but the expanded list was not live-validated because Yahoo rate-limited the replay.
+
+The separate **dip watchlist** is observation only. It looks for a recovering
+share near recent support, with RSI 35–60 and rising, improving MACD, adequate
+average volume, and a close below its recent high. It shows a level to monitor on
+a later completed close and an invalidation level. It never prints an entry band
+or a buy instruction. This is a new, unvalidated heuristic inspired by the
+broker reports dated 21, 23, and 24 September 2026; agreement with a broker
+is not evidence of profitability. Paper-track outcomes before using it for trades.
+
+## Broker-call scorecard
+
+`broker_scorecard.py` reads manually entered calls in `broker_calls.json` and
+daily OHLC bars in `broker_prices.csv`. The six calls from the supplied JS Global
+reports are seeded, with dated source references. Run `python broker_scorecard.py`
+to see each call's first-target or stop outcome. The GitHub workflow records a
+completed official PSX bar for every symbol in the calls file each evening and
+commits the updated CSV with the delivery journal. Add new calls to the JSON
+before their report-date session; later additions need missing prices backfilled
+before their outcome can be scored.
+
+The scorecard **assumes the report was available before that date's market open**
+and buys at the open, even though the broker says "buy on dips" and does not give
+an executable entry. It exits at the first target or stop, uses the open for a gap,
+and assumes the stop came first if both levels fall within one day's high/low.
+It excludes fees, spread and slippage. Repeated calls on the same share are
+counted separately and can represent overlapping exposure. This is a comparison
+method, not a record of actual trades or evidence of strategy profitability.
+
+The configurable universe starts with 31 symbols from your watchlist and the
+broker comparison (which added BOP),
 limiting cold-start download load. This is not a claim of verified present liquidity;
 strategy liquidity filters still apply. Edit `briefing_config.json` to change symbols.
-At least 80% of the configured universe and the benchmark must have verified data
+At least 80% of the configured universe and the official market summary must have verified data
 for the exact completed session before candidate cards are released. Missing stocks
 are identified. Unadjusted prices with large discontinuities are held for review.
 
@@ -42,9 +80,11 @@ This is a **separate local copy**. Creating these files has not changed the runn
 repository or sent Telegram messages. To activate on `sshah66444/PSX-Signals`, add:
 
 - `daily_briefing.py`
-- `psx_provider.py`
 - `briefing_config.json`
+- `requirements.txt` (adds Beautiful Soup and journal encryption)
 - `test_briefing.py`
+- `broker_scorecard.py`, `broker_calls.json`, `broker_prices.csv`, `test_broker_scorecard.py`
+- `state_crypto.py`, `test_state_crypto.py`
 - `.github/workflows/next_day_briefing.yml`
 - `.github/workflows/briefing_tests.yml`
 - `.github/workflows/daily_psx_signals.yml` (disables the old scheduled sender)
@@ -65,10 +105,13 @@ scheduled job. Install/setup time also shifts receipt slightly. This is an 8 p.m
 target, not a guaranteed deadline. An always-on worker is needed for tighter timing.
 Only the new workflow should be scheduled, or the old bot can still send stale digests.
 
-The workflow caches monthly market files and commits `.state/briefing.sqlite3` after
-each run. This file contains prepared reports, delivery states, Telegram message IDs
-and a hash of the recipient ID; no bot token. Avoid publishing a personal repo's
-journal. Concurrent jobs are serialized. State persistence failure or a runner crash
+The workflow encrypts the delivery journal and commits only
+`.state/briefing.sqlite3.enc` after each run. It contains prepared reports,
+delivery states, Telegram message IDs and a hash of the recipient ID. The
+encryption key is derived from the two Telegram secrets, which are never
+committed. Rotating either secret requires securely migrating the journal first;
+otherwise the old encrypted state cannot be opened and delivery stops. Concurrent
+jobs are serialized. State persistence failure or a runner crash
 between sending and saving can still create duplicate-delivery risk; GitHub runners
 are not an exactly-once delivery system.
 
@@ -93,18 +136,21 @@ Use Python 3.11+ with the existing requirements:
 
 ```bash
 python -m unittest -v test_briefing
+python -m unittest -v test_broker_scorecard
+python -m unittest -v test_state_crypto
+python broker_scorecard.py       # hypothetical broker-call scorecard
 python daily_briefing.py --preview  # after 19:00 PKT; no Telegram sends or journal writes
 python daily_briefing.py --tick     # production scheduled invocation; may send
 python daily_briefing.py --daemon   # optional always-on host; background preparation
 ```
 
-No flags means preview. Preview may populate the price cache, but cannot change trade
-or delivery state. Set the same environment variables or use `.env` for local sends.
+No flags means preview. Preview cannot change trade or delivery state. Set the
+same environment variables or use `.env` for local sends.
 The existing venv uses Python 3.9/LibreSSL and emitted an SSL compatibility warning;
 GitHub uses Python 3.11.
 
 ## Sources
 
-- PSX history: https://dps.psx.com.pk/historical
+- PSX market summary: https://www.psx.com.pk/market-summary/
 - PSX holidays: https://www.psx.com.pk/psx/exchange/general/calendar-holidays
 - GitHub scheduling limitations: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows

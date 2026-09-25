@@ -78,17 +78,20 @@ class BriefingTests(unittest.TestCase):
     def test_bad_candles_rejected(self):
         d=self.fixture();d.iloc[-1,d.columns.get_loc('High')]=90
         with self.assertRaises(ValueError):b.verified_bars(d,date(2026,9,22))
-    def test_missing_benchmark_withholds_candidates(self):
+    def summary(self):
+        return dict(date='2026-09-22',rows={'OGDC':{}},index_close=170000,
+                    advancing=200,declining=100,asof='2026-09-22T19:15:00')
+    def test_missing_completed_summary_withholds_candidates(self):
         c=dict(self.c,symbols=['OGDC'])
-        with patch.object(b,'fetch_kse100_index',return_value=(None,{})),patch.object(b,'get_stock',return_value=(self.fixture(),'Official PSX')):
-            snap=b.build_snapshot(c,self.now('19:30'))
-        self.assertFalse(snap['ready']);self.assertFalse(snap['candidates'])
+        with patch.object(b,'market_summary',side_effect=ValueError('summary unavailable')):
+            with self.assertRaisesRegex(ValueError,'summary unavailable'):
+                b.build_snapshot(c,self.now('19:30'))
     def test_shortlist_and_plain_dates(self):
         c=dict(self.c,symbols=['OGDC'])
         fixture=self.fixture()
         setup=dict(symbol='OGDC',strategy='BREAKOUT',status='TRIGGERED',entry_min=101.,entry_max=102.,
-                   stop_loss=98.,tp1=108.,tp2=112.,rr_tp1=1.5,price=101.,checklist={'Liquidity':True},trigger_note='Trend and volume passed')
-        with patch.object(b,'fetch_kse100_index',return_value=(fixture,{'regime':'BULL_MARKET','is_bullish':True})),patch.object(b,'get_stock',return_value=(fixture,'Official PSX')),patch.object(b,'generate_signal',return_value=setup):
+                   stop_loss=98.,tp1=108.,tp2=112.,rr_tp1=1.5,price=101.,failures=[],reason='Trend and volume passed')
+        with patch.object(b,'market_summary',return_value=self.summary()),patch.object(b,'get_stock',return_value=(fixture,'PSX + Yahoo')),patch.object(b,'evaluate_candidate',return_value=setup):
             snap=b.build_snapshot(c,self.now('19:30'))
         self.assertTrue(snap['ready']);self.assertEqual(len(snap['candidates']),1)
         text=b.render(snap);self.assertIn('Do not chase'.lower(),text.lower());self.assertLess(len(text),3500)
@@ -96,6 +99,54 @@ class BriefingTests(unittest.TestCase):
         import sys
         self.assertNotIn('signal_tracker',sys.modules)
     def test_zero_candidates_still_produces_daily_report(self):
-        self.assertIn('NO QUALIFYING SETUPS',b.render(self.snapshot()))
+        self.assertIn('NO QUALIFYING BREAKOUTS',b.render(self.snapshot()))
+    def test_dip_watch_is_not_rendered_as_entry(self):
+        s=self.snapshot()
+        s['dip_watches']=[dict(symbol='PPL',price=230,support=225,confirmation=233,invalidation=222)]
+        text=b.render(s)
+        self.assertIn('observation only',text)
+        self.assertIn('not a buy signal',text)
+        self.assertNotIn('Entry band:',text)
+    def test_dip_watch_requires_confirmation_inputs(self):
+        d=self.fixture()
+        self.assertIsNone(b.evaluate_dip_watch('OGDC',d))
+    def test_dip_watch_rule_and_bearish_rejection(self):
+        d=self.fixture()
+        d.loc[d.index[-2],'Close']=100
+        d.loc[d.index[-1],['Open','High','Low','Close','Volume']]=[100,102,99,101,200000]
+        d.loc[d.index[-20],'High']=110
+        d['ATR']=3.;d['EMA_20']=99.;d['EMA_50']=98.
+        d['Vol_MA20']=150000.;d['RSI']=48.;d['MACD_Hist']=.2
+        d.loc[d.index[-2],['RSI','MACD_Hist']]=[45.,.1]
+        with patch.object(b,'compute_all_indicators',return_value=d):
+            watch=b.evaluate_dip_watch('OGDC',d)
+            self.assertEqual(watch['symbol'],'OGDC')
+            self.assertLess(watch['invalidation'],watch['support'])
+            d.loc[d.index[-1],'RSI']=40
+            self.assertIsNone(b.evaluate_dip_watch('OGDC',d))
+    def test_low_coverage_withholds_dip_watch(self):
+        c=dict(self.c,symbols=['OGDC','PPL'],min_coverage=1.)
+        with patch.object(b,'market_summary',return_value=self.summary()), \
+             patch.object(b,'get_stock',side_effect=[(self.fixture(),'PSX + Yahoo'),ValueError('missing')]), \
+             patch.object(b,'evaluate_candidate',return_value=None), \
+             patch.object(b,'evaluate_dip_watch',return_value=dict(symbol='OGDC',price=101,support=99)):
+            snap=b.build_snapshot(c,self.now('19:30'))
+        self.assertFalse(snap['ready'])
+        self.assertEqual(snap['dip_watches'],[])
+    def test_prior_session_missing_is_rejected(self):
+        c=dict(self.c,symbols=['OGDC'])
+        prior=self.fixture().iloc[:-2]
+        with patch.object(b.yf,'Ticker') as ticker:
+            ticker.return_value.history.return_value=prior
+            with self.assertRaisesRegex(ValueError,'Prior-session history missing'):
+                b.get_stock('OGDC',date(2026,9,22),c,
+                    dict(rows={'OGDC':dict(LDCP=101,Open=101,High=103,Low=100,Close=102,Volume=100000)}))
+    def test_cross_source_close_mismatch_is_rejected(self):
+        c=dict(self.c,symbols=['OGDC'])
+        with patch.object(b.yf,'Ticker') as ticker:
+            ticker.return_value.history.return_value=self.fixture().iloc[:-1]
+            with self.assertRaisesRegex(ValueError,'mismatch'):
+                b.get_stock('OGDC',date(2026,9,22),c,
+                    dict(rows={'OGDC':dict(LDCP=130,Open=130,High=131,Low=129,Close=130,Volume=100000)}))
 
 if __name__=='__main__':unittest.main()

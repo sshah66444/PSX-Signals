@@ -14,9 +14,9 @@ import time
 import requests
 import numpy as np
 import pandas as pd
-from psx_provider import fetch_official
-from data_engine import fetch_kse100_index
-from signal_engine import generate_signal
+from bs4 import BeautifulSoup
+import yfinance as yf
+from signal_engine import compute_all_indicators
 
 ROOT = Path(__file__).resolve().parent
 PKT = ZoneInfo('Asia/Karachi')
@@ -75,57 +75,153 @@ def verified_bars(df, expected):
     return d
 
 
-def get_stock(symbol, expected, config):
-    df, source = fetch_official(symbol, config['period'], str(ROOT/'.cache'))
-    return verified_bars(df, expected), source
+def previous_session(d,config):
+    for _ in range(14):
+        d-=timedelta(days=1)
+        if session_day(d,config):return d
+    raise ValueError('No previous trading session in configured calendar')
 
 
-def build_snapshot(config, now=None):
-    now = now or datetime.now(PKT)
-    expected = now.astimezone(PKT).date()
-    if not session_day(expected, config) or now.astimezone(PKT).strftime('%H:%M') < config['prepare_time']:
+def market_summary(expected):
+    """Read one completed official PSX market snapshot for the named source date."""
+    response=requests.get('https://www.psx.com.pk/market-summary/',timeout=20)
+    response.raise_for_status()
+    soup=BeautifulSoup(response.text,'html.parser')
+    stamp=soup.select_one('.inner-content-table h4')
+    if not stamp:raise ValueError('PSX market summary timestamp missing')
+    published=datetime.strptime(stamp.get_text(' ',strip=True)[:19],'%Y-%m-%d %H:%M:%S')
+    if published.date()!=expected or published.time().hour<17:
+        raise ValueError(f'Official market summary is not a completed {expected} session')
+    exchange=soup.select_one('.inner-content-table .ms-tbl-new')
+    if not exchange or 'Status: Closed' not in exchange.get_text(' ',strip=True):
+        raise ValueError('PSX market session is not marked closed')
+    rows={}
+    for cell in soup.select('td.dataportal[data-srip]'):
+        symbol=cell.get('data-srip','')
+        cells=cell.parent.find_all('td',recursive=False)
+        if len(cells)<8:continue
+        try:
+            vals=[float(cells[i].get_text(' ',strip=True).replace(',','')) for i in (1,2,3,4,5,7)]
+            ldcp,o,h,l,c,v=vals
+            if 0<l<=min(o,c)<=max(o,c)<=h and v>=0:
+                rows[symbol]=dict(LDCP=ldcp,Open=o,High=h,Low=l,Close=c,Volume=v)
+        except ValueError:continue
+    index_card=None
+    for card in soup.select('.indices-single'):
+        if card.find('h3') and card.find('h3').get_text(strip=True)=='KSE100':
+            index_card=card;break
+    if not index_card or not index_card.find('h4'):
+        raise ValueError('KSE-100 current close missing')
+    index_close=float(index_card.find('h4').get_text(strip=True).replace(',',''))
+    stats=exchange.get_text(' ',strip=True)
+    import re
+    matches=re.search(r'Advanced:\s*([\d,]+).*?Declined:\s*([\d,]+)',soup.get_text(' ',strip=True))
+    if not matches or not rows:raise ValueError('PSX market breadth/stock rows missing')
+    advancing,declining=(int(x.replace(',','')) for x in matches.groups())
+    return dict(date=expected.isoformat(),rows=rows,index_close=index_close,
+                advancing=advancing,declining=declining,asof=published.isoformat())
+
+
+def get_stock(symbol,expected,config,summary):
+    today=summary['rows'].get(symbol)
+    if not today:raise ValueError('Symbol missing from completed PSX market summary')
+    df=yf.Ticker(f'{symbol}.KA').history(period=config['period'],interval='1d',auto_adjust=False)
+    if df is None or df.empty:raise ValueError('Yahoo historical OHLCV unavailable')
+    d=df[['Open','High','Low','Close','Volume']].copy()
+    d.index=pd.to_datetime(d.index).tz_localize(None)
+    d=d[d.index.date<expected]
+    prev=previous_session(expected,config)
+    if len(d)<59 or d.index[-1].date()!=prev:
+        raise ValueError(f'Prior-session history missing (need {prev})')
+    # Check the cross-source overlap before appending today's official bar.
+    if abs(float(d.Close.iloc[-1])/today['LDCP']-1)>.005:
+        raise ValueError('Yahoo/PSX prior-close mismatch; corporate action or feed conflict')
+    fresh=pd.DataFrame([{k:today[k] for k in ('Open','High','Low','Close','Volume')}],
+                       index=pd.to_datetime([expected]))
+    combined=pd.concat([d,fresh]).sort_index()
+    return verified_bars(combined,expected), 'PSX completed market summary + Yahoo prior history'
+
+
+def evaluate_candidate(symbol,df,summary):
+    """Transparent short-horizon rule with no unverified index-history claims."""
+    d=compute_all_indicators(df)
+    b=d.iloc[-1];p=d.iloc[-2]
+    close,atr=float(b.Close),float(b.ATR)
+    resistance=float(d.High.iloc[-21:-1].max())
+    trend=bool(close>b.EMA_20>b.EMA_50 and b.EMA_50>d.EMA_50.iloc[-6])
+    volume_ok=bool(b.Volume>=1.2*b.Vol_MA20 and b.Vol_MA20>=80000)
+    momentum=bool(b.MACD_Hist>p.MACD_Hist and 42<=b.RSI<=68)
+    breakout=bool(close>resistance and close<=resistance+1.5*atr)
+    healthy_market=summary['advancing']>=summary['declining']
+    entry_low=round(close,2)
+    entry_high=round(close+0.25*atr,2)
+    stop=round(min(float(d.Low.iloc[-21:-1].min()),close-1.3*atr),2)
+    risk=entry_high-stop
+    checks=dict(trend=trend,liquidity=volume_ok,momentum=momentum,
+                breakout=breakout,market_breadth=healthy_market,
+                positive_risk=stop>0 and risk>0)
+    if not all(checks.values()):return None
+    tp1=round(entry_high+1.5*risk,2)
+    tp2=round(entry_high+2.5*risk,2)
+    return dict(symbol=symbol,strategy='BREAKOUT',status='TRIGGERED',price=close,
+                entry_min=entry_low,entry_max=entry_high,stop_loss=stop,tp1=tp1,tp2=tp2,
+                rr_tp1=round((tp1-entry_high)/risk,2),failures=[],
+                reason='Fresh 20-session breakout, rising trend, 1.2× volume and improving MACD.')
+
+
+def evaluate_dip_watch(symbol,df):
+    """Observation only: a recovering share near recent support, not an entry call."""
+    d=compute_all_indicators(df)
+    b,p=d.iloc[-1],d.iloc[-2]
+    close,atr=float(b.Close),float(b.ATR)
+    if not np.isfinite([close,atr,b.RSI,b.Vol_MA20,b.MACD_Hist,p.MACD_Hist]).all() or atr<=0:
+        return None
+    recent_low=float(d.Low.iloc[-11:-1].min())
+    resistance=float(d.High.iloc[-21:-1].max())
+    support=max(x for x in (recent_low,float(b.EMA_20),float(b.EMA_50)) if x<close) if any(
+        x<close for x in (recent_low,float(b.EMA_20),float(b.EMA_50))
+    ) else recent_low
+    checks=(b.Vol_MA20>=80000, 35<=b.RSI<=60, b.RSI>p.RSI,
+            b.MACD_Hist>p.MACD_Hist, close>=p.Close,
+            0<close-support<=1.5*atr, close<resistance)
+    if not all(checks):return None
+    return dict(symbol=symbol,price=round(close,2),support=round(support,2),
+                confirmation=round(float(b.High),2),invalidation=round(max(.01,support-.5*atr),2),
+                reason='Near recent support; RSI and MACD are improving. Wait for a later close above confirmation.')
+
+
+def build_snapshot(config,now=None):
+    now=now or datetime.now(PKT)
+    expected=now.astimezone(PKT).date()
+    if not session_day(expected,config) or now.astimezone(PKT).strftime('%H:%M')<config['prepare_time']:
         raise ValueError('Prepare only after configured evening time on a trading day')
-    target = next_session(expected, config)
-    benchmark, regime = fetch_kse100_index(force_refresh=True)
-    benchmark_ok = (benchmark is not None and len(benchmark) >= 50
-                    and benchmark.index[-1].date() == expected
-                    and np.isfinite(benchmark.Close.to_numpy(dtype=float)).all()
-                    and (benchmark.Close > 0).all())
-    errors, candidates = {}, []
-    valid = 0
+    target=next_session(expected,config)
+    summary=market_summary(expected)
+    errors,candidates,watches={},[],[]
+    valid=0
     with ThreadPoolExecutor(max_workers=config['workers']) as pool:
-        futures = {pool.submit(get_stock, symbol, expected, config):symbol for symbol in config['symbols']}
+        futures={pool.submit(get_stock,symbol,expected,config,summary):symbol for symbol in config['symbols']}
         for future in as_completed(futures):
-            symbol = futures[future]
+            symbol=futures[future]
             try:
-                df, source = future.result()
-                valid += 1
-                if not benchmark_ok: continue
-                setup = generate_signal(symbol, df, data_meta=dict(source=source,has_true_ohlc=True,
-                    last_date=expected.isoformat(),data_age_days=0,is_settled=True,
-                    expected_date=expected.isoformat()),df_kse=benchmark,market_regime=regime)
-                if setup.get('status') not in ('TRIGGERED','WATCHING'): continue
-                keys = ('entry_min','entry_max','stop_loss','tp1','tp2','rr_tp1','price')
-                if not all(isinstance(setup.get(k),(float,int)) and math.isfinite(setup[k]) for k in keys): continue
-                if not 0 < setup['stop_loss'] < setup['entry_min'] <= setup['entry_max'] < setup['tp1'] < setup['tp2']: continue
-                # Do not promote structurally invalid WATCHING setups just to fill a shortlist.
-                checks = setup.get('checklist',{})
-                failures = [k for k,v in checks.items() if not v]
-                if len(failures) > 2: continue
-                if any(any(word in key.lower() for word in ('liquidity','macro market','true high','risk:reward')) for key in failures): continue
-                keep = {k:setup[k] for k in keys}
-                keep.update(symbol=symbol,strategy=setup['strategy'],status=setup['status'],
-                            failures=failures,reason=setup.get('trigger_note','')[:240])
-                candidates.append(keep)
-            except (ValueError, OSError, requests.RequestException, KeyError, TypeError) as exc:
-                errors[symbol] = str(exc)[:160]
-    candidates.sort(key=lambda x:(x['status']=='TRIGGERED',-len(x['failures']),x['rr_tp1']),reverse=True)
-    coverage = valid / len(config['symbols'])
-    ready = bool(benchmark_ok and coverage >= config['min_coverage'])
+                df,source=future.result()
+                valid+=1
+                candidate=evaluate_candidate(symbol,df,summary)
+                if candidate:candidates.append(candidate)
+                elif watch:=evaluate_dip_watch(symbol,df):watches.append(watch)
+            except (ValueError,OSError,requests.RequestException,KeyError,TypeError,IndexError) as exc:
+                errors[symbol]=str(exc)[:160]
+    candidates.sort(key=lambda x:x['rr_tp1'],reverse=True)
+    watches.sort(key=lambda x:(x['price']-x['support'])/x['price'])
+    coverage=valid/len(config['symbols'])
+    ready=coverage>=config['min_coverage']
+    regime=(f"KSE-100 {summary['index_close']:,.2f}; "
+            f"advancing {summary['advancing']}, declining {summary['declining']}")
     return dict(session=expected.isoformat(),for_session=target.isoformat(),generated_at=now.isoformat(),
-                source='Official PSX daily OHLCV',total=len(config['symbols']),valid=valid,
-                ready=ready,benchmark_ok=bool(benchmark_ok),regime=regime.get('regime','UNKNOWN') if benchmark_ok else 'UNVERIFIED',
-                candidates=candidates[:config['top_n']] if ready else [],errors=errors)
+                source='Official PSX completed market summary + Yahoo prior history',
+                total=len(config['symbols']),valid=valid,ready=ready,benchmark_ok=True,
+                regime=regime,candidates=candidates[:config['top_n']] if ready else [],
+                dip_watches=watches[:config['top_n']] if ready else [],errors=errors)
 
 
 def render(snapshot):
@@ -136,10 +232,9 @@ def render(snapshot):
            f"Market context: {s['regime']}"]
     if not s['ready']:
         lines += ['DATA INCOMPLETE — no new entry plan.',
-                  'Latest-session prices or benchmark could not be verified. Older-session setups are withheld.']
+                  'The completed-session summary or enough stock histories could not be verified. Older-session setups are withheld.']
     elif not s['candidates']:
-        lines += ['NO QUALIFYING SETUPS — no new entry suggested by these rules.',
-                  'The scan completed; no candidate passed the shortlist filters.']
+        lines += ['NO QUALIFYING BREAKOUTS — no new entry suggested by the breakout rules.']
     else:
         for i,x in enumerate(s['candidates'],1):
             label='Close confirmed; conditional entry next session' if x['status']=='TRIGGERED' else 'WATCH ONLY — confirmation still missing'
@@ -155,6 +250,16 @@ def render(snapshot):
             if x['failures']: block += ['Missing: '+ '; '.join(x['failures'])[:200],
                                         'Do not enter from this card; wait for a later completed-close confirmation.']
             if len('\n'.join(lines+block)) < 3200: lines += block
+    if s['ready'] and s.get('dip_watches'):
+        lines += ['\nDIP WATCHLIST — observation only; no entry suggested today.']
+        for x in s['dip_watches']:
+            block=[f"{x['symbol']}: close {x['price']:.2f}; support ~{x['support']:.2f}; ",
+                   f"watch for a later completed close above {x['confirmation']:.2f}; ",
+                   f"invalidate below {x['invalidation']:.2f}."]
+            if len('\n'.join(lines+block))<3200:lines.append(''.join(block))
+        lines += ['A watch is not a buy signal. Recheck price, volume and market context after confirmation.']
+    elif s['ready'] and not s['candidates']:
+        lines += ['No dip watches met the observation filters either.']
     if s.get('errors'): lines += ['Unavailable/stale: '+', '.join(sorted(s['errors']))[:230]]
     lines += ['\nLevels expire after the named session. These are conditional setups, not executed trades.']
     return '\n'.join(lines)
@@ -238,7 +343,7 @@ def safe_snapshot(config,now):
         return build_snapshot(config,now)
     except Exception as exc:
         return dict(session=now.date().isoformat(),for_session=next_session(now.date(),config).isoformat(),generated_at=now.isoformat(),ready=False,
-                    source='Official PSX daily OHLCV',total=len(config['symbols']),valid=0,
+                    source='Official PSX market summary + Yahoo prior history',total=len(config['symbols']),valid=0,
                     benchmark_ok=False,regime='UNVERIFIED',candidates=[],errors={'scan':type(exc).__name__})
 
 

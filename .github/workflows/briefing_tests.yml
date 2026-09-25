@@ -1,7 +1,7 @@
 name: Next-day briefing tests
 on:
   push:
-    paths: ['**.py', 'briefing_config.json', 'requirements.txt', '.github/workflows/briefing_tests.yml']
+    paths: ['**.py', 'briefing_config.json', 'broker_calls.json', 'broker_prices.csv', 'requirements.txt', '.github/workflows/briefing_tests.yml']
   pull_request:
 permissions:
   contents: read
@@ -15,4 +15,4 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python -m unittest -v test_briefing
+      - run: python -m unittest -v test_briefing test_broker_scorecard test_state_crypto
