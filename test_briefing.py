@@ -38,6 +38,18 @@ class BriefingTests(unittest.TestCase):
         b.tick(self.c,self.j,self.sender,self.now('22:00'))
         self.assertNotIn('PSX PLAN',self.messages[0])
         self.assertIn('No late entry plan',self.messages[0])
+    def test_after_midnight_missed_notice_once(self):
+        late=datetime.fromisoformat('2026-09-23T00:35:00').replace(tzinfo=b.PKT)
+        b.tick(self.c,self.j,self.sender,late)
+        b.tick(self.c,self.j,self.sender,late)
+        self.assertEqual(len(self.messages),1)
+        self.assertIn('2026-09-22',self.messages[0])
+        self.assertNotIn('PSX PLAN',self.messages[0])
+    def test_after_midnight_does_not_override_delivered_plan(self):
+        self.j.deliver('2026-09-22:plan','plan',self.sender)
+        late=datetime.fromisoformat('2026-09-23T00:35:00').replace(tzinfo=b.PKT)
+        b.tick(self.c,self.j,self.sender,late)
+        self.assertEqual(len(self.messages),1)
     def test_old_snapshot_not_used(self):
         s=self.snapshot();s['session']='2026-09-21';self.j.save(s)
         b.tick(self.c,self.j,self.sender,self.now('20:00'))

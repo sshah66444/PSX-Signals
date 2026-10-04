@@ -321,7 +321,17 @@ def telegram_sender(token,chat):
 def tick(config,journal,sender,now=None):
     now=(now or datetime.now(PKT)).astimezone(PKT)
     day,clock=now.date(),now.strftime('%H:%M')
-    if not session_day(day,config) or clock < config['prepare_time']: return
+    if clock < config['prepare_time']:
+        # A GitHub schedule can arrive after midnight. Report a missed evening
+        # once for the preceding session; never relabel stale prices as a plan.
+        previous=day-timedelta(days=1)
+        if clock<='07:00' and previous.year==config['calendar_year'] and session_day(previous,config):
+            key=previous.isoformat()+':plan'
+            if journal.status(key) not in ('sent','sending','uncertain'):
+                journal.deliver(previous.isoformat()+':missed',
+                    f'PSX {previous}: the scheduled briefing missed its evening window. No late entry plan will be sent. Scheduler timing needs attention.',sender)
+        return
+    if not session_day(day,config): return
     session=day.isoformat(); key=session+':plan'
     if journal.status(key) in ('sent','sending','uncertain'): return
     snapshot=journal.snapshot(session)
