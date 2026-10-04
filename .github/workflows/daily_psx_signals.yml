@@ -2,8 +2,10 @@ name: PSX Telegram Commands
 on:
   schedule:
     # Preserve the old command-polling windows without running its stale daily scan.
-    - cron: '41 14 * * 1-5'
-    - cron: '17 16 * * 1-5'
+    - cron: '41 19 * * 1-5'
+      timezone: 'Asia/Karachi'
+    - cron: '17 21 * * 1-5'
+      timezone: 'Asia/Karachi'
   workflow_dispatch:
 permissions:
   contents: write
