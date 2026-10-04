@@ -99,8 +99,9 @@ Repository workflow permissions must allow the action to push its journal commit
 Protected default branches may require a dedicated state store instead; a failed
 state push must be fixed before relying on deduplication across runners.
 
-The workflow warms data at **19:05 and 19:35 PKT**, attempts delivery at **20:00**, then
-retries at **20:20, 20:40, and 20:55**. GitHub may start any of these late or drop a
+The workflow warms data at **19:05 and 19:35 PKT**, attempts delivery at **20:02**, then
+retries at **20:17, 20:32, 20:47, and 20:57**. Each cron explicitly names
+`Asia/Karachi`. GitHub may start any of these late or drop a
 scheduled job. Install/setup time also shifts receipt slightly. This is an 8 p.m.
 target, not a guaranteed deadline. An always-on worker is needed for tighter timing.
 The companion command workflow polls Telegram at its former times without running

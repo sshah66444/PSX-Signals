@@ -1,10 +1,12 @@
 name: PSX Next-Trading-Day Briefing
 on:
   schedule:
-    # Prepare the completed-session snapshot at 19:05 and refresh at 19:35 PKT.
-    - cron: '5,35 14 * * 1-5'
-    # Target 20:00 PKT; retry at 20:20, 20:40 and 20:55 if delivery/data failed.
-    - cron: '0,20,40,55 15 * * 1-5'
+    # GitHub interprets each cron in the explicit Pakistan timezone.
+    - cron: '5,35 19 * * 1-5'
+      timezone: 'Asia/Karachi'
+    # Target just after 20:00 PKT, off the high-load top of the hour.
+    - cron: '2,17,32,47,57 20 * * 1-5'
+      timezone: 'Asia/Karachi'
   workflow_dispatch:
 permissions:
   contents: write
@@ -22,6 +24,8 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Log scheduler time in Pakistan
+        run: python -c "from datetime import datetime; from zoneinfo import ZoneInfo; print('Workflow started at', datetime.now(ZoneInfo('Asia/Karachi')).isoformat())"
       - name: Unlock delivery journal
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
