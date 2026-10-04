@@ -126,6 +126,8 @@ At the delivery target:
 - Data incomplete: send one pending notice, then retry. No stale candidate cards.
 - Data still incomplete after cutoff: a late job emits one failure notice, not a
   next-day plan. If GitHub never starts a job, it cannot emit any notice.
+- If GitHub starts only after midnight, send one missed-evening status for the
+  preceding trading session and withhold all stale entry levels.
 - Explicit Telegram rejection: retry on a later run.
 - Network timeout with unknown delivery outcome: retain `uncertain` and require
   review before resending, to avoid silently duplicating a possibly delivered plan.
