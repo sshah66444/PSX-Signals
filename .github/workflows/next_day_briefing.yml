@@ -1,12 +1,12 @@
 name: PSX Next-Trading-Day Briefing
 on:
   schedule:
-    # GitHub interprets each cron in the explicit Pakistan timezone.
-    - cron: '5,35 19 * * 1-5'
-      timezone: 'Asia/Karachi'
-    # Target just after 20:00 PKT, off the high-load top of the hour.
-    - cron: '2,17,32,47,57 20 * * 1-5'
-      timezone: 'Asia/Karachi'
+    # Pakistan is UTC+5 year-round. Use UTC explicitly because live runs with
+    # timezone: Asia/Karachi have fired at the written UTC hour instead.
+    # 14:05/14:35 UTC = 19:05/19:35 PKT: prepare the data.
+    - cron: '5,35 14 * * 1-5'
+    # 15:02–15:57 UTC = 20:02–20:57 PKT: deliver within the evening window.
+    - cron: '2,17,32,47,57 15 * * 1-5'
   workflow_dispatch:
 permissions:
   contents: write
