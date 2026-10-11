@@ -27,6 +27,7 @@ jobs:
       - name: Log scheduler time in Pakistan
         run: python -c "from datetime import datetime; from zoneinfo import ZoneInfo; print('Workflow started at', datetime.now(ZoneInfo('Asia/Karachi')).isoformat())"
       - name: Unlock delivery journal
+        id: unlock_journal
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -37,11 +38,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python daily_briefing.py --tick
       - name: Record completed prices for delivered-signal scorecard
-        if: always()
+        if: ${{ always() && steps.unlock_journal.outcome == 'success' }}
         continue-on-error: true
         run: python briefing_performance.py --record
       - name: Print delivered-signal scorecard
-        if: always()
+        if: ${{ always() && steps.unlock_journal.outcome == 'success' }}
         continue-on-error: true
         run: python briefing_performance.py --forward-report
       - name: Lock delivery journal
