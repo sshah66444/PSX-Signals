@@ -203,13 +203,17 @@ def read_replay_csv(prices_path, breadth_path):
     return prices, breadth
 
 
-def report(rows, label):
+def report(rows, label, delivered_plans=None):
     closed = [r for r in rows if 'net_pct' in r]
     skipped = sum(r['status'].startswith('skipped') for r in rows)
     wins = sum(r['net_pct'] > 0 for r in closed)
     net = sum(r['net_pct'] for r in closed)
-    lines = [label, f'Setups evaluated: {len(rows)}; hypothetical fills: {len(closed)}; '
-             f'opening gaps skipped: {skipped}; unresolved: {len(rows)-len(closed)-skipped}.']
+    lines = [label]
+    if delivered_plans is not None:
+        lines.append(f'Delivered plans: {delivered_plans}; plans with no breakout: '
+                     f'{delivered_plans-len({r["source_session"] for r in rows})}.')
+    lines.append(f'Setups evaluated: {len(rows)}; hypothetical fills: {len(closed)}; '
+                 f'opening gaps skipped: {skipped}; unresolved: {len(rows)-len(closed)-skipped}.')
     if closed:
         lines.append(f'Net wins: {wins}/{len(closed)}; mean per filled setup: '
                      f'{net/len(closed):+.2f}% after {ROUND_TRIP_COST_PCT:.2f}% assumed costs.')
@@ -217,6 +221,13 @@ def report(rows, label):
         lines.append('No closed hypothetical fills yet. Edge is not established.')
     lines.append('Hypothetical fills use daily bars; same-day stop/target ties count as stopped. '
                  'Actual execution, slippage and taxes may differ.')
+    if rows:
+        lines.append('Recent setups:')
+        for row in rows[-10:]:
+            result = (f'{row["net_pct"]:+.2f}% net' if 'net_pct' in row
+                      else row['status'])
+            lines.append(f'{row["source_session"]} {row["symbol"]}: {result} '
+                         f'({row["status"]})')
     return '\n'.join(lines)
 
 
@@ -244,7 +255,10 @@ def main():
         record_completed_session(journal, summary, config['symbols'])
         print(f"Recorded official session {summary['date']} for forward scorecard")
     else:
-        print(report(forward_scorecard(journal), 'Delivered briefing scorecard'))
+        delivered = journal.db.execute('''SELECT COUNT(*) FROM deliveries
+            WHERE status='sent' AND key LIKE '%:plan' ''').fetchone()[0]
+        print(report(forward_scorecard(journal), 'Delivered briefing scorecard',
+                     delivered_plans=delivered))
 
 
 if __name__ == '__main__':
