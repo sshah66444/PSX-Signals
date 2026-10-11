@@ -1,3 +1,11 @@
+# Next-session briefing upgrade
+
+Start with [NEXT_DAY_SETUP.md](NEXT_DAY_SETUP.md) for the new 8 p.m. Pakistan-time Telegram workflow. This copy preserves the previous dashboard; its original documentation follows.
+
+The evening briefing's own outcome tracker and matching historical replay are
+documented in [BRIEFING_SCORECARD.md](BRIEFING_SCORECARD.md). The older dashboard
+backtester uses different signal rules.
+
 # PSX AlphaSignals — Professional Screener, Signal Engine & Audited Ledger
 
 An institutional-grade technical screener, transparent signal engine, and audited trade ledger built with **Streamlit**, **Plotly**, and **Python** designed specifically for the Pakistan Stock Exchange (PSX).
