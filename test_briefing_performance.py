@@ -43,6 +43,9 @@ class PerformanceTests(unittest.TestCase):
             journal.db.commit()
             first = p.forward_scorecard(journal)
             self.assertEqual(first[0]['status'], 'target1')
+            text = p.report(first, 'Forward', delivered_plans=2)
+            self.assertIn('plans with no breakout: 1', text)
+            self.assertIn('2026-10-07 OGDC:', text)
             changed = dict(summary, rows={'OGDC':dict(Open=101, High=109,
                 Low=90, Close=95, Volume=100000)})
             p.record_completed_session(journal, changed, ['OGDC'])
