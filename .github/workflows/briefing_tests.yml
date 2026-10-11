@@ -15,4 +15,4 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python -m unittest -v test_briefing test_broker_scorecard test_state_crypto
+      - run: python -m unittest -v test_briefing test_briefing_performance test_broker_scorecard test_state_crypto
