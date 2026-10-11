@@ -36,6 +36,14 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python daily_briefing.py --tick
+      - name: Record completed prices for delivered-signal scorecard
+        if: always()
+        continue-on-error: true
+        run: python briefing_performance.py --record
+      - name: Print delivered-signal scorecard
+        if: always()
+        continue-on-error: true
+        run: python briefing_performance.py --forward-report
       - name: Lock delivery journal
         if: always()
         env:
