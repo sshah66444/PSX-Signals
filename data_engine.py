@@ -327,8 +327,11 @@ def validate_market_data(
         return False, "Insufficient historical sessions (minimum 20 required)", 999
 
     latest_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
-    today = datetime.date.today()
-    age_days = (today - latest_date).days
+    if as_of is not None:
+        ref_date = (as_of.astimezone(PKT_TZ) if as_of.tzinfo else as_of).date()
+    else:
+        ref_date = datetime.date.today()
+    age_days = (ref_date - latest_date).days
 
     if age_days < 0:
         age_days = 0  # Timestamp timezone difference
