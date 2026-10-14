@@ -170,7 +170,7 @@ def evaluate_candidate(symbol,df,summary):
 
 
 def evaluate_dip_watch(symbol,df):
-    """Observation only: a recovering share near recent support, not an entry call."""
+    """Conditional next-session reversal; entry requires an opening zone and trigger."""
     d=compute_all_indicators(df)
     b,p=d.iloc[-1],d.iloc[-2]
     close,atr=float(b.Close),float(b.ATR)
@@ -185,9 +185,18 @@ def evaluate_dip_watch(symbol,df):
             b.MACD_Hist>p.MACD_Hist, close>=p.Close,
             0<close-support<=1.5*atr, close<resistance)
     if not all(checks):return None
-    return dict(symbol=symbol,price=round(close,2),support=round(support,2),
-                confirmation=round(float(b.High),2),invalidation=round(max(.01,support-.5*atr),2),
-                reason='Near recent support; RSI and MACD are improving. Wait for a later close above confirmation.')
+    trigger=round(float(b.High)+.01,2)
+    entry_min=round(max(support,close-.5*atr),2)
+    entry_max=round(min(close+.25*atr,trigger-.01),2)
+    stop=round(max(.01,support-.5*atr),2)
+    risk=trigger-stop
+    if not (0<stop<entry_min<=entry_max<trigger and 0<risk/trigger<=.05):return None
+    return dict(symbol=symbol,strategy='DIP_REVERSAL',status='CONDITIONAL',
+                price=round(close,2),support=round(support,2),
+                entry_min=entry_min,entry_max=entry_max,trigger=trigger,
+                stop_loss=stop,tp1=round(trigger+1.5*risk,2),
+                tp2=round(trigger+2.5*risk,2),rr_tp1=1.5,
+                reason='Near support with improving RSI and MACD; reversal requires a fresh intraday trigger.')
 
 
 def build_snapshot(config,now=None):
@@ -222,7 +231,7 @@ def build_snapshot(config,now=None):
                 source='Official PSX completed market summary + Yahoo prior history',
                 total=len(config['symbols']),valid=valid,ready=ready,benchmark_ok=True,
                 regime=regime,candidates=candidates[:config['top_n']] if ready else [],
-                dip_watches=watches[:config['top_n']] if ready else [],errors=errors)
+                dip_setups=watches[:config['top_n']] if ready else [],errors=errors)
 
 
 def render(snapshot):
@@ -251,16 +260,17 @@ def render(snapshot):
             if x['failures']: block += ['Missing: '+ '; '.join(x['failures'])[:200],
                                         'Do not enter from this card; wait for a later completed-close confirmation.']
             if len('\n'.join(lines+block)) < 3200: lines += block
-    if s['ready'] and s.get('dip_watches'):
-        lines += ['\nDIP WATCHLIST — observation only; no entry suggested today.']
-        for x in s['dip_watches']:
-            block=[f"{x['symbol']}: close {x['price']:.2f}; support ~{x['support']:.2f}; ",
-                   f"watch for a later completed close above {x['confirmation']:.2f}; ",
-                   f"invalidate below {x['invalidation']:.2f}."]
+    if s['ready'] and s.get('dip_setups'):
+        lines += ['\nCONDITIONAL DIP SETUPS — not triggered yet.']
+        for x in s['dip_setups']:
+            block=[f"{x['symbol']}: close {x['price']:.2f}; next-session opening zone "
+                   f"{x['entry_min']:.2f}–{x['entry_max']:.2f}; enter only if price then "
+                   f"crosses {x['trigger']:.2f}; stop {x['stop_loss']:.2f}; "
+                   f"TP1 {x['tp1']:.2f}; TP2 {x['tp2']:.2f}."]
             if len('\n'.join(lines+block))<3200:lines.append(''.join(block))
-        lines += ['A watch is not a buy signal. Recheck price, volume and market context after confirmation.']
+        lines += ['Skip a gap above the zone or an open below the stop. No trigger means no trade. Targets are before costs.']
     elif s['ready'] and not s['candidates']:
-        lines += ['No dip watches met the observation filters either.']
+        lines += ['No conditional dip setups met the filters either.']
     if s.get('errors'): lines += ['Unavailable/stale: '+', '.join(sorted(s['errors']))[:230]]
     lines += ['\nLevels expire after the named session. These are conditional setups, not executed trades.']
     return '\n'.join(lines)

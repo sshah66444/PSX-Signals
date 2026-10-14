@@ -11,6 +11,8 @@ from daily_briefing import Journal
 
 SETUP = dict(symbol='OGDC', entry_min=100, entry_max=102,
              stop_loss=97, tp1=108, tp2=114, rr_tp1=1.5)
+DIP = dict(symbol='PSO', strategy='DIP_REVERSAL', entry_min=99, entry_max=101,
+           trigger=102, stop_loss=97, tp1=109.5, tp2=114.5)
 
 
 class PerformanceTests(unittest.TestCase):
@@ -25,6 +27,16 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(p.simulate_outcome(SETUP, [bar],
                          expected_entry_session='2026-10-09')['status'],
                          'missing_entry_bar')
+
+    def test_dip_requires_zone_then_trigger_and_expires_next_session(self):
+        bar=dict(session='2026-10-08',Open=100,High=101,Low=99,Close=100,Volume=100000)
+        self.assertEqual(p.simulate_outcome(DIP,[bar])['status'],'not_triggered')
+        self.assertEqual(p.simulate_outcome(DIP,[dict(bar,Open=103,High=105)])['status'],
+                         'skipped_open_outside_band')
+        tie=dict(bar,High=110,Low=96)
+        outcome=p.simulate_outcome(DIP,[tie])
+        self.assertEqual(outcome['status'],'stopped')
+        self.assertEqual(outcome['entry'],102)
 
     def test_forward_scorecard_only_counts_sent_plan_and_does_not_rewrite_prices(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -44,12 +56,28 @@ class PerformanceTests(unittest.TestCase):
             first = p.forward_scorecard(journal)
             self.assertEqual(first[0]['status'], 'target1')
             text = p.report(first, 'Forward', delivered_plans=2)
-            self.assertIn('plans with no breakout: 1', text)
-            self.assertIn('2026-10-07 OGDC:', text)
+            self.assertIn('plans with no scored setup: 1', text)
+            self.assertIn('2026-10-07 OGDC BREAKOUT:', text)
             changed = dict(summary, rows={'OGDC':dict(Open=101, High=109,
                 Low=90, Close=95, Volume=100000)})
             p.record_completed_session(journal, changed, ['OGDC'])
             self.assertEqual(p.forward_scorecard(journal), first)
+            journal.db.close()
+
+    def test_delivered_dip_is_scored_separately_only_after_trigger(self):
+        with tempfile.TemporaryDirectory() as folder:
+            journal=Journal(Path(folder)/'journal.sqlite3')
+            journal.save(dict(session='2026-10-07',for_session='2026-10-08',
+                              ready=True,candidates=[],dip_setups=[DIP]))
+            journal.db.execute("INSERT INTO deliveries VALUES ('2026-10-07:plan','sent',1,'x')")
+            journal.db.commit()
+            p.record_completed_session(journal,dict(date='2026-10-08',advancing=100,
+                declining=200,index_close=160000,rows={'PSO':dict(Open=100,High=101,
+                Low=99,Close=100,Volume=100000)}),['PSO'])
+            rows=p.forward_scorecard(journal)
+            self.assertEqual(rows[0]['strategy'],'DIP_REVERSAL')
+            self.assertEqual(rows[0]['status'],'not_triggered')
+            self.assertIn('DIP_REVERSAL: 1 setups, 0 closed fills',p.report(rows,'Forward'))
             journal.db.close()
 
     def test_historical_replay_uses_live_candidate_function_and_next_market_day(self):

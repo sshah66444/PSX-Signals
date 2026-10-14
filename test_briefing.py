@@ -117,13 +117,15 @@ class BriefingTests(unittest.TestCase):
         self.assertNotIn('signal_tracker',sys.modules)
     def test_zero_candidates_still_produces_daily_report(self):
         self.assertIn('NO QUALIFYING BREAKOUTS',b.render(self.snapshot()))
-    def test_dip_watch_is_not_rendered_as_entry(self):
+    def test_conditional_dip_requires_zone_and_trigger(self):
         s=self.snapshot()
-        s['dip_watches']=[dict(symbol='PPL',price=230,support=225,confirmation=233,invalidation=222)]
+        s['dip_setups']=[dict(symbol='PPL',price=230,support=225,entry_min=228,
+                              entry_max=231,trigger=233,stop_loss=222,tp1=249.5,tp2=260.5)]
         text=b.render(s)
-        self.assertIn('observation only',text)
-        self.assertIn('not a buy signal',text)
-        self.assertNotIn('Entry band:',text)
+        self.assertIn('CONDITIONAL DIP SETUPS',text)
+        self.assertIn('opening zone 228.00–231.00',text)
+        self.assertIn('crosses 233.00',text)
+        self.assertIn('No trigger means no trade',text)
     def test_dip_watch_requires_confirmation_inputs(self):
         d=self.fixture()
         self.assertIsNone(b.evaluate_dip_watch('OGDC',d))
@@ -138,7 +140,8 @@ class BriefingTests(unittest.TestCase):
         with patch.object(b,'compute_all_indicators',return_value=d):
             watch=b.evaluate_dip_watch('OGDC',d)
             self.assertEqual(watch['symbol'],'OGDC')
-            self.assertLess(watch['invalidation'],watch['support'])
+            self.assertLess(watch['stop_loss'],watch['support'])
+            self.assertLess(watch['entry_max'],watch['trigger'])
             d.loc[d.index[-1],'RSI']=40
             self.assertIsNone(b.evaluate_dip_watch('OGDC',d))
     def test_low_coverage_withholds_dip_watch(self):
@@ -149,7 +152,7 @@ class BriefingTests(unittest.TestCase):
              patch.object(b,'evaluate_dip_watch',return_value=dict(symbol='OGDC',price=101,support=99)):
             snap=b.build_snapshot(c,self.now('19:30'))
         self.assertFalse(snap['ready'])
-        self.assertEqual(snap['dip_watches'],[])
+        self.assertEqual(snap['dip_setups'],[])
     def test_one_vendor_cache_error_does_not_abort_scan(self):
         c=dict(self.c,symbols=['OGDC','PPL'],min_coverage=.5)
         with patch.object(b,'market_summary',return_value=self.summary()), \

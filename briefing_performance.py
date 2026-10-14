@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from daily_briefing import (PKT, ROOT, Journal, evaluate_candidate,
+from daily_briefing import (PKT, ROOT, Journal, evaluate_candidate, evaluate_dip_watch,
                             load_config, market_summary, verified_bars)
 
 HOLD_SESSIONS = 4
@@ -56,7 +56,7 @@ def delivered_setups(journal):
     for row in rows:
         snapshot = json.loads(row['payload'])
         if snapshot.get('ready'):
-            for setup in snapshot.get('candidates', []):
+            for setup in snapshot.get('candidates', []) + snapshot.get('dip_setups', []):
                 yield snapshot, setup
 
 
@@ -77,10 +77,15 @@ def simulate_outcome(setup, bars, hold_sessions=HOLD_SESSIONS,
     first = bars[0]
     if expected_entry_session and first['session'] != expected_entry_session:
         return dict(status='missing_entry_bar', expected_entry_session=expected_entry_session)
-    entry = float(first['Open'])
-    if not float(setup['entry_min']) <= entry <= float(setup['entry_max']):
-        return dict(status='skipped_open_outside_band', entry=entry,
+    opening = float(first['Open'])
+    if not float(setup['entry_min']) <= opening <= float(setup['entry_max']):
+        return dict(status='skipped_open_outside_band', opening=opening,
                     entry_session=first['session'])
+    conditional = setup.get('strategy') == 'DIP_REVERSAL'
+    if conditional and float(first['High']) < float(setup['trigger']):
+        return dict(status='not_triggered', opening=opening,
+                    entry_session=first['session'])
+    entry = float(setup['trigger']) if conditional else opening
     stop, target = float(setup['stop_loss']), float(setup['tp1'])
     if not 0 < stop < entry < target:
         return dict(status='invalid_levels', entry=entry)
@@ -127,7 +132,8 @@ def forward_scorecard(journal):
                                    expected_sessions=sessions)
         rows.append(dict(source_session=snapshot['session'],
                          target_session=snapshot['for_session'],
-                         symbol=setup['symbol'], **outcome))
+                         symbol=setup['symbol'],strategy=setup.get('strategy','BREAKOUT'),
+                         **outcome))
     return rows
 
 
@@ -147,7 +153,7 @@ def historical_replay(prices, breadth, config):
         if market is None or day not in market_days[:-1]:
             continue
         expected_entry = market_days[market_days.index(day)+1].isoformat()
-        candidates = []
+        candidates, dips = [], []
         valid = 0
         for symbol, frame in available.items():
             history = frame.loc[frame.index.date <= day]
@@ -157,17 +163,20 @@ def historical_replay(prices, breadth, config):
             setup = evaluate_candidate(symbol, history, market)
             if setup:
                 candidates.append(setup)
+            elif dip := evaluate_dip_watch(symbol, history):
+                dips.append(dip)
         if valid / len(config['symbols']) < config['min_coverage']:
             continue
         candidates.sort(key=lambda x: x['rr_tp1'], reverse=True)
-        for setup in candidates[:config['top_n']]:
+        dips.sort(key=lambda x: (x['price']-x['support'])/x['price'])
+        for setup in candidates[:config['top_n']] + dips[:config['top_n']]:
             future = available[setup['symbol']].loc[
                 available[setup['symbol']].index.date > day].head(HOLD_SESSIONS)
             bars = [dict(session=index.date().isoformat(), **{
                 key: float(row[key]) for key in PRICE_FIELDS})
                     for index, row in future.iterrows()]
             rows.append(dict(source_session=day.isoformat(),
-                             symbol=setup['symbol'],
+                             symbol=setup['symbol'],strategy=setup.get('strategy','BREAKOUT'),
                              **simulate_outcome(setup, bars,
                                                 expected_entry_session=expected_entry,
                                                 expected_sessions=[d.isoformat() for d in
@@ -206,14 +215,22 @@ def read_replay_csv(prices_path, breadth_path):
 def report(rows, label, delivered_plans=None):
     closed = [r for r in rows if 'net_pct' in r]
     skipped = sum(r['status'].startswith('skipped') for r in rows)
+    untriggered = sum(r['status']=='not_triggered' for r in rows)
     wins = sum(r['net_pct'] > 0 for r in closed)
     net = sum(r['net_pct'] for r in closed)
     lines = [label]
     if delivered_plans is not None:
-        lines.append(f'Delivered plans: {delivered_plans}; plans with no breakout: '
+        lines.append(f'Delivered plans: {delivered_plans}; plans with no scored setup: '
                      f'{delivered_plans-len({r["source_session"] for r in rows})}.')
     lines.append(f'Setups evaluated: {len(rows)}; hypothetical fills: {len(closed)}; '
-                 f'opening gaps skipped: {skipped}; unresolved: {len(rows)-len(closed)-skipped}.')
+                 f'opens outside zone skipped: {skipped}; dip triggers missed: {untriggered}; '
+                 f'unresolved: {len(rows)-len(closed)-skipped-untriggered}.')
+    for strategy in ('BREAKOUT','DIP_REVERSAL'):
+        group=[r for r in rows if r.get('strategy','BREAKOUT')==strategy]
+        finished=[r for r in group if 'net_pct' in r]
+        if group:
+            mean=f'{sum(r["net_pct"] for r in finished)/len(finished):+.2f}%' if finished else 'pending'
+            lines.append(f'{strategy}: {len(group)} setups, {len(finished)} closed fills, mean net {mean}.')
     if closed:
         lines.append(f'Net wins: {wins}/{len(closed)}; mean per filled setup: '
                      f'{net/len(closed):+.2f}% after {ROUND_TRIP_COST_PCT:.2f}% assumed costs.')
@@ -226,7 +243,7 @@ def report(rows, label, delivered_plans=None):
         for row in rows[-10:]:
             result = (f'{row["net_pct"]:+.2f}% net' if 'net_pct' in row
                       else row['status'])
-            lines.append(f'{row["source_session"]} {row["symbol"]}: {result} '
+            lines.append(f'{row["source_session"]} {row["symbol"]} {row.get("strategy","BREAKOUT")}: {result} '
                          f'({row["status"]})')
     return '\n'.join(lines)
 

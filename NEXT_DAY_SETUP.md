@@ -9,7 +9,7 @@
   there are no qualifying setups. Friday reports name the next open session.
 - Show both the source session and the intended trading session. Never relabel old
   prices as today’s report. No entry plan after the 21:00 Pakistan cutoff.
-- Maximum three candidates, with conditional entry band, stop, two targets,
+- Maximum three breakout and three conditional dip setups, with entry zone, stop, two targets,
   reward/risk, plain-language reasoning and no-chasing instruction.
 
 ## What changed
@@ -35,13 +35,15 @@ predictions or orders. On the 2026-09-24 live validation of the original
 had missing or conflicting history. BOP was subsequently added to the watchlist,
 but the expanded list was not live-validated because Yahoo rate-limited the replay.
 
-The separate **dip watchlist** is observation only. It looks for a recovering
+The separate **conditional dip strategy** looks for a recovering
 share near recent support, with RSI 35–60 and rising, improving MACD, adequate
-average volume, and a close below its recent high. It shows a level to monitor on
-a later completed close and an invalidation level. It never prints an entry band
-or a buy instruction. This is a new, unvalidated heuristic inspired by the
-broker reports dated 21, 23, and 24 September 2026; agreement with a broker
-is not evidence of profitability. Paper-track outcomes before using it for trades.
+average volume, and a close below its recent high. A setup is valid only for the
+named next session: the open must be inside its printed zone, and price must then
+cross the printed trigger. An open below the stop or a gap above the zone is skipped.
+Its stop is below support and first target is 1.5 times the trigger-to-stop risk.
+Risk above 5% of trigger price is rejected. This is an unvalidated heuristic;
+agreement with a broker is not evidence of profitability. The forward scorecard
+tracks these setups separately from breakouts before treating them as reliable.
 
 ## Broker-call scorecard
 
