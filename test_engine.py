@@ -33,6 +33,10 @@ from signal_engine import (
     calculate_rsi,
     calculate_macd,
     calculate_atr,
+    SWING_FILTER,
+    TACTICAL_FILTER,
+    swing_filter,
+    tactical_filter,
 )
 from backtester import run_signal_backtest
 import signal_tracker
@@ -865,6 +869,128 @@ def test_session_freshness_guard():
     print("  ✓ Session Freshness Guard passed (Deterministic session cutoff, validation rejection, status downgrade & card notice).")
 
 
+def test_swing_tactical_two_track_segregation():
+    print("23. Testing Swing Track vs. Tactical Track segregation and filters...")
+    # 1. Test SWING_FILTER on a valid BREAKOUT candidate
+    breakout_cand = {
+        "symbol": "TESTPSO",
+        "strategy": "BREAKOUT",
+        "track": "swing",
+        "exit_mode": "trailing_ema",
+        "time_stop_bars": 4,
+        "status": "TRIGGERED",
+        "price": 364.09,
+        "entry_min": 364.09,
+        "entry_max": 365.65,
+        "stop_loss": 338.40,
+        "tp1": 406.52,
+        "tp2": 433.77,
+        "rr_tp1": 1.57,
+        "rr_tp2": 2.50,
+        "trigger_note": "Fresh 20-session breakout",
+        "checklist": {
+            "Macro Market Gate (KSE-100 > 50 EMA)": True,
+            "Relative Strength Leader (vs KSE-100)": True,
+            "Trend Alignment (Price > 20 & 50 EMA)": True,
+            "Minimum Liquidity (20MA Vol >= 80k)": True,
+            "Verified Intraday OHLC (True High/Low)": True,
+            "Favorable Risk:Reward (>= 1.2:1)": True,
+        },
+    }
+    ok_b, reason_b = swing_filter(breakout_cand)
+    assert ok_b, f"Valid BREAKOUT candidate must pass swing_filter, got: {reason_b}"
+    assert breakout_cand["track"] == "swing"
+    assert breakout_cand["exit_mode"] == "trailing_ema"
+
+    # 2. Test SWING_FILTER on a valid PULLBACK candidate
+    pullback_cand = {
+        "symbol": "TESTDGKC",
+        "strategy": "PULLBACK",
+        "track": "swing",
+        "exit_mode": "trailing_ema",
+        "time_stop_bars": 4,
+        "status": "TRIGGERED",
+        "price": 182.40,
+        "entry_min": 181.50,
+        "entry_max": 183.00,
+        "stop_loss": 175.00,
+        "tp1": 195.00,
+        "tp2": 205.00,
+        "rr_tp1": 1.45,
+        "rr_tp2": 2.30,
+        "trigger_note": "Testing 20 EMA support",
+        "checklist": {
+            "Macro Market Gate (KSE-100 > 50 EMA)": True,
+            "Relative Strength Leader (vs KSE-100)": True,
+            "Macro Trend Intact (Price > 50 EMA)": True,
+            "Testing 20 EMA Support Zone": True,
+            "Minimum Liquidity (20MA Vol >= 80k)": True,
+            "Verified Intraday OHLC (True High/Low)": True,
+            "Favorable Risk:Reward (>= 1.2:1)": True,
+        },
+    }
+    ok_pb, reason_pb = swing_filter(pullback_cand)
+    assert ok_pb, f"Valid PULLBACK candidate must pass swing_filter, got: {reason_pb}"
+
+    # 3. Test SWING_FILTER properly rejects MEAN_REVERSION
+    tactical_cand = {
+        "symbol": "TESTFFC",
+        "strategy": "MEAN_REVERSION",
+        "track": "tactical",
+        "exit_mode": "time_stop",
+        "time_stop_bars": 2,
+        "status": "TRIGGERED",
+        "price": 535.39,
+        "entry_min": 534.00,
+        "entry_max": 536.00,
+        "stop_loss": 528.25,
+        "tp1": 547.00,
+        "tp2": 554.50,
+        "rr_tp1": 0.95,
+        "rr_tp2": 1.60,
+        "trigger_note": "Oversold bounce near support",
+        "checklist": {
+            "Macro Market Gate (KSE-100 > 50 EMA)": True,
+            "Minimum Liquidity (20MA Vol >= 80k)": True,
+            "Verified Intraday OHLC (True High/Low)": True,
+        },
+    }
+    ok_mr_swing, reason_mr_swing = swing_filter(tactical_cand)
+    assert not ok_mr_swing, "MEAN_REVERSION must NOT pass swing_filter"
+    assert "not in swing set" in reason_mr_swing
+
+    # 4. Test TACTICAL_FILTER accepts MEAN_REVERSION and rejects BREAKOUT
+    ok_tac, reason_tac = tactical_filter(tactical_cand)
+    assert ok_tac, f"Valid MEAN_REVERSION candidate must pass tactical_filter, got: {reason_tac}"
+
+    ok_b_tac, reason_b_tac = tactical_filter(breakout_cand)
+    assert not ok_b_tac, "BREAKOUT candidate must NOT pass tactical_filter"
+    assert "not in tactical set" in reason_b_tac
+
+    # 5. Test card formatting displays the track badge
+    card_b = format_actionable_card(breakout_cand, company_name="Pakistan State Oil")
+    assert "SWING TRACK" in card_b, "Actionable card for breakout must display SWING TRACK"
+
+    card_t = format_actionable_card(tactical_cand, company_name="Fauji Fertilizer")
+    assert "TACTICAL TRACK" in card_t, "Actionable card for tactical must display TACTICAL TRACK"
+
+    # 6. Test ledger database segregation
+    signal_tracker.init_db()
+    signal_tracker.record_or_update_setup(breakout_cand, "TESTPSO")
+    signal_tracker.record_or_update_setup(tactical_cand, "TESTFFC")
+
+    active_swing = signal_tracker.get_active_signals(track="swing")
+    active_tactical = signal_tracker.get_active_signals(track="tactical")
+    assert any(s["symbol"] == "TESTPSO" for s in active_swing), "TESTPSO must be in active swing track"
+    assert not any(s["symbol"] == "TESTPSO" for s in active_tactical), "TESTPSO must NOT be in active tactical track"
+    assert any(s["symbol"] == "TESTFFC" for s in active_tactical), "TESTFFC must be in active tactical track"
+
+    perf_summary = signal_tracker.get_performance_summary()
+    assert "swing" in perf_summary and "tactical" in perf_summary, "Performance summary must contain segregated swing and tactical metrics"
+
+    print("  ✓ Swing Track vs. Tactical Track segregation passed (Filters, metadata, cards & ledger isolation).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -890,6 +1016,7 @@ if __name__ == "__main__":
     test_telegram_no_signals_note_matches_regime()
     test_mean_reversion_strategy()
     test_session_freshness_guard()
+    test_swing_tactical_two_track_segregation()
     print("=== All Verification Tests Passed Successfully! ===")
 
 

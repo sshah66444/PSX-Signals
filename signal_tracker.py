@@ -31,6 +31,7 @@ def init_db():
             id TEXT PRIMARY KEY,
             symbol TEXT NOT NULL,
             strategy TEXT NOT NULL,
+            track TEXT DEFAULT 'swing',
             status TEXT NOT NULL,
             created_date TEXT NOT NULL,
             triggered_date TEXT,
@@ -46,6 +47,11 @@ def init_db():
             notes TEXT
         )
         """)
+        # Ensure 'track' column exists for existing tables
+        cursor.execute("PRAGMA table_info(signals)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "track" not in columns:
+            cursor.execute("ALTER TABLE signals ADD COLUMN track TEXT DEFAULT 'swing'")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS signal_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,18 +115,20 @@ def record_or_update_setup(setup: dict, symbol: str) -> tuple[bool, str]:
         # New setup detected
         sig_id = f"{symbol}-{datetime.datetime.now().strftime('%Y%m%d%H%M')}-{strategy[:3]}"
         triggered_date = today_str if status == "TRIGGERED" else None
+        track = setup.get("track", "swing" if strategy in ["BREAKOUT", "PULLBACK"] else "tactical")
 
         cursor.execute(
             """
             INSERT INTO signals (
-                id, symbol, strategy, status, created_date, triggered_date,
+                id, symbol, strategy, track, status, created_date, triggered_date,
                 entry_min, entry_max, stop_loss, tp1, tp2, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sig_id,
                 symbol,
                 strategy,
+                track,
                 status,
                 today_str,
                 triggered_date,
@@ -294,26 +302,69 @@ def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35) -> lis
     return updates
 
 
-def get_active_signals() -> list[dict]:
-    """Returns all currently active (WATCHING or TRIGGERED) setups."""
+def get_active_signals(track: str = None) -> list[dict]:
+    """Returns all currently active (WATCHING or TRIGGERED) setups, optionally filtered by track."""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM signals WHERE status IN ('WATCHING', 'TRIGGERED') ORDER BY created_date DESC")
+        if track:
+            cursor.execute(
+                "SELECT * FROM signals WHERE status IN ('WATCHING', 'TRIGGERED') AND track = ? ORDER BY created_date DESC",
+                (track,),
+            )
+        else:
+            cursor.execute("SELECT * FROM signals WHERE status IN ('WATCHING', 'TRIGGERED') ORDER BY created_date DESC")
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
 
-def get_performance_summary() -> dict:
+def get_performance_summary(track: str = None) -> dict:
     """
     Computes audited performance from real signals actually recorded in signals.db.
+    Supports filtering by track ('swing' or 'tactical') or returning overall + per-track breakdown.
     Completely separated from historical simulations.
     """
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM signals")
+        if track:
+            cursor.execute("SELECT * FROM signals WHERE track = ?", (track,))
+        else:
+            cursor.execute("SELECT * FROM signals")
         all_signals = cursor.fetchall()
 
+        def compute_stats(df_subset):
+            total = len(df_subset)
+            active = len(df_subset[df_subset["status"].isin(["WATCHING", "TRIGGERED"])]) if total > 0 else 0
+            closed = df_subset[df_subset["status"].isin(["TP1_HIT", "TP2_HIT", "STOPPED_OUT", "EXPIRED"])] if total > 0 else pd.DataFrame()
+            if closed.empty:
+                return {
+                    "total_recorded": total,
+                    "active_count": active,
+                    "closed_count": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate_pct": 0.0,
+                    "net_pnl_pct": 0.0,
+                    "avg_trade_pnl": 0.0,
+                    "message": f"{total} setups recorded ({active} active, 0 closed yet).",
+                }
+            wins = len(closed[closed["net_pnl_pct"] > 0])
+            win_rate = round((wins / len(closed)) * 100, 1)
+            total_pnl = round(float(closed["net_pnl_pct"].sum()), 2)
+            avg_pnl = round(float(closed["net_pnl_pct"].mean()), 2)
+            return {
+                "total_recorded": total,
+                "active_count": active,
+                "closed_count": len(closed),
+                "wins": wins,
+                "losses": len(closed) - wins,
+                "win_rate_pct": win_rate,
+                "net_pnl_pct": total_pnl,
+                "avg_trade_pnl": avg_pnl,
+                "ledger_df": closed,
+            }
+
         if not all_signals:
+            track_label = f" for {track} track" if track else ""
             return {
                 "total_recorded": 0,
                 "active_count": 0,
@@ -321,38 +372,16 @@ def get_performance_summary() -> dict:
                 "win_rate_pct": 0.0,
                 "net_pnl_pct": 0.0,
                 "avg_trade_pnl": 0.0,
-                "message": "No signals have been recorded in the live ledger yet.",
+                "message": f"No signals have been recorded in the live ledger{track_label} yet.",
             }
 
         df = pd.DataFrame([dict(r) for r in all_signals])
-        total = len(df)
-        active = len(df[df["status"].isin(["WATCHING", "TRIGGERED"])])
-        closed = df[df["status"].isin(["TP1_HIT", "TP2_HIT", "STOPPED_OUT", "EXPIRED"])]
+        summary = compute_stats(df)
 
-        if closed.empty:
-            return {
-                "total_recorded": total,
-                "active_count": active,
-                "closed_count": 0,
-                "win_rate_pct": 0.0,
-                "net_pnl_pct": 0.0,
-                "avg_trade_pnl": 0.0,
-                "message": f"{total} setups recorded ({active} active, 0 closed yet).",
-            }
+        if track is None:
+            df_swing = df[df["track"] == "swing"] if "track" in df.columns else pd.DataFrame()
+            df_tactical = df[df["track"] == "tactical"] if "track" in df.columns else pd.DataFrame()
+            summary["swing"] = compute_stats(df_swing)
+            summary["tactical"] = compute_stats(df_tactical)
 
-        wins = len(closed[closed["net_pnl_pct"] > 0])
-        win_rate = round((wins / len(closed)) * 100, 1)
-        total_pnl = round(float(closed["net_pnl_pct"].sum()), 2)
-        avg_pnl = round(float(closed["net_pnl_pct"].mean()), 2)
-
-        return {
-            "total_recorded": total,
-            "active_count": active,
-            "closed_count": len(closed),
-            "wins": wins,
-            "losses": len(closed) - wins,
-            "win_rate_pct": win_rate,
-            "net_pnl_pct": total_pnl,
-            "avg_trade_pnl": avg_pnl,
-            "ledger_df": closed,
-        }
+        return summary

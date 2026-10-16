@@ -240,27 +240,33 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
         send_telegram_message(token, chat_id, reply)
 
     elif cmd == "/active":
-        active_list = get_active_signals()
+        track_arg = parts[1].lower() if len(parts) > 1 and parts[1].lower() in ["swing", "tactical"] else None
+        active_list = get_active_signals(track=track_arg)
         if not active_list:
-            reply = "ℹ️ No currently active setups in the ledger. Send /scan to run a fresh evaluation."
+            track_label = f" in {track_arg.upper()} track" if track_arg else ""
+            reply = f"ℹ️ No currently active setups{track_label} in the ledger. Send /scan to run a fresh evaluation."
         else:
             cards = []
             for s in active_list:
                 sym = s["symbol"]
+                t_label = (s.get("track") or ("swing" if s["strategy"] in ["BREAKOUT", "PULLBACK"] else "tactical")).upper()
                 card = (
-                    f"• <b>${sym}</b> ({s['status']})\n"
+                    f"• <b>${sym}</b> [{t_label}] ({s['status']})\n"
                     f"  Strategy: {s['strategy']} | Entry: {s['entry_min']:.2f}–{s['entry_max']:.2f}\n"
                     f"  SL: {s['stop_loss']:.2f} | TP1: {s['tp1']:.2f} | TP2: {s['tp2']:.2f}\n"
                 )
                 cards.append(card)
-            reply = "⚡ <b>Active & Watching Setups:</b>\n\n" + "\n".join(cards)
+            header_str = f"⚡ <b>Active & Watching Setups ({track_arg.upper()} TRACK):</b>\n\n" if track_arg else "⚡ <b>Active & Watching Setups:</b>\n\n"
+            reply = header_str + "\n".join(cards)
         send_telegram_message(token, chat_id, reply)
 
     elif cmd == "/performance":
-        summary = get_performance_summary()
+        track_arg = parts[1].lower() if len(parts) > 1 and parts[1].lower() in ["swing", "tactical"] else None
+        summary = get_performance_summary(track=track_arg)
+        header_title = f"Audited Live Performance Ledger ({track_arg.upper()} TRACK)" if track_arg else "Audited Live Performance Ledger"
         if summary.get("closed_count", 0) == 0:
             reply = (
-                "📊 <b>Audited Live Performance Ledger</b>\n\n"
+                f"📊 <b>{header_title}</b>\n\n"
                 f"Total setups recorded: <b>{summary['total_recorded']}</b>\n"
                 f"Active / In-progress: <b>{summary['active_count']}</b>\n"
                 f"Closed trades: <b>0</b> (waiting for resolutions).\n\n"
@@ -268,13 +274,23 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
             )
         else:
             reply = (
-                "📊 <b>Audited Live Performance Ledger</b>\n\n"
+                f"📊 <b>{header_title}</b>\n\n"
                 f"Total Closed Trades: <b>{summary['closed_count']}</b>\n"
                 f"Wins: <b>{summary['wins']}</b> | Losses: <b>{summary['losses']}</b>\n"
                 f"Win Rate: <b>{summary['win_rate_pct']}%</b>\n"
                 f"Total Net P&L: <b>{summary['net_pnl_pct']:+.2f}%</b> (after costs)\n"
                 f"Avg Trade P&L: <b>{summary['avg_trade_pnl']:+.2f}%</b>\n"
             )
+            if not track_arg and "swing" in summary and "tactical" in summary:
+                s_sum = summary["swing"]
+                t_sum = summary["tactical"]
+                reply += (
+                    f"\n<b>• Swing Track (Breakout/Pullback):</b> "
+                    f"{s_sum['closed_count']} closed, {s_sum['win_rate_pct']}% WR, {s_sum['net_pnl_pct']:+.2f}% net\n"
+                    f"<b>• Tactical Track (Mean Reversion):</b> "
+                    f"{t_sum['closed_count']} closed, {t_sum['win_rate_pct']}% WR, {t_sum['net_pnl_pct']:+.2f}% net\n"
+                    f"\n<i>Tip: Use <code>/performance swing</code> or <code>/performance tactical</code> for filtered views.</i>"
+                )
         send_telegram_message(token, chat_id, reply)
 
     elif cmd in ["/stock", "/why"]:

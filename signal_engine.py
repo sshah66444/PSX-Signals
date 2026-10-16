@@ -111,6 +111,85 @@ def compute_all_indicators(df: pd.DataFrame, df_kse: pd.DataFrame = None) -> pd.
     return df
 
 
+# --- TWO-TRACK ARCHITECTURAL FILTERS & DEFINITIONS ---
+SWING_FILTER = {
+    "allowed_strategies": {"BREAKOUT", "PULLBACK"},
+    "require_trend_alignment": True,        # price > EMA20 > EMA50 for BREAKOUT or > EMA50 for PULLBACK
+    "require_rs_leader": True,              # RS_Ratio >= RS_MA20
+    "require_macro_bullish": True,          # KSE-100 > 50 EMA
+    "min_vol_ma20": 80_000,
+    "min_rr_tp1": 1.2,
+    "exit_mode": "trailing_ema",            # Trailing 20 EMA
+    "time_stop_bars": 4,
+    "holding_max_bars": 30,
+}
+
+TACTICAL_FILTER = {
+    "allowed_strategies": {"MEAN_REVERSION"},
+    "exit_mode": "time_stop",               # Strict 48h bounce rule
+    "time_stop_bars": 2,                    # 2-day limit
+    "holding_max_bars": 5,
+    "min_vol_ma20": 80_000,
+}
+
+
+def swing_filter(candidate: dict) -> tuple[bool, str]:
+    """
+    Validates whether a candidate qualifies for the SWING TRACK.
+    Enforces macro alignment, trend continuation, benchmark leadership, and R:R >= 1.2:1.
+    """
+    if not candidate or candidate.get("status") in ["INSUFFICIENT_DATA", "INDEX_OUT_OF_BOUNDS", "NONE"]:
+        return False, "invalid candidate"
+    strategy = candidate.get("strategy")
+    if strategy not in SWING_FILTER["allowed_strategies"]:
+        return False, f"strategy {strategy} not in swing set"
+
+    checklist = candidate.get("checklist", {})
+
+    if SWING_FILTER["require_macro_bullish"] and not checklist.get("Macro Market Gate (KSE-100 > 50 EMA)"):
+        return False, "market in correction"
+
+    if SWING_FILTER["require_rs_leader"] and not checklist.get("Relative Strength Leader (vs KSE-100)"):
+        return False, "lagging benchmark"
+
+    # Handles both BREAKOUT ("Trend Alignment...") and PULLBACK ("Macro Trend Intact...")
+    trend_aligned = (
+        checklist.get("Trend Alignment (Price > 20 & 50 EMA)")
+        or checklist.get("Macro Trend Intact (Price > 50 EMA)")
+    )
+    if SWING_FILTER["require_trend_alignment"] and not trend_aligned:
+        return False, "trend not aligned"
+
+    if not checklist.get("Minimum Liquidity (20MA Vol >= 80k)"):
+        return False, "insufficient liquidity"
+
+    if candidate.get("rr_tp1", 0) < SWING_FILTER["min_rr_tp1"]:
+        return False, "reward:risk below threshold"
+
+    return True, "passed"
+
+
+def tactical_filter(candidate: dict) -> tuple[bool, str]:
+    """
+    Validates whether a candidate qualifies for the TACTICAL TRACK.
+    Enforces oversold mean-reversion with verified OHLC and adequate liquidity.
+    """
+    if not candidate or candidate.get("status") in ["INSUFFICIENT_DATA", "INDEX_OUT_OF_BOUNDS", "NONE"]:
+        return False, "invalid candidate"
+    strategy = candidate.get("strategy")
+    if strategy not in TACTICAL_FILTER["allowed_strategies"]:
+        return False, f"strategy {strategy} not in tactical set"
+
+    checklist = candidate.get("checklist", {})
+    if not checklist.get("Minimum Liquidity (20MA Vol >= 80k)"):
+        return False, "insufficient liquidity"
+
+    if not checklist.get("Verified Intraday OHLC (True High/Low)"):
+        return False, "unverified OHLC"
+
+    return True, "passed"
+
+
 def evaluate_bar_strategy(
     df_ind: pd.DataFrame,
     bar_idx: int = -1,
@@ -123,8 +202,9 @@ def evaluate_bar_strategy(
     Single source of truth used identically by both the screener and the backtester.
 
     Strategies supported:
-    1. BREAKOUT: Consolidation near 20-day resistance, breakout with volume & RS leadership.
-    2. PULLBACK: Healthy uptrend, price pulling back to 20 EMA / support band.
+    1. BREAKOUT: Consolidation near 20-day resistance, breakout with volume & RS leadership (SWING TRACK).
+    2. PULLBACK: Healthy uptrend, price pulling back to 20 EMA / support band (SWING TRACK).
+    3. MEAN_REVERSION: Oversold bounce off classical support confluence (TACTICAL TRACK).
     """
     if df_ind is None or len(df_ind) < 25:
         return {"status": "INSUFFICIENT_DATA"}
@@ -257,6 +337,9 @@ def evaluate_bar_strategy(
 
         return {
             "strategy": strategy,
+            "track": "swing",
+            "exit_mode": "trailing_ema",
+            "time_stop_bars": 4,
             "status": status,
             "date": date_str,
             "price": price,
@@ -337,6 +420,9 @@ def evaluate_bar_strategy(
 
         return {
             "strategy": strategy,
+            "track": "swing",
+            "exit_mode": "trailing_ema",
+            "time_stop_bars": 4,
             "status": status,
             "date": date_str,
             "price": price,
@@ -451,6 +537,9 @@ def evaluate_bar_strategy(
 
         return {
             "strategy": strategy,
+            "track": "tactical",
+            "exit_mode": "time_stop",
+            "time_stop_bars": p_mr_time_stop,
             "status": status,
             "date": date_str,
             "price": price,
@@ -482,6 +571,9 @@ def evaluate_bar_strategy(
     # Default: No clear actionable setup
     return {
         "strategy": "NONE",
+        "track": "none",
+        "exit_mode": "none",
+        "time_stop_bars": 0,
         "status": "NEUTRAL",
         "date": date_str,
         "price": price,
@@ -601,12 +693,15 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
             f"Showing {esc(last_date)} data.\n"
         )
 
+    track = setup.get("track", "swing" if strategy in ["BREAKOUT", "PULLBACK"] else "tactical")
+    track_badge = "SWING TRACK" if track == "swing" else "TACTICAL TRACK"
+
     card = (
         f"{badge_emoji} <b>${sym} — {status_label}</b>\n"
         f"🏢 {company_esc}\n"
         f"{pending_banner}"
         f"📅 <b>Data:</b> {last_date} Close ({source_esc}) | Age: {age}d\n"
-        f"🎯 <b>Strategy:</b> {strategy.title()} Setup\n"
+        f"🎯 <b>Strategy:</b> {strategy.title()} Setup | <b>{track_badge}</b>\n"
         f"📍 <b>Trigger Condition:</b> {trigger_note}\n"
         f"💰 <b>Current Price:</b> {price:.2f} PKR\n"
         f"🛒 <b>Planned Entry:</b> {setup.get('entry_min', 0):.2f} – {setup.get('entry_max', 0):.2f} PKR\n"
