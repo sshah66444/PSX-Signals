@@ -6,6 +6,7 @@ and Interactive Commands (/scan, /active, /stock, /why, /performance, /watchlist
 
 import os
 import sys
+import time
 import argparse
 import requests
 import datetime
@@ -31,29 +32,95 @@ from signal_tracker import (
     get_active_signals,
     get_performance_summary,
 )
+from swing_config import get_config
+
+
+TELEGRAM_TEXT_LIMIT = 3800        # Telegram rejects text > 4096 chars; keep headroom for entities
+TELEGRAM_MAX_ATTEMPTS = 4         # Retries per chunk (rate limits + transient failures)
+TELEGRAM_PACING_SECONDS = 1.1     # ~1 message/sec per chat stays under flood limits
+
+
+def _split_message(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """
+    Splits a long HTML message into Telegram-safe chunks on line boundaries.
+
+    Telegram's sendMessage rejects anything above 4096 characters, which is why
+    long watchlist/active-setup dumps used to disappear silently.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        # A single line longer than the limit has to be hard-split
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if c.strip()]
+
+
+def _post_with_retry(url: str, payload: dict, timeout: int = 20) -> tuple[bool, str]:
+    """
+    POSTs one message payload, honouring Telegram's 429 retry_after and retrying
+    transient network/5xx failures with exponential backoff.
+    """
+    last_error = "unknown error"
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout)
+        except Exception as exc:
+            last_error = f"connection error: {exc}"
+            time.sleep(2 * attempt)
+            continue
+
+        if resp.status_code == 200:
+            return True, ""
+        if resp.status_code == 429:
+            try:
+                retry_after = int(resp.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                retry_after = 5
+            last_error = f"429 rate limited (retry_after={retry_after}s)"
+            time.sleep(min(max(retry_after, 1), 60))
+            continue
+        if resp.status_code >= 500:
+            last_error = f"{resp.status_code}: {resp.text[:200]}"
+            time.sleep(2 * attempt)
+            continue
+        return False, f"{resp.status_code}: {resp.text[:200]}"
+
+    return False, f"failed after {TELEGRAM_MAX_ATTEMPTS} attempts ({last_error})"
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
-    """Sends an HTML formatted message to Telegram."""
-    if not token or not chat_id:
+    """Sends an HTML formatted message to Telegram, chunking and retrying as needed."""
+    if not token or not chat_id or not str(text).strip():
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=15)
-        if resp.status_code == 200:
-            return True
-        else:
-            print(f"✗ Telegram API error ({resp.status_code}): {resp.text}")
-            return False
-    except Exception as e:
-        print(f"✗ Failed to connect to Telegram: {e}")
-        return False
+    delivered = True
+    for chunk in _split_message(str(text)):
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        ok, error = _post_with_retry(url, payload)
+        if not ok:
+            print(f"✗ Telegram delivery failed for chat {chat_id}: {error}")
+            delivered = False
+    return delivered
 
 
 def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool:
@@ -62,7 +129,9 @@ def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool
         return False
     recipients = [c.strip() for c in str(chat_ids_str).split(",") if c.strip()]
     success = True
-    for cid in recipients:
+    for idx, cid in enumerate(recipients):
+        if idx:
+            time.sleep(TELEGRAM_PACING_SECONDS)
         ok = send_telegram_message(token, cid, text)
         if not ok:
             success = False
@@ -89,6 +158,7 @@ def run_daily_market_cycle(
     symbols: list = None,
     dry_run: bool = False,
     strict_freshness: bool = True,
+    mode: str = None,
 ) -> list[str]:
     """
     Executes the complete daily workflow:
@@ -99,6 +169,14 @@ def run_daily_market_cycle(
     5. Scans for new or triggered setups.
     6. Records them in signals.db without repeating unchanged setups.
     """
+    # Get trading mode from environment or parameter
+    # Default to swing_trade mode for all scans
+    if mode is None:
+        mode = os.environ.get("PSX_TRADING_MODE", "swing_trade")
+
+    config = get_config(mode)
+    print(f"Running in {config['name']} mode (time_stop: {config['time_stop_bars']} days, targets: {config['tp1_risk_multiplier']}x/{config['tp2_risk_multiplier']}x)")
+
     watchlist = get_watchlist()
     target_symbols = symbols if symbols else list(watchlist.keys())
     messages = []
@@ -160,20 +238,28 @@ def run_daily_market_cycle(
     new_setup_cards = []
     for sym, m_info in market_data.items():
         df = m_info["df"]
-        setup = generate_signal(sym, df, data_meta=m_info, df_kse=df_kse, market_regime=regime_info)
+        setup = generate_signal(sym, df, data_meta=m_info, df_kse=df_kse, market_regime=regime_info, mode=mode)
         status = setup.get("status")
 
         if status in ["TRIGGERED", "WATCHING"]:
-            is_new_or_updated, note = record_or_update_setup(setup, sym)
+            if dry_run:
+                # A dry run must never mutate the live ledger: otherwise the real
+                # scan that follows sees the setup as "already active" and stays
+                # silent, silently swallowing the alert.
+                is_new_or_updated = True
+            else:
+                is_new_or_updated, note = record_or_update_setup(setup, sym)
             # Only send card if this is a newly detected setup or transitioned to TRIGGERED
             if is_new_or_updated:
                 comp_name = watchlist.get(sym, {}).get("name", sym)
-                card = format_actionable_card(setup, company_name=comp_name)
+                card = format_actionable_card(setup, company_name=comp_name, mode=mode)
                 new_setup_cards.append(card)
 
     # 5. Summary header
     today_str = datetime.date.today().strftime("%d-%b-%Y")
     regime_badge = "🟢 BULL MARKET" if is_bullish else "🔴 MARKET CORRECTION (Cash Preservation Mode)"
+    if regime_info.get("benchmark_stale"):
+        regime_badge = "⚪ BENCHMARK STALE (Macro Gate Neutral)"
     header = (
         f"📊 <b>PSX AlphaSignals Daily Market Scan</b>\n"
         f"📅 Date: <b>{today_str}</b>\n"
@@ -201,14 +287,22 @@ def run_daily_market_cycle(
 
     # 6. Broadcast in banner-first order: header, then lifecycle updates, then
     # new setup cards, then the no-signals fallback if there was nothing else.
+    # Each message is paced so a 40-60 alert evening does not trip Telegram's
+    # flood control (previously the tail of the batch was dropped silently).
     if not dry_run and token and chat_id:
-        broadcast_telegram_message(token, chat_id, header)
-        for upd in lifecycle_updates:
-            broadcast_telegram_message(token, chat_id, upd["text"])
-        for card in new_setup_cards:
-            broadcast_telegram_message(token, chat_id, card)
+        outbox = [header]
+        outbox.extend([upd["text"] for upd in lifecycle_updates])
+        outbox.extend(new_setup_cards)
         if no_signals_note:
-            broadcast_telegram_message(token, chat_id, no_signals_note)
+            outbox.append(no_signals_note)
+
+        delivered = 0
+        for idx, item in enumerate(outbox):
+            if idx:
+                time.sleep(TELEGRAM_PACING_SECONDS)
+            if broadcast_telegram_message(token, chat_id, item):
+                delivered += 1
+        print(f"   Telegram delivery: {delivered}/{len(outbox)} messages sent successfully.")
 
     return messages
 
@@ -372,11 +466,32 @@ def main():
     parser.add_argument("--symbol", type=str, help="Specific symbol to scan")
     parser.add_argument("--dry-run", action="store_true", help="Print output without delivering to Telegram")
     parser.add_argument("--check-commands", action="store_true", help="Poll and execute interactive Telegram commands")
-    parser.add_argument("--allow-stale", action="store_true", help="Bypass strict session freshness guard (e.g. for holidays/backtests)")
+    parser.add_argument("--test", action="store_true", help="Send a single diagnostic message to Telegram and exit")
+    parser.add_argument("--allow-stale", action="store_true", default=True, help="Bypass strict session freshness guard (default: on, so a one-session feed lag still delivers alerts with a pending notice)")
+    parser.add_argument("--strict-freshness", action="store_true", help="Halt the scan when today's EOD bar has not settled yet")
+    parser.add_argument("--mode", type=str, default=None, choices=["day_trade", "swing_trade", "position_trade"],
+                       help="Trading mode (default: swing_trade or PSX_TRADING_MODE env var)")
     args = parser.parse_args()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if args.test:
+        if not token or not chat_id:
+            print("✗ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing from environment or .env")
+            sys.exit(1)
+        test_mode = args.mode or os.environ.get("PSX_TRADING_MODE", "swing_trade")
+        cfg = get_config(test_mode)
+        ok = send_telegram_message(
+            token,
+            chat_id,
+            "✅ <b>PSX AlphaSignals connectivity test</b>\n"
+            f"⚙️ Mode: {cfg['name']} (time stop {cfg['time_stop_bars']} sessions, trail EMA-{cfg['trailing_ema']})\n"
+            f"🕒 {datetime.datetime.now().strftime('%d-%b-%Y %H:%M')}\n"
+            "<i>Delivery to this chat is working.</i>",
+        )
+        print("✓ Test message delivered." if ok else "✗ Test message delivery failed.")
+        sys.exit(0 if ok else 1)
 
     if args.check_commands:
         print("Checking for interactive Telegram user commands...")
@@ -389,7 +504,8 @@ def main():
         chat_id,
         symbols=symbols,
         dry_run=args.dry_run,
-        strict_freshness=not args.allow_stale,
+        strict_freshness=args.strict_freshness,
+        mode=args.mode,
     )
 
     if args.dry_run or not token or not chat_id:

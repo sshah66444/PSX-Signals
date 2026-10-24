@@ -257,6 +257,42 @@ def is_session_settled(
         )
 
 
+def _http_get_json(url: str, timeout: int = 15):
+    """
+    GETs a JSON payload from the PSX data portal.
+
+    The portal's edge nodes intermittently close plain `requests` connections
+    (RemoteDisconnected) while still serving the same path to a browser TLS
+    fingerprint, so each URL is tried once with requests and once with
+    curl_cffi impersonating Chrome before giving up.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    last_error = "unknown error"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        last_error = f"HTTP {resp.status_code}"
+    except Exception as exc:
+        last_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        from curl_cffi import requests as curl_requests
+
+        resp = curl_requests.get(url, impersonate="chrome", timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        last_error = f"HTTP {resp.status_code} (curl_cffi)"
+    except Exception as exc:
+        last_error = f"{last_error}; curl_cffi {type(exc).__name__}: {exc}"
+
+    raise RuntimeError(f"PSX feed unavailable for {url}: {last_error}")
+
+
 def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     """
     Fetches official end-of-day timeseries directly from the PSX Data Portal (DPS).
@@ -270,15 +306,12 @@ def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     live setups on this data to prevent distorted ATR and stop-loss levels.
     """
     url = f"https://dps.psx.com.pk/timeseries/eod/{clean_symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
-    resp = requests.get(url, headers=headers, timeout=12)
-    if resp.status_code != 200:
+    try:
+        data = _http_get_json(url, timeout=15)
+    except Exception as exc:
+        print(f"   [DPS] {clean_symbol} unavailable: {exc}")
         return None
 
-    data = resp.json()
     rows = data.get("data", [])
     if not rows or len(rows) < 20:
         return None
@@ -530,28 +563,24 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
     if df_kse is None:
         try:
             url = "https://dps.psx.com.pk/timeseries/eod/KSE100"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-            }
-            resp = requests.get(url, headers=headers, timeout=12)
-            if resp.status_code == 200:
-                rows = resp.json().get("data", [])
-                if rows and len(rows) >= 50:
-                    records = []
-                    for item in rows:
-                        ts, c, v, o = item[0], float(item[1]), float(item[2]), float(item[3])
-                        d = datetime.datetime.fromtimestamp(ts, tz=PKT_TZ).date()
-                        records.append({
-                            "Date": pd.to_datetime(d),
-                            "Open": round(o, 2),
-                            "Close": round(c, 2),
-                            "Volume": int(v),
-                        })
-                    df_fresh = pd.DataFrame(records).drop_duplicates("Date", keep="first").set_index("Date").sort_index()
-                    df_kse = df_fresh
-                    df_kse.to_csv(cache_file)
-        except Exception:
+            payload = _http_get_json(url, timeout=15)
+            rows = payload.get("data", [])
+            if rows and len(rows) >= 50:
+                records = []
+                for item in rows:
+                    ts, c, v, o = item[0], float(item[1]), float(item[2]), float(item[3])
+                    d = datetime.datetime.fromtimestamp(ts, tz=PKT_TZ).date()
+                    records.append({
+                        "Date": pd.to_datetime(d),
+                        "Open": round(o, 2),
+                        "Close": round(c, 2),
+                        "Volume": int(v),
+                    })
+                df_fresh = pd.DataFrame(records).drop_duplicates("Date", keep="first").set_index("Date").sort_index()
+                df_kse = df_fresh
+                df_kse.to_csv(cache_file)
+        except Exception as exc:
+            print(f"   [KSE-100] live fetch unavailable: {exc}")
             df_kse = None
 
     # 3. Fallback to cache if network failed
@@ -573,6 +602,8 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
             "expected_date": str(expected_sess_date),
             "freshness_note": "Benchmark data feed offline.",
             "note": "KSE-100 benchmark feed offline.",
+            "benchmark_stale": True,
+            "benchmark_age_days": None,
         }
 
     # Compute Moving Averages
@@ -585,6 +616,33 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
     last_date = df_kse.index[-1].strftime("%Y-%m-%d")
     kse_latest_dt = df_kse.index[-1].date() if hasattr(df_kse.index[-1], "date") else df_kse.index[-1]
     is_settled, expected_date, freshness_note = is_session_settled(kse_latest_dt)
+
+    # Benchmark trust check: if the index series has not moved for more than a week the
+    # feed is blocked/extended-holiday. Gating long breakouts on a month-old index
+    # silently mutes the entire swing screener, so surface it and keep the macro gate
+    # neutral rather than pretending the old regime is still current.
+    benchmark_age_days = max(0, (datetime.date.today() - kse_latest_dt).days)
+    benchmark_stale = benchmark_age_days > 5
+
+    if benchmark_stale:
+        return df_kse, {
+            "regime": "BENCHMARK_STALE",
+            "is_bullish": True,
+            "close": round(latest_close, 2),
+            "ema50": round(latest_ema50, 2),
+            "ema200": round(latest_ema200, 2),
+            "last_date": last_date,
+            "is_settled": is_settled,
+            "expected_date": str(expected_date),
+            "freshness_note": freshness_note,
+            "note": (
+                f"KSE-100 benchmark is {benchmark_age_days} days old (last bar {last_date}) — "
+                "live PSX feed unreachable. Macro gate kept neutral: breakouts are not filtered "
+                "on this stale index."
+            ),
+            "benchmark_stale": True,
+            "benchmark_age_days": benchmark_age_days,
+        }
 
     # Regime Determination:
     if latest_close >= latest_ema50 and latest_ema50 >= latest_ema200:
@@ -611,6 +669,8 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
         "expected_date": str(expected_date),
         "freshness_note": freshness_note,
         "note": note,
+        "benchmark_stale": False,
+        "benchmark_age_days": benchmark_age_days,
     }
 
 

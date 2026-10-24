@@ -129,12 +129,27 @@ python test_engine.py
 
 ### 5. Run Telegram Bot
 ```bash
-# Test alert formatting without sending:
-python telegram_notifier.py --dry-run
+# Verify bot credentials + chat delivery (sends one diagnostic message):
+python telegram_notifier.py --test
 
-# Start interactive Telegram command listener:
+# Swing-trading scan, delivered live to Telegram:
+python telegram_notifier.py --mode swing_trade
+
+# Preview cards without sending or touching the ledger:
+python telegram_notifier.py --mode swing_trade --dry-run
+
+# Start interactive Telegram command listener (/scan, /active, /stock, /why, /performance):
 python telegram_notifier.py --check-commands
 ```
+
+On macOS you can also double-click `run_swing_scan.command` for a live swing scan.
+
+**Automatic daily delivery:** `.github/workflows/swing_signals.yml` runs the swing
+scan at 20:45 PKT (15:45 UTC) every trading day, with a 21:45 PKT retry that is
+skipped once the day's scan has already delivered. Long cards are chunked under
+Telegram's 4096-character limit, rate-limited sends are retried using Telegram's
+`retry_after`, and the ledger (`signals.db`) plus the delivery marker are committed
+back to the repo so signals are never duplicated.
 
 ---
 
@@ -149,8 +164,10 @@ psx-signal-screener/
 ├── backtester.py           # Multi-target backtester with ambiguous bar detection & fee deduction
 ├── signal_tracker.py       # Persistent SQLite ledger (signals.db) with WAL concurrency
 ├── telegram_notifier.py    # Telegram bot with daily scans, lifecycle updates & /commands
+├── run_swing_scan.command  # macOS double-click launcher for a live swing scan
 ├── test_engine.py          # Automated verification test suite
 ├── signals.db              # SQLite persistent trade ledger (WAL enabled)
 └── .github/workflows/
-    └── daily_psx_signals.yml # Autonomous GitHub Actions cloud runner with state persistence
+    ├── daily_psx_signals.yml # Telegram /command polling runner
+    └── swing_signals.yml     # Daily 20:45 PKT swing-scan delivery (+ 21:45 PKT retry)
 ```

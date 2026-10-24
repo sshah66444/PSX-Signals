@@ -7,6 +7,7 @@ Serves as the single deterministic source of truth for both live alerts and back
 import datetime
 import numpy as np
 import pandas as pd
+from swing_config import get_config
 
 
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
@@ -48,37 +49,54 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def compute_all_indicators(df: pd.DataFrame, df_kse: pd.DataFrame = None) -> pd.DataFrame:
+def compute_all_indicators(df: pd.DataFrame, df_kse: pd.DataFrame = None, mode: str = "swing_trade") -> pd.DataFrame:
     """Computes technical indicator series and benchmark relative strength across the price history."""
     df = df.copy()
     close = df["Close"]
 
-    df["EMA_20"] = calculate_ema(close, 20)
-    df["EMA_50"] = calculate_ema(close, 50)
-    df["EMA_200"] = calculate_ema(close, min(200, max(20, len(df) - 1)))
+    # Get configuration based on trading mode
+    config = get_config(mode)
 
-    macd, sig, hist = calculate_macd(close, 12, 26, 9)
+    ema_fast = config["ema_fast"]
+    ema_medium = config["ema_medium"]
+    ema_slow = config["ema_slow"]
+    vol_period = config["volume_period"]
+    bb_period = config["bb_period"]
+    squeeze_lookback = config["squeeze_lookback"]
+    resistance_lookback = config["resistance_lookback"]
+
+    # Calculate EMAs with configurable periods
+    df["EMA_20"] = calculate_ema(close, 20)  # Keep for legacy compatibility
+    df["EMA_50"] = calculate_ema(close, 50)  # Keep for legacy compatibility
+    df["EMA_Fast"] = calculate_ema(close, ema_fast)
+    df["EMA_Medium"] = calculate_ema(close, ema_medium)
+    df["EMA_200"] = calculate_ema(close, min(ema_slow, max(20, len(df) - 1)))
+
+    macd, sig, hist = calculate_macd(close, config["macd_fast"], config["macd_slow"], config["macd_signal"])
     df["MACD"] = macd
     df["MACD_Signal"] = sig
     df["MACD_Hist"] = hist
 
-    df["RSI"] = calculate_rsi(close, 14)
+    df["RSI"] = calculate_rsi(close, config["rsi_period"])
     df["ATR"] = calculate_atr(df, 14)
-    df["Vol_MA20"] = df["Volume"].rolling(20).mean()
+    df["Vol_MA20"] = df["Volume"].rolling(20).mean()  # Keep for legacy
+    df["Vol_MA_Primary"] = df["Volume"].rolling(vol_period).mean()
 
-    # Dynamic rolling 20-day high and low
-    df["Rolling_High20"] = df["High"].rolling(20).max()
-    df["Rolling_Low20"] = df["Low"].rolling(20).min()
+    # Dynamic rolling high and low (configurable lookback)
+    df["Rolling_High20"] = df["High"].rolling(20).max()  # Keep for legacy
+    df["Rolling_Low20"] = df["Low"].rolling(20).min()    # Keep for legacy
+    df[f"Rolling_High{resistance_lookback}"] = df["High"].rolling(resistance_lookback).max()
+    df[f"Rolling_Low{resistance_lookback}"] = df["Low"].rolling(resistance_lookback).min()
 
-    # Bollinger Bands & Volatility Compression (Squeeze Base)
-    df["BB_Middle"] = df["Close"].rolling(20).mean()
-    df["BB_Std"] = df["Close"].rolling(20).std()
+    # Bollinger Bands & Volatility Compression (configurable period)
+    df["BB_Middle"] = df["Close"].rolling(bb_period).mean()
+    df["BB_Std"] = df["Close"].rolling(bb_period).std()
     df["BB_Upper"] = df["BB_Middle"] + (2.0 * df["BB_Std"])
     df["BB_Lower"] = df["BB_Middle"] - (2.0 * df["BB_Std"])
     df["BB_Width"] = (df["BB_Upper"] - df["BB_Lower"]) / (df["BB_Middle"] + 1e-6)
-    df["BB_Width_Min60"] = df["BB_Width"].rolling(60, min_periods=20).min()
-    # Volatility squeeze: current bandwidth is within 35% of its 60-day tightest compression
-    df["Is_Squeeze"] = df["BB_Width"] <= (1.35 * df["BB_Width_Min60"])
+    df[f"BB_Width_Min{squeeze_lookback}"] = df["BB_Width"].rolling(squeeze_lookback, min_periods=20).min()
+    # Volatility squeeze: current bandwidth is within 35% of its lookback-period tightest compression
+    df["Is_Squeeze"] = df["BB_Width"] <= (1.35 * df[f"BB_Width_Min{squeeze_lookback}"])
 
     # Classical Daily Floor Pivot Points (calculated from prior session High, Low, Close without lookahead)
     prev_h = df["High"].shift(1)
@@ -196,6 +214,7 @@ def evaluate_bar_strategy(
     has_true_ohlc: bool = True,
     market_regime: dict = None,
     params: dict = None,
+    mode: str = "swing_trade",
 ) -> dict:
     """
     Evaluates strategy conditions on a specific historical bar.
@@ -209,15 +228,28 @@ def evaluate_bar_strategy(
     if df_ind is None or len(df_ind) < 25:
         return {"status": "INSUFFICIENT_DATA"}
 
+    # Get trading mode configuration
+    config = get_config(mode)
+
     # Configurable Strategy Parameters with institutional defaults
-    p_vol_mult = params.get("vol_surge_mult", 1.20) if params else 1.20
+    # Allow params override, otherwise use mode config, finally fall back to legacy defaults
+    p_vol_mult = params.get("vol_surge_mult") if params and "vol_surge_mult" in params else config["volume_surge_threshold"]
     p_rsi_min = params.get("rsi_min", 42.0) if params else 42.0
     p_rsi_max = params.get("rsi_max", 68.0) if params else 68.0
     p_pb_rsi_max = params.get("pullback_rsi_max", 58.0) if params else 58.0
     p_oversold_rsi_max = params.get("oversold_rsi_max", 38.0) if params else 38.0
     p_mr_regime = params.get("mean_rev_regime", "all") if params else "all"
-    p_mr_time_stop = params.get("mr_time_stop_bars", 2) if params else 2
-    p_rr_min = params.get("rr_min", 1.20) if params else 1.20
+    p_mr_time_stop = params.get("mr_time_stop_bars") if params and "mr_time_stop_bars" in params else config["mr_time_stop_bars"]
+    p_rr_min = params.get("rr_min") if params and "rr_min" in params else 1.20
+    p_time_stop_bars = config["time_stop_bars"]
+    p_trailing_ema = config["trailing_ema"]
+
+    # Target multipliers from mode config
+    tp1_risk_mult = config["tp1_risk_multiplier"]
+    tp2_risk_mult = config["tp2_risk_multiplier"]
+    tp1_atr_mult = config["tp1_atr_multiplier"]
+    tp2_atr_mult = config["tp2_atr_multiplier"]
+    stop_atr_mult = config["stop_atr_multiplier"]
 
     # Normalize negative index
     n = len(df_ind)
@@ -235,6 +267,14 @@ def evaluate_bar_strategy(
     ema20 = float(bar["EMA_20"])
     ema50 = float(bar["EMA_50"])
     ema200 = float(bar["EMA_200"]) if "EMA_200" in bar and not pd.isna(bar["EMA_200"]) else ema50
+
+    # Mode-accurate trailing trend anchor: 20 EMA (day_trade), 50 EMA (swing_trade),
+    # 100 EMA (position_trade). Computed from the same series so the trailing level in
+    # the alert always matches the configured exit model instead of a fixed 20 EMA.
+    trailing_ema_series = calculate_ema(df_ind["Close"], p_trailing_ema)
+    trailing_ema_val = float(trailing_ema_series.iloc[idx])
+    if pd.isna(trailing_ema_val) or trailing_ema_val <= 0:
+        trailing_ema_val = ema50
     rsi = float(bar["RSI"]) if not pd.isna(bar["RSI"]) else 50.0
     prev_rsi = float(prev["RSI"]) if not pd.isna(prev["RSI"]) else rsi
     macd_hist = float(bar["MACD_Hist"])
@@ -281,11 +321,11 @@ def evaluate_bar_strategy(
         strategy = "BREAKOUT"
         entry_min = round(max(res20 * 0.995, price - 0.3 * atr), 2)
         entry_max = round(max(price, res20 * 1.01), 2)
-        # Structural Invalidation: Below 50 EMA support (or res20 - 0.8*ATR, whichever is more defensive)
-        invalidation = round(min(res20 - 0.8 * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(res20 - 0.8 * atr, 2)
+        # Structural Invalidation: Below 50 EMA support (or res20 - stop_atr_mult*ATR, whichever is more defensive)
+        invalidation = round(min(res20 - stop_atr_mult * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(res20 - stop_atr_mult * atr, 2)
         risk = max(entry_max - invalidation, 0.01)
-        tp1 = round(entry_max + max(1.35 * risk, 1.4 * atr), 2)
-        tp2 = round(entry_max + max(2.5 * risk, 2.6 * atr), 2)
+        tp1 = round(entry_max + max(tp1_risk_mult * risk, tp1_atr_mult * atr), 2)
+        tp2 = round(entry_max + max(tp2_risk_mult * risk, tp2_atr_mult * atr), 2)
         rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
         rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
 
@@ -339,7 +379,7 @@ def evaluate_bar_strategy(
             "strategy": strategy,
             "track": "swing",
             "exit_mode": "trailing_ema",
-            "time_stop_bars": 4,
+            "time_stop_bars": p_time_stop_bars,
             "status": status,
             "date": date_str,
             "price": price,
@@ -348,8 +388,9 @@ def evaluate_bar_strategy(
             "stop_loss": invalidation,
             "tp1": tp1,
             "tp2": tp2,
-            "trailing_stop_ema": round(ema20, 2),
-            "trailing_rule": "Exit on daily close below 20 EMA (Trailing Trend Model)",
+            "trailing_stop_ema": round(trailing_ema_val, 2),
+            "trailing_ema_period": p_trailing_ema,
+            "trailing_rule": f"Exit on daily close below EMA-{p_trailing_ema} (Trailing Trend Model)",
             "risk_pct": round((risk / entry_max) * 100, 1),
             "rr_tp1": rr_tp1,
             "rr_tp2": rr_tp2,
@@ -361,6 +402,7 @@ def evaluate_bar_strategy(
             "has_true_ohlc": c_true_ohlc,
             "is_rs_leader": c_rs_leader,
             "is_squeeze": c_squeeze,
+            "mode": mode,
         }
 
     # --- STRATEGY 2: Pullback to 20 EMA / Support ---
@@ -370,10 +412,10 @@ def evaluate_bar_strategy(
         strategy = "PULLBACK"
         entry_min = round(min(ema20 - 0.2 * atr, price * 0.99), 2)
         entry_max = round(max(price, ema20 + 0.2 * atr), 2)
-        invalidation = round(min(ema20 - 0.8 * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(ema20 - 0.8 * atr, 2)
+        invalidation = round(min(ema20 - stop_atr_mult * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(ema20 - stop_atr_mult * atr, 2)
         risk = max(entry_max - invalidation, 0.01)
-        tp1 = round(entry_max + max(1.35 * risk, 1.4 * atr), 2)
-        tp2 = round(entry_max + max(2.5 * risk, 2.6 * atr), 2)
+        tp1 = round(entry_max + max(tp1_risk_mult * risk, tp1_atr_mult * atr), 2)
+        tp2 = round(entry_max + max(tp2_risk_mult * risk, tp2_atr_mult * atr), 2)
         rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
         rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
 
@@ -422,7 +464,7 @@ def evaluate_bar_strategy(
             "strategy": strategy,
             "track": "swing",
             "exit_mode": "trailing_ema",
-            "time_stop_bars": 4,
+            "time_stop_bars": p_time_stop_bars,
             "status": status,
             "date": date_str,
             "price": price,
@@ -431,8 +473,9 @@ def evaluate_bar_strategy(
             "stop_loss": invalidation,
             "tp1": tp1,
             "tp2": tp2,
-            "trailing_stop_ema": round(ema20, 2),
-            "trailing_rule": "Exit on daily close below 20 EMA (Trailing Trend Model)",
+            "trailing_stop_ema": round(trailing_ema_val, 2),
+            "trailing_ema_period": p_trailing_ema,
+            "trailing_rule": f"Exit on daily close below EMA-{p_trailing_ema} (Trailing Trend Model)",
             "risk_pct": round((risk / entry_max) * 100, 1),
             "rr_tp1": rr_tp1,
             "rr_tp2": rr_tp2,
@@ -444,6 +487,7 @@ def evaluate_bar_strategy(
             "has_true_ohlc": c_true_ohlc,
             "is_rs_leader": c_rs_leader,
             "is_squeeze": c_squeeze,
+            "mode": mode,
         }
 
     # --- STRATEGY 3: Mean-Reversion / Oversold Rebound (Broker Model) ---
@@ -561,6 +605,8 @@ def evaluate_bar_strategy(
             "has_true_ohlc": c_true_ohlc,
             "is_rs_leader": c_rs_leader,
             "is_squeeze": c_squeeze,
+            "mode": mode,
+            "trailing_ema_period": p_trailing_ema,
             "pivot": round(pivot, 2),
             "pivot_s1": round(pivot_s1, 2),
             "pivot_s2": round(pivot_s2, 2),
@@ -599,6 +645,7 @@ def generate_signal(
     df_kse: pd.DataFrame = None,
     market_regime: dict = None,
     params: dict = None,
+    mode: str = "swing_trade",
 ) -> dict:
     """
     Evaluates the latest completed session and formats a comprehensive setup package.
@@ -607,13 +654,14 @@ def generate_signal(
         return {}
 
     has_true_ohlc = data_meta.get("has_true_ohlc", True) if data_meta else True
-    df_ind = compute_all_indicators(df, df_kse=df_kse)
+    df_ind = compute_all_indicators(df, df_kse=df_kse, mode=mode)
     setup = evaluate_bar_strategy(
         df_ind,
         bar_idx=-1,
         has_true_ohlc=has_true_ohlc,
         market_regime=market_regime,
         params=params,
+        mode=mode,
     )
     setup["symbol"] = symbol
     setup["df_indicators"] = df_ind
@@ -648,10 +696,25 @@ def generate_signal(
     return setup
 
 
-def format_actionable_card(setup: dict, company_name: str = "") -> str:
+def format_actionable_card(setup: dict, company_name: str = "", mode: str = None) -> str:
     """
     Formats the transparent, actionable Telegram card requested by the user.
+
+    The exit model is rendered from the active trading mode, so a swing alert
+    always quotes the swing trailing EMA (default 50) and time stop instead of
+    inheriting day-trading defaults.
     """
+    # Resolve the mode used for this setup: explicit argument -> setup payload -> default
+    resolved_mode = mode or setup.get("mode") or "swing_trade"
+    try:
+        cfg = get_config(resolved_mode)
+    except ValueError:
+        cfg = get_config()
+        resolved_mode = "swing_trade"
+    trailing_period = setup.get("trailing_ema_period", cfg["trailing_ema"])
+    time_stop_bars = setup.get("time_stop_bars", cfg["time_stop_bars"])
+    holding_max_bars = cfg["holding_max_bars"]
+
     sym = setup.get("symbol", "")
     strategy = setup.get("strategy", "NONE")
     status = setup.get("status", "NEUTRAL")
@@ -682,9 +745,18 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
     company_esc = esc(company_name)
 
     if strategy == "MEAN_REVERSION":
-        exit_model_str = setup.get("trailing_rule", "Exit at Target 1 (Scalp) / Target 2 (20 EMA) or 2-Day Time Stop (48h)")
+        exit_model_str = setup.get(
+            "trailing_rule",
+            f"Exit at TP1 (scalp) / TP2, or {time_stop_bars}-session time stop",
+        )
+        mode_detail = f"time stop {time_stop_bars} sessions, mean-reversion exit on TP1/TP2"
     else:
-        exit_model_str = f"Trailing 20 EMA ({setup.get('trailing_stop_ema', 0):.2f} PKR) or Targets"
+        exit_model_str = (
+            f"Trail daily close below EMA-{trailing_period} "
+            f"({setup.get('trailing_stop_ema', 0):.2f} PKR); partial exits at TP1/TP2; "
+            f"hard time stop after {time_stop_bars} sessions (max hold {holding_max_bars})"
+        )
+        mode_detail = f"time stop {time_stop_bars} sessions, trail EMA-{trailing_period}"
 
     pending_banner = ""
     if not is_settled:
@@ -702,6 +774,7 @@ def format_actionable_card(setup: dict, company_name: str = "") -> str:
         f"{pending_banner}"
         f"📅 <b>Data:</b> {last_date} Close ({source_esc}) | Age: {age}d\n"
         f"🎯 <b>Strategy:</b> {strategy.title()} Setup | <b>{track_badge}</b>\n"
+        f"⚙️ <b>Mode:</b> {cfg['name']} ({mode_detail})\n"
         f"📍 <b>Trigger Condition:</b> {trigger_note}\n"
         f"💰 <b>Current Price:</b> {price:.2f} PKR\n"
         f"🛒 <b>Planned Entry:</b> {setup.get('entry_min', 0):.2f} – {setup.get('entry_max', 0):.2f} PKR\n"

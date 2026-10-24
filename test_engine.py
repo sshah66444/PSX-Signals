@@ -244,7 +244,9 @@ def test_backtester_same_bar_breakeven():
     df.loc[probe_bar, "Low"] = 270.0    # retraces into breakeven band: below entry (~274.69), above stop (~264.43)
     df.loc[probe_bar, "Close"] = 275.5
 
-    bt = run_signal_backtest(df, symbol="TEST_BE", holding_max_bars=20, broker_fee_pct=0.35, exit_mode="fixed_tp")
+    # This fixture was designed around the 20-day range/level geometry, so pin it to
+    # day_trade instead of inheriting the (now default) 50-day swing lookback.
+    bt = run_signal_backtest(df, symbol="TEST_BE", holding_max_bars=20, broker_fee_pct=0.35, exit_mode="fixed_tp", mode="day_trade")
     assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
     assert bt["resolved_trades"] > 0, "Fixture must produce at least one resolved trade to actually test anything"
 
@@ -274,7 +276,13 @@ def test_kse100_macro_and_relative_strength(df):
     assert df_kse is not None and not df_kse.empty, "KSE-100 index dataframe must not be empty"
     assert len(df_kse) >= 50, "KSE-100 index must have at least 50 historical sessions"
     assert "regime" in regime, "regime dict must contain 'regime'"
-    assert regime["regime"] in ["BULL_MARKET", "RECOVERY_ZONE", "MARKET_CORRECTION"]
+    assert regime["regime"] in ["BULL_MARKET", "RECOVERY_ZONE", "MARKET_CORRECTION", "BENCHMARK_STALE"]
+    if regime["regime"] == "BENCHMARK_STALE":
+        # A dead/stale PSX feed must be labelled rather than silently reported as
+        # a fresh bull/correction call, and the macro gate stays neutral so the
+        # screener keeps producing alerts.
+        assert regime.get("benchmark_stale") is True
+        assert regime["is_bullish"] is True
     assert "close" in regime and regime["close"] > 0
     assert "ema50" in regime and regime["ema50"] > 0
 
@@ -307,7 +315,9 @@ def test_time_stop_exit():
     assert os.path.exists(cache_sys), "SYS_real.csv cache file must exist"
     df_sys = pd.read_csv(cache_sys, index_col=0, parse_dates=True)
 
-    bt = run_signal_backtest(df_sys, symbol="SYS", holding_max_bars=20, time_stop_bars=4)
+    # Legacy 4-bar stagnation fixture: pin to day_trade so the 20-day geometry and
+    # 2-bar mean-reversion clock it was written against still apply.
+    bt = run_signal_backtest(df_sys, symbol="SYS", holding_max_bars=20, time_stop_bars=4, mode="day_trade")
     assert "error" not in bt, f"Backtest failed: {bt.get('error')}"
     assert bt["total_triggered"] >= 1, "Should have triggered setups in SYS"
     assert bt.get("time_stop_hits", 0) >= 1, "Should have triggered at least one time-stop exit"
@@ -315,10 +325,20 @@ def test_time_stop_exit():
     trades = bt["trades_df"]
     stalled_trades = trades[trades["outcome"].str.contains("TIME-STOP")]
     assert not stalled_trades.empty, "Must have recorded at least one TIME-STOP exit in trades_df"
-    first_stalled = stalled_trades.iloc[0]
-    assert first_stalled["bars_held"] >= 4, f"Time stop should trigger at >= 4 bars, held: {first_stalled['bars_held']}"
-    assert not bool(first_stalled["tp1_reached"]), "Time-stopped trade must not have reached TP1"
-    print(f"  ✓ Time-Stop Rule passed ({len(stalled_trades)} stalled trade(s) exited cleanly at >= 4 bars).")
+    # Mean-reversion exits run on their own (shorter) clock than stalled-momentum
+    # exits, so each family is validated against its own bar threshold instead of
+    # assuming the first time stop in the frame is a momentum stop.
+    mr_stalled = stalled_trades[stalled_trades["outcome"].str.contains("Mean Reversion")]
+    momentum_stalled = stalled_trades[~stalled_trades["outcome"].str.contains("Mean Reversion")]
+    assert not mr_stalled.empty, "This fixture must produce at least one mean-reversion time stop"
+    assert (mr_stalled["bars_held"] >= 2).all(), "Mean-reversion stops must respect their own bar limit"
+    if not momentum_stalled.empty:
+        assert (momentum_stalled["bars_held"] >= 4).all(), "Momentum time stops must respect time_stop_bars"
+    assert not bool(stalled_trades.iloc[0]["tp1_reached"]), "Time-stopped trade must not have reached TP1"
+    print(
+        f"  ✓ Time-Stop Rule passed ({len(mr_stalled)} MR + {len(momentum_stalled)} momentum "
+        "time stop(s) exited on their configured clocks)."
+    )
 
 
 def test_microstructure_and_next_day_open():
@@ -515,9 +535,21 @@ def test_trailing_ema_exit_mode():
         },
         "market_regime": {"is_bullish": True, "regime": "BULL_MARKET"},
     }
-    card_text = format_actionable_card(dummy_signal, "Test Company")
-    assert "Trailing 20 EMA" in card_text, "Actionable card must mention Trailing 20 EMA exit model"
-    print("  ✓ Trailing 20 EMA Exit Architecture passed (Trailing EMA + Structural Stops + Telegram Card).")
+    card_text = format_actionable_card(dummy_signal, "Test Company", mode="day_trade")
+    assert "EMA-20" in card_text, "Day-trade card must trail the 20 EMA"
+    assert "time stop after 4 sessions" in card_text, "Day-trade card must quote its 4-session time stop"
+
+    # The same setup rendered in swing mode must switch the exit model to the
+    # 50 EMA / 15-session clock instead of inheriting the day-trade defaults.
+    swing_setup = dict(dummy_signal)
+    swing_setup["mode"] = "swing_trade"
+    swing_setup["trailing_stop_ema"] = 99.75
+    swing_setup["trailing_ema_period"] = 50
+    swing_card = format_actionable_card(swing_setup, "Test Company", mode="swing_trade")
+    assert "EMA-50" in swing_card, "Swing card must trail the 50 EMA, not the 20 EMA"
+    assert "time stop after 15 sessions" in swing_card, "Swing card must quote its 15-session time stop"
+    assert "Swing Trading" in swing_card, "Swing card must name the active mode"
+    print("  ✓ Mode-accurate exit architecture passed (day: EMA-20/4 sessions, swing: EMA-50/15 sessions).")
 
 
 def test_trailing_ema_ambiguous_bar():
@@ -987,6 +1019,13 @@ def test_swing_tactical_two_track_segregation():
 
     perf_summary = signal_tracker.get_performance_summary()
     assert "swing" in perf_summary and "tactical" in perf_summary, "Performance summary must contain segregated swing and tactical metrics"
+
+    # Clean up the synthetic ledger rows so the live performance stats never
+    # inherit test symbols between runs.
+    with signal_tracker.get_connection() as conn:
+        conn.execute("DELETE FROM signal_events WHERE signal_id LIKE 'TESTPSO%' OR signal_id LIKE 'TESTFFC%'")
+        conn.execute("DELETE FROM signals WHERE symbol IN ('TESTPSO', 'TESTFFC')")
+        conn.commit()
 
     print("  ✓ Swing Track vs. Tactical Track segregation passed (Filters, metadata, cards & ledger isolation).")
 

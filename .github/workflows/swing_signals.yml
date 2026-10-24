@@ -1,0 +1,84 @@
+name: PSX Swing Signals (Daily Scan)
+
+# Delivers the swing-trading signal cards to Telegram once per trading day.
+# This replaces the "legacy daily scan" that was removed from
+# daily_psx_signals.yml (commit ae99113), which left the bot polling commands
+# but never actually scanning for new swing setups.
+
+on:
+  schedule:
+    # Pakistan is UTC+5 year-round. GitHub cron is UTC-only (a `timezone:` key is
+    # NOT honoured), so the windows below are written in UTC:
+    #   15:45 UTC = 20:45 PKT  -> primary run, after the PSX EOD settlement window
+    #   16:45 UTC = 21:45 PKT  -> retry, skipped when the primary run already delivered
+    - cron: '45 15 * * 1-5'
+    - cron: '45 16 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: psx-swing-scan
+  cancel-in-progress: false
+
+jobs:
+  swing_scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check whether today's scan already delivered
+        id: gate
+        run: |
+          TODAY=$(TZ=Asia/Karachi date +%F)
+          echo "today=${TODAY}" >> "$GITHUB_OUTPUT"
+          if [ -f ".state/swing_scan_${TODAY}.done" ] && [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Swing scan already delivered for ${TODAY}; skipping this retry window."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deliver swing-trading scan to Telegram
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PSX_TRADING_MODE: swing_trade
+        run: python telegram_notifier.py --mode swing_trade
+
+      - name: Mark today as delivered
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          mkdir -p .state
+          printf '{"delivered_at": "%s", "mode": "swing_trade"}\n' \
+            "$(TZ=Asia/Karachi date -Iseconds)" > ".state/swing_scan_${{ steps.gate.outputs.today }}.done"
+
+      - name: Persist signal ledger and delivery marker
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add signals.db .state
+          if git diff --staged --quiet; then
+            echo "Nothing to persist."
+            exit 0
+          fi
+          git commit -m "Persist PSX swing scan ledger [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Could not push the updated signal ledger after 3 attempts."
+          exit 1

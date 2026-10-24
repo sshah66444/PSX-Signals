@@ -303,6 +303,13 @@ with tab2:
     if scan_records:
         df_scan = pd.DataFrame(scan_records)
 
+        # Keep quote/level columns strictly numeric: unavailable symbols write "-"
+        # into these fields, and the resulting object dtype makes Arrow serialization
+        # fail on every rerun ("Could not convert '-' ... to double").
+        for num_col in ["Price (PKR)", "Stop Loss", "TP1", "RSI"]:
+            if num_col in df_scan.columns:
+                df_scan[num_col] = pd.to_numeric(df_scan[num_col], errors="coerce")
+
         # Filters
         c_filter1, c_filter2 = st.columns([1, 1])
         with c_filter1:

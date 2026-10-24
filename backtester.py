@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from signal_engine import compute_all_indicators, evaluate_bar_strategy
 from data_engine import check_has_true_ohlc, get_symbol_sector, get_symbol_name
+from swing_config import get_config
 
 
 def calculate_execution_friction(adv_20: float) -> tuple[float, float, str]:
@@ -142,6 +143,7 @@ def run_signal_backtest(
     simulate_circuit_trapping: bool = False,
     strategy_params: dict = None,
     exit_mode: str = "trailing_ema",  # "trailing_ema" (default, lets winners run) or "fixed_tp" (legacy)
+    mode: str = "swing_trade",
 ) -> dict:
     """
     Backtests strategy performance bar-by-bar across historical data.
@@ -168,7 +170,7 @@ def run_signal_backtest(
                      "which invalidates ATR, stop-loss triggers, and target simulations."
         }
 
-    df_ind = compute_all_indicators(df, df_kse=df_kse)
+    df_ind = compute_all_indicators(df, df_kse=df_kse, mode=mode)
     n_bars = len(df_ind)
 
     # Pre-align KSE-100 series for fast O(1) regime lookup if provided
@@ -181,7 +183,15 @@ def run_signal_backtest(
         kse_close_series = df_kse["Close"].reindex(df_ind.index, method="ffill")
         kse_ema50_series = df_kse["EMA_50"].reindex(df_ind.index, method="ffill")
 
-    mr_time_stop_bars = strategy_params.get("mr_time_stop_bars", 2) if strategy_params else 2
+    # Mean-reversion exits must run on the same clock as the mode that produced the
+    # entry (swing = 5 sessions, day = 2). Hardcoding 2 here stopped swing setups out
+    # early and disagreed with the signal engine's own mr_time_stop_bars.
+    mode_mr_stop = get_config(mode)["mr_time_stop_bars"]
+    mr_time_stop_bars = (
+        strategy_params.get("mr_time_stop_bars", mode_mr_stop)
+        if strategy_params
+        else mode_mr_stop
+    )
     trades = []
     in_trade = False
     active = {}
@@ -740,6 +750,7 @@ def run_signal_backtest(
                 bar_idx=i,
                 market_regime=hist_regime,
                 params=strategy_params,
+                mode=mode,
             )
             if setup.get("status") == "TRIGGERED":
                 if use_next_day_open:
