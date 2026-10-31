@@ -1187,6 +1187,80 @@ def test_benchmark_fallback_and_feed_breaker():
     print("  ✓ Benchmark fallback passed (proxy regime, insufficient-data guard, feed breaker).")
 
 
+def test_broker_import():
+    print("26. Testing broker EOD import (column detection, dates, close-only, merge)...")
+    import tempfile
+    import import_broker_data as ibd
+
+    # 1. Column detection across realistic broker headers
+    mapping = ibd.detect_columns(["Date", "Open", "High", "Low", "Close", "Volume"])
+    assert mapping == {"date": "Date", "open": "Open", "high": "High", "low": "Low",
+                       "close": "Close", "volume": "Volume"}, mapping
+
+    mapping2 = ibd.detect_columns(
+        ["Trade Date", "Open Price", "High Price", "Low Price", "Close Price", "Volume Traded"]
+    )
+    assert mapping2["date"] == "Trade Date" and mapping2["close"] == "Close Price"
+    assert mapping2["volume"] == "Volume Traded"
+
+    # 2. Number and date parsing (day-first, thousands separators)
+    assert ibd._to_number("1,234.50") == 1234.5
+    assert pd.isna(ibd._to_number("-"))
+    dates = ibd.parse_dates(pd.Series(["25/12/2026", "01/02/2026"]))
+    assert dates.iloc[0] == pd.Timestamp("2026-12-25"), "dd/mm/yyyy must be day-first"
+    assert dates.iloc[1] == pd.Timestamp("2026-02-01")
+
+    # 3. Symbol inference from filename (must not pick the date or 'JSG')
+    assert ibd.infer_symbol("/tmp/JSG_OGDC.csv") == "OGDC"
+    assert ibd.infer_symbol("/tmp/2026-10-31_MEBL.csv") == "MEBL"
+    assert ibd.infer_symbol("/tmp/HBL.csv") == "HBL"
+
+    # 4. Normalisation: full OHLC keeps true wicks, close-only is flagged approximated
+    base = generate_isolated_test_data(days=60, base_price=100.0)
+    full = pd.DataFrame({
+        "Date": base.index.strftime("%d/%m/%Y"),
+        "Open": base["Open"].values, "High": base["High"].values,
+        "Low": base["Low"].values, "Close": base["Close"].values,
+        "Volume": base["Volume"].values,
+    })
+    frame, info = ibd.normalise_frame(full, "TESTFULL")
+    assert list(frame.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert frame.index.name == "Date" and len(frame) >= 50
+    assert info["has_true_ohlc"] is True
+
+    close_only = full[["Date", "Close"]]
+    frame2, info2 = ibd.normalise_frame(close_only, "TESTCLOSE")
+    assert info2["synthetic_ohlc"] is True
+    assert info2["has_true_ohlc"] is False, "Close-only data must never claim verified OHLC"
+    assert (frame2["High"] >= frame2[["Open", "Close"]].max(axis=1) - 1e-9).all()
+
+    # 5. Merge is additive and idempotent (uses an isolated cache dir)
+    original_cache = ibd.CACHE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ibd.CACHE_DIR = tmp
+        try:
+            first = ibd.merge_with_cache(frame, "TESTFULL")
+            assert os.path.exists(os.path.join(tmp, "TESTFULL_real.csv"))
+            assert os.path.exists(os.path.join(tmp, "TESTFULL_broker.json"))
+            assert first["rows_added"] == len(frame)
+
+            second = ibd.merge_with_cache(frame, "TESTFULL")
+            assert second["rows_added"] == 0, "Re-import must not duplicate rows"
+            assert second["rows_replaced"] == len(frame)
+            assert second["rows_total"] == len(frame)
+
+            # Adding newer bars must extend, never truncate
+            newer = frame.tail(5).copy()
+            newer.index = newer.index + pd.Timedelta(days=30)
+            third = ibd.merge_with_cache(newer, "TESTFULL")
+            assert third["rows_added"] == 5
+            assert third["rows_total"] == len(frame) + 5
+        finally:
+            ibd.CACHE_DIR = original_cache
+
+    print("  ✓ Broker import passed (headers, day-first dates, close-only flag, idempotent merge).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -1215,6 +1289,7 @@ if __name__ == "__main__":
     test_swing_tactical_two_track_segregation()
     test_tiered_signal_model()
     test_benchmark_fallback_and_feed_breaker()
+    test_broker_import()
     print("=== All Verification Tests Passed Successfully! ===")
 
 

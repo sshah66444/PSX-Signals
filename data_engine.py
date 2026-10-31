@@ -6,11 +6,12 @@ Zero synthetic fabrication in production.
 
 from __future__ import annotations
 import os
+import json
 import datetime
 import requests
 import pandas as pd
 
-CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+CACHE_DIR = os.environ.get("PSX_CACHE_DIR") or os.path.join(os.path.dirname(__file__), ".cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Top 75 Most Liquid & Active PSX Stocks across All Core Sectors
@@ -431,6 +432,30 @@ def validate_market_data(
     return True, "Data valid and verified", age_days
 
 
+def _load_broker_cache(clean_symbol: str, cache_file: str, max_age_days: int):
+    """
+    Returns (df, source_label) when this symbol's cache was populated by
+    import_broker_data.py and is still fresh, otherwise (None, None).
+
+    Broker-imported data is the client's own traded feed, so it takes precedence
+    over scraped sources and covers symbols those sources have dropped.
+    """
+    marker_path = os.path.join(CACHE_DIR, f"{clean_symbol}_broker.json")
+    if not (os.path.exists(marker_path) and os.path.exists(cache_file)):
+        return None, None
+    try:
+        with open(marker_path) as fh:
+            meta = json.load(fh)
+        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+        is_valid, reason, age = validate_market_data(df, max_age_days=max_age_days)
+        if not is_valid:
+            return None, None
+        imported = str(meta.get("imported_at", ""))[:10]
+        return df, f"Broker EOD import ({imported})"
+    except Exception:
+        return None, None
+
+
 def fetch_psx_stock(
     symbol: str,
     period: str = "6mo",
@@ -465,22 +490,31 @@ def fetch_psx_stock(
     source = "None"
     has_true_ohlc = False
 
+    # 0. Broker-imported EOD (see import_broker_data.py) wins when fresh, because it
+    # is the client's own traded feed and covers symbols Yahoo has dropped.
+    df_broker, broker_source = _load_broker_cache(clean_symbol, cache_file, max_age_days)
+    if df_broker is not None:
+        df = df_broker
+        has_true_ohlc = check_has_true_ohlc(df)
+        source = broker_source + (" — Verified True OHLC" if has_true_ohlc else " — OHLC approximated")
+
     # 1. Try Yahoo Finance (.KA) - Primary Source for verified true OHLCV
-    try:
-        df_yf = _fetch_from_yahoo(clean_symbol, period=period)
-        if df_yf is not None:
-            is_valid, reason, age = validate_market_data(
-                df_yf,
-                max_age_days=max_age_days,
-                require_settled_session=require_settled_session,
-            )
-            if is_valid:
-                df = df_yf
-                has_true_ohlc = check_has_true_ohlc(df_yf)
-                source = f"Yahoo Finance ({clean_symbol}.KA) — Verified True OHLC" if has_true_ohlc else f"Yahoo Finance ({clean_symbol}.KA) — Flat Wicks"
-                df.to_csv(cache_file)
-    except Exception:
-        df = None
+    if df is None:
+        try:
+            df_yf = _fetch_from_yahoo(clean_symbol, period=period)
+            if df_yf is not None:
+                is_valid, reason, age = validate_market_data(
+                    df_yf,
+                    max_age_days=max_age_days,
+                    require_settled_session=require_settled_session,
+                )
+                if is_valid:
+                    df = df_yf
+                    has_true_ohlc = check_has_true_ohlc(df_yf)
+                    source = f"Yahoo Finance ({clean_symbol}.KA) — Verified True OHLC" if has_true_ohlc else f"Yahoo Finance ({clean_symbol}.KA) — Flat Wicks"
+                    df.to_csv(cache_file)
+        except Exception:
+            df = None
 
     # 2. Try Local Cache (only if not force_refresh, cache is settled to expected date, and valid)
     if df is None and not force_refresh and os.path.exists(cache_file):

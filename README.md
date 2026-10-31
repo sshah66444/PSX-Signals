@@ -155,6 +155,37 @@ Because PSX withdrew its public history API, the bot no longer depends on it:
 If PSX restores or licenses the feed, no code change is needed for the official index — the
 proxy is only used when the official series is stale or missing.
 
+### 11. Importing Broker EOD Data (JS Global / any broker)
+
+If you have a brokerage account, its EOD exports are the highest-quality source
+available and they cover symbols Yahoo has dropped (`ENGRO`, `FFBL`, `SHEL`,
+`CYNERGICO`, `GLL`, `IPAK`).
+
+```bash
+# 1. Inspect an unfamiliar export — shows how columns were detected
+python import_broker_data.py --file jsg_eod.csv --list-columns
+
+# 2. Dry run (parse + report, writes nothing)
+python import_broker_data.py --file jsg_eod.csv --symbol OGDC --dry-run
+
+# 3. Import one file, or a whole folder of per-symbol files
+python import_broker_data.py --file jsg_eod.xlsx --sheet EOD --symbol OGDC
+python import_broker_data.py --dir ~/Downloads/jsg_exports
+```
+
+The importer auto-detects headers (`Close` / `Close Price` / `LDCP` / `Last`,
+`Volume` / `Volume Traded` / `Turnover`, …), parses day-first dates
+(`dd/mm/yyyy`, `dd-Mon-yyyy`, epochs), infers the ticker from the filename
+(`OGDC.csv`, `2026-10-31_OGDC.csv`) or a symbol column, and merges into the
+existing cache without truncating history.
+
+Imported symbols get a `.cache/<SYM>_broker.json` marker, after which
+`fetch_psx_stock()` **prefers** that data over scraped sources (freshness rules
+still apply). Close-only exports are accepted but flagged as approximated, so
+they can never trigger a live entry.
+
+Set `PSX_CACHE_DIR` to import into an isolated cache (useful for testing).
+
 ---
 
 ## 🛠️ Getting Started
