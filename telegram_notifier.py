@@ -571,7 +571,7 @@ def main():
         for sym in probes:
             res = fetch_psx_stock(sym, period="6mo")
             status = res.get("status")
-            print(f"Yahoo {sym:6s}: {status:11s} last={res.get('last_date')} source={res.get('source')}")
+            print(f"Symbol {sym:6s}: {status:11s} last={res.get('last_date')} source={res.get('source')}")
             if status == "OK":
                 frames[sym] = res
 
