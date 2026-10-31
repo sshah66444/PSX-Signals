@@ -7,7 +7,7 @@ Serves as the single deterministic source of truth for both live alerts and back
 import datetime
 import numpy as np
 import pandas as pd
-from swing_config import get_config
+from swing_config import get_config, MIN_SCORE_BUY_NOW, MIN_SCORE_BUY_ZONE, SIGNAL_VERSION
 
 
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
@@ -47,6 +47,76 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.ewm(span=period, adjust=False).mean()
     return atr
+
+
+def _score_evidence(evidence: dict) -> int:
+    """
+    Converts weighted evidence into a 0-100 conviction score.
+
+    `evidence` maps a human-readable condition to (passed, weight). Missing
+    confirmations cost points; they do not veto the setup. Only the hard risk
+    gates in `_resolve_state` can veto.
+    """
+    total = sum(weight for _, weight in evidence.values())
+    if total <= 0:
+        return 0
+    earned = sum(weight for passed, weight in evidence.values() if passed)
+    return int(round(earned * 100.0 / total))
+
+
+def _grade_for(score: int, rr_tp1: float = None) -> str:
+    if score >= 80:
+        grade = "A"
+    elif score >= 65:
+        grade = "B"
+    elif score >= 50:
+        grade = "C"
+    else:
+        grade = "D"
+    # An A-grade needs a first target worth at least 1.5R; a high conviction score
+    # on 1.2:1 geometry is a B at best.
+    if grade == "A" and rr_tp1 is not None and rr_tp1 < 1.5:
+        grade = "B"
+    return grade
+
+
+def _resolve_state(
+    blockers: list,
+    score: int,
+    trigger_met: bool,
+    in_zone: bool,
+    macro_ok: bool = True,
+) -> str:
+    """
+    Maps (hard-gate blockers, score, trigger, zone) to a tradeable signal state.
+
+    BUY_NOW   - risk gates pass, entry trigger satisfied, conviction >= 80
+    BUY_ZONE  - risk gates pass, price is inside the entry zone, conviction >= 60
+    WATCH     - risk gates pass but the setup is not tradeable yet
+    AVOID     - a hard risk gate failed (bad data, illiquid, R:R too thin, ...)
+    """
+    if blockers:
+        return "AVOID"
+    if not macro_ok:
+        return "WATCH"
+    if trigger_met and score >= MIN_SCORE_BUY_NOW:
+        return "BUY_NOW"
+    if in_zone and score >= MIN_SCORE_BUY_ZONE:
+        return "BUY_ZONE"
+    return "WATCH"
+
+
+def _state_note(state: str, blockers: list, score: int, grade: str, trigger_condition: str, trigger_note: str) -> str:
+    """Builds the plain-English reason that accompanies a tiered signal state."""
+    if state == "AVOID":
+        return "Not tradeable: " + "; ".join(blockers) + "."
+    if state == "WATCH":
+        if blockers:
+            return "Waiting: " + "; ".join(blockers) + "."
+        return f"Setup forming ({score}/100, grade {grade}); not yet in the entry zone."
+    if state == "BUY_ZONE":
+        return f"Price is in the buy zone ({score}/100, grade {grade}) and every risk gate passes; waiting on the confirmation candle."
+    return trigger_note
 
 
 def compute_all_indicators(df: pd.DataFrame, df_kse: pd.DataFrame = None, mode: str = "swing_trade") -> pd.DataFrame:
@@ -243,6 +313,9 @@ def evaluate_bar_strategy(
     p_rr_min = params.get("rr_min") if params and "rr_min" in params else 1.20
     p_time_stop_bars = config["time_stop_bars"]
     p_trailing_ema = config["trailing_ema"]
+    p_min_rr_tp1 = config["min_rr_tp1"]
+    p_min_rr_tp2 = config["min_rr_tp2"]
+    p_entry_zone_atr = config["entry_zone_atr"]
 
     # Target multipliers from mode config
     tp1_risk_mult = config["tp1_risk_multiplier"]
@@ -304,6 +377,9 @@ def evaluate_bar_strategy(
     c_market_gate = bool(is_market_bullish)
     c_rs_leader = bool(bar["Is_RS_Leader"]) if "Is_RS_Leader" in bar else True
     c_squeeze = bool(bar["Is_Squeeze"]) if "Is_Squeeze" in bar else True
+    # Relative strength is only meaningful when the benchmark is fresh; scoring it
+    # against a month-old KSE-100 would silently dock 15 points from every name.
+    benchmark_stale = bool((market_regime or {}).get("benchmark_stale"))
 
     # Technical Condition checks
     c_true_ohlc = bool(has_true_ohlc)
@@ -343,37 +419,44 @@ def evaluate_bar_strategy(
             f"Favorable Risk:Reward (>= {p_rr_min:.1f}:1)": rr_tp1 >= p_rr_min,
         }
 
-        # Status determination (gated strictly on ALL checklist conditions)
-        if all(checklist.values()):
-            status = "TRIGGERED"
-            trigger_note = f"All criteria verified: daily close ({price:.2f}) cleared resistance ({res20:.2f}) with {volume/vol_ma:.1f}x volume, RS leadership, tight base, and R:R {rr_tp1}:1."
-        elif not c_market_gate:
-            status = "WATCHING"
-            trigger_note = f"Disqualified from TRIGGERED: Broad market in correction ({regime_name}). Long breakouts suppressed to preserve cash."
-        elif not c_rs_leader:
-            status = "WATCHING"
-            trigger_note = "Disqualified from TRIGGERED: Stock is lagging behind KSE-100 index (lack of institutional sponsorship)."
-        elif not c_squeeze:
-            status = "WATCHING"
-            trigger_note = "Disqualified from TRIGGERED: Volatility is loose/erratic. Setup requires tight volatility compression base before breakout."
-        elif not c_true_ohlc:
-            status = "WATCHING"
-            trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and resistance levels cannot be reliably calculated."
-        elif not (rr_tp1 >= 1.2):
-            status = "WATCHING"
-            trigger_note = f"Price cleared resistance, but disqualified: Risk:Reward ({rr_tp1}:1) is below 1.2:1 minimum threshold."
-        elif not c_rsi_healthy:
-            status = "WATCHING"
-            trigger_note = f"Price cleared resistance, but disqualified: RSI ({rsi:.1f}) is outside healthy range (42 - 68)."
-        elif c_breakout_level and not c_volume_surge:
-            status = "WATCHING"
-            trigger_note = f"Price cleared resistance ({res20:.2f}), but volume ({volume/vol_ma:.1f}x MA) requires confirmation."
-        elif not c_liquidity:
-            status = "WATCHING"
-            trigger_note = f"Approaching resistance ({res20:.2f}), but average liquidity ({vol_ma:.0f} shares) is below 80k threshold."
-        else:
-            status = "WATCHING"
-            trigger_note = f"Approaching 20-day resistance ({res20:.2f}). Waiting for close breakout with volume."
+        # --- Tiered model (signal v2): hard risk gates + scored evidence ---
+        # Hard gates are tradability/risk vetoes only. Everything else is
+        # evidence that moves the 0-100 conviction score, so a stock that is
+        # 8/11 - rather than 11/11 - is still surfaced as BUY ZONE / WATCH
+        # with an explicit trigger price instead of being silently withheld.
+        hard_gates = {
+            "Verified intraday OHLC": c_true_ohlc,
+            "20-day liquidity >= 80k shares": c_liquidity,
+            f"Reward:Risk >= {p_min_rr_tp1:.1f}:1 to TP1": rr_tp1 >= p_min_rr_tp1,
+            "Stop distance within 0.4-12% of price": 0.4 <= (risk / entry_max * 100) <= 12.0,
+            "RSI not overbought (<= 80)": rsi <= 80.0,
+        }
+        blockers = [f"failed gate: {msg}" for msg, passed in hard_gates.items() if not passed]
+
+        evidence = {
+            "Trend Alignment (Price > 20 EMA > 50 EMA)": (c_trend, 20),
+            **({} if benchmark_stale else {"Relative Strength Leader (vs KSE-100)": (c_rs_leader, 15)}),
+            "Volume Surge": (c_volume_surge, 15),
+            "Momentum Health (MACD Expanding)": (c_macd_turn, 15),
+            "Healthy RSI": (c_rsi_healthy, 10),
+            "Volatility Compression (Tight Base)": (c_squeeze, 10),
+            "Within 1 ATR of the Breakout Level": (abs(res20 - price) <= atr, 10),
+            "Bullish Close": (price >= open_price, 5),
+        }
+        score = _score_evidence(evidence)
+        grade = _grade_for(score, rr_tp1)
+        trigger_met = c_breakout_level and c_volume_surge
+        in_zone = (-0.015 <= dist_to_res <= 0.03)
+        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=c_market_gate)
+        entry_trigger = round(res20 * 1.005, 2)
+        trigger_condition = f"daily close above {entry_trigger:.2f} on volume >= {p_vol_mult:.2f}x the 50-day average"
+        status = "TRIGGERED" if state == "BUY_NOW" else "WATCHING"
+        trigger_note = _state_note(state, blockers, score, grade, trigger_condition, (
+            f"Breakout confirmed: close {price:.2f} cleared {res20:.2f} on {volume / vol_ma:.1f}x volume "
+            f"with R:R {rr_tp1}:1 (grade {grade})."
+        ))
+        if not c_market_gate and not blockers:
+            trigger_note = f"Macro gate: KSE-100 regime is {regime_name}. Long breakouts suppressed until the index reclaims its 50 EMA."
 
         return {
             "strategy": strategy,
@@ -402,17 +485,35 @@ def evaluate_bar_strategy(
             "has_true_ohlc": c_true_ohlc,
             "is_rs_leader": c_rs_leader,
             "is_squeeze": c_squeeze,
+            "signal_version": SIGNAL_VERSION,
+            "state": state,
+            "score": score,
+            "grade": grade,
+            "entry_trigger": entry_trigger,
+            "trigger_condition": trigger_condition,
+            "blockers": blockers,
+            "hard_gates": hard_gates,
+            "evidence": {k: {"passed": v[0], "weight": v[1]} for k, v in evidence.items()},
             "mode": mode,
         }
 
-    # --- STRATEGY 2: Pullback to 20 EMA / Support ---
+    # --- STRATEGY 2: Pullback to the 20 EMA (shallow) or the 50 EMA (deep) ---
+    # Shallow: uptrend intact, price tags the 20 EMA. Deep: long-term uptrend
+    # intact, price retraces into the 50 EMA. Without the deep variant, "buy the
+    # dip" can never fire while the broad market sits below its 50-day average.
     dist_to_ema20 = (price - ema20) / ema20
-    is_in_pullback_zone = price > ema50 and (-0.02 <= dist_to_ema20 <= 0.02)
+    dist_to_ema50 = (price - ema50) / ema50
+    is_ema20_pullback = price > ema50 and (-0.02 <= dist_to_ema20 <= 0.02)
+    is_ema50_pullback = price > ema200 and (-0.03 <= dist_to_ema50 <= 0.03)
+    is_in_pullback_zone = is_ema20_pullback or is_ema50_pullback
     if is_in_pullback_zone and rsi < p_pb_rsi_max and not is_oversold:
         strategy = "PULLBACK"
-        entry_min = round(min(ema20 - 0.2 * atr, price * 0.99), 2)
-        entry_max = round(max(price, ema20 + 0.2 * atr), 2)
-        invalidation = round(min(ema20 - stop_atr_mult * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(ema20 - stop_atr_mult * atr, 2)
+        support_ref = ema20 if is_ema20_pullback else ema50
+        support_label = "20 EMA" if is_ema20_pullback else "50 EMA"
+        dist_to_support = dist_to_ema20 if is_ema20_pullback else dist_to_ema50
+        entry_min = round(min(support_ref - 0.2 * atr, price * 0.99), 2)
+        entry_max = round(max(price, support_ref + 0.2 * atr), 2)
+        invalidation = round(min(support_ref - stop_atr_mult * atr, ema50 * 0.98), 2) if ema50 * 0.98 < entry_max else round(support_ref - stop_atr_mult * atr, 2)
         risk = max(entry_max - invalidation, 0.01)
         tp1 = round(entry_max + max(tp1_risk_mult * risk, tp1_atr_mult * atr), 2)
         tp2 = round(entry_max + max(tp2_risk_mult * risk, tp2_atr_mult * atr), 2)
@@ -426,7 +527,7 @@ def evaluate_bar_strategy(
             "Relative Strength Leader (vs KSE-100)": c_rs_leader,
             "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
             "Macro Trend Intact (Price > 50 EMA)": price > ema50,
-            "Testing 20 EMA Support Zone": True,
+            f"Testing {support_label} Support Zone": True,
             "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
             f"Cooling RSI (< {p_pb_rsi_max:.0f}, Not Overbought)": rsi < p_pb_rsi_max,
             "Bounce Confirmation (Bullish Close)": c_bounce_candle,
@@ -434,31 +535,43 @@ def evaluate_bar_strategy(
             f"Favorable Risk:Reward (>= {p_rr_min:.1f}:1)": rr_tp1 >= p_rr_min,
         }
 
-        # Status determination (gated strictly on ALL checklist conditions)
-        if all(checklist.values()):
-            status = "TRIGGERED"
-            trigger_note = f"All criteria verified: bullish bounce at 20 EMA ({ema20:.2f}) with RS leadership, stabilizing MACD, and R:R {rr_tp1}:1."
-        elif not c_market_gate:
-            status = "WATCHING"
-            trigger_note = f"Disqualified from TRIGGERED: Broad market in correction ({regime_name}). Long pullbacks suppressed to preserve cash."
-        elif not c_rs_leader:
-            status = "WATCHING"
-            trigger_note = "Disqualified from TRIGGERED: Stock is lagging behind KSE-100 index."
-        elif not c_true_ohlc:
-            status = "WATCHING"
-            trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. ATR and stop-loss distance cannot be reliably calculated."
-        elif not (rr_tp1 >= p_rr_min):
-            status = "WATCHING"
-            trigger_note = f"Support bounce detected, but disqualified: Risk:Reward ({rr_tp1}:1) is below {p_rr_min:.1f}:1 minimum threshold."
-        elif not (rsi < p_pb_rsi_max):
-            status = "WATCHING"
-            trigger_note = f"Testing support, but RSI ({rsi:.1f}) is elevated (> {p_pb_rsi_max:.0f})."
-        elif not c_liquidity:
-            status = "WATCHING"
-            trigger_note = f"Testing 20 EMA support, but liquidity ({vol_ma:.0f} shares) is below 80k threshold."
-        else:
-            status = "WATCHING"
-            trigger_note = f"Testing 20 EMA support ({ema20:.2f}). Waiting for bullish reversal confirmation."
+        # --- Tiered model (signal v2) for "buy the dip" swing entries ---
+        # A pullback no longer has to also be a breakout, an RS leader, a MACD
+        # turn and a green candle on the same session. Trend structure and the
+        # other confirmations are scored; only risk/tradability can veto.
+        hard_gates = {
+            "Verified intraday OHLC": c_true_ohlc,
+            "20-day liquidity >= 80k shares": c_liquidity,
+            f"Reward:Risk >= {p_min_rr_tp1:.1f}:1 to TP1": rr_tp1 >= p_min_rr_tp1,
+            "Stop distance within 0.4-12% of price": 0.4 <= (risk / entry_max * 100) <= 12.0,
+            "RSI not overbought (<= 80)": rsi <= 80.0,
+        }
+        blockers = [f"failed gate: {msg}" for msg, passed in hard_gates.items() if not passed]
+
+        evidence = {
+            "Macro Trend Intact (Price > 50 EMA)": (price > ema50, 20),
+            "Long-Term Uptrend (Price > 200 EMA)": (price > ema200, 10),
+            **({} if benchmark_stale else {"Relative Strength Leader (vs KSE-100)": (c_rs_leader, 15)}),
+            "Volume Support": (volume >= 1.0 * vol_ma, 10),
+            "MACD Momentum Stabilization": (c_macd_turn, 15),
+            f"Cooling RSI (< {p_pb_rsi_max:.0f})": (rsi < p_pb_rsi_max, 10),
+            "Bounce Confirmation (Bullish Close)": (c_bounce_candle, 10),
+            "Reward:Risk >= 2:1": (rr_tp1 >= 2.0, 10),
+        }
+        score = _score_evidence(evidence)
+        grade = _grade_for(score, rr_tp1)
+        trigger_met = c_bounce_candle and rsi < p_pb_rsi_max and price > support_ref * 0.995
+        in_zone = abs(dist_to_support) <= 0.03
+        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=c_market_gate)
+        entry_trigger = round(max(price, support_ref), 2)
+        trigger_condition = f"daily close back above {entry_trigger:.2f} (the {support_label}) holding the trend"
+        status = "TRIGGERED" if state == "BUY_NOW" else "WATCHING"
+        trigger_note = _state_note(state, blockers, score, grade, trigger_condition, (
+            f"Pullback entry confirmed: bullish close at the {support_label} ({support_ref:.2f}) "
+            f"with trend structure intact and R:R {rr_tp1}:1 (grade {grade})."
+        ))
+        if not c_market_gate and not blockers:
+            trigger_note = f"Macro gate: KSE-100 regime is {regime_name}. Long pullbacks suppressed until the index reclaims its 50 EMA."
 
         return {
             "strategy": strategy,
@@ -487,6 +600,15 @@ def evaluate_bar_strategy(
             "has_true_ohlc": c_true_ohlc,
             "is_rs_leader": c_rs_leader,
             "is_squeeze": c_squeeze,
+            "signal_version": SIGNAL_VERSION,
+            "state": state,
+            "score": score,
+            "grade": grade,
+            "entry_trigger": entry_trigger,
+            "trigger_condition": trigger_condition,
+            "blockers": blockers,
+            "hard_gates": hard_gates,
+            "evidence": {k: {"passed": v[0], "weight": v[1]} for k, v in evidence.items()},
             "mode": mode,
         }
 
@@ -550,34 +672,56 @@ def evaluate_bar_strategy(
             "Momentum Stabilization (RSI / MACD Curl)": c_momentum_turn,
             "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
             "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
-            "Favorable Mean-Reversion Potential (R:R >= 0.8:1 TP1 or >= 1.5:1 TP2)": (rr_tp1 >= 0.80 or rr_tp2 >= 1.50),
+            f"Favorable Mean-Reversion Potential (R:R >= 1.0:1 TP1 and >= {p_min_rr_tp2:.1f}:1 TP2)": (rr_tp1 >= 1.0 and rr_tp2 >= p_min_rr_tp2),
         }
 
-        if all(checklist.values()):
-            status = "TRIGGERED"
-            macro_desc = "bull-market dip" if is_market_bullish else "counter-trend relief bounce"
-            trigger_note = f"All criteria verified: oversold {macro_desc} (RSI {rsi:.1f}) off support ({pivot_s1:.2f}) with reversal candle, curling momentum, and R:R {rr_tp1}:1 to TP1 ({tp1:.2f})."
-        elif not c_mr_macro:
-            status = "WATCHING"
-            trigger_note = f"Disqualified from TRIGGERED: Strategy B configured for correction_only mode, but KSE-100 is in {regime_name}."
-        elif not c_true_ohlc:
-            status = "WATCHING"
-            trigger_note = "Disqualified from TRIGGERED: Data source lacks verified intraday High/Low wicks. Support levels cannot be reliably calculated."
-        elif not c_liquidity:
-            status = "WATCHING"
-            trigger_note = f"Oversold near support, but 20-day liquidity ({vol_ma:.0f} shares) is below 80k threshold."
-        elif not c_bounce_candle:
-            status = "WATCHING"
-            trigger_note = f"Oversold near support (RSI {rsi:.1f}), but waiting for green close or lower-wick absorption candle."
-        elif not c_momentum_turn:
-            status = "WATCHING"
-            trigger_note = f"Oversold near support (RSI {rsi:.1f}), but momentum has not yet curled upward."
-        elif not (rr_tp1 >= 0.80 or rr_tp2 >= 1.50):
-            status = "WATCHING"
-            trigger_note = f"Oversold bounce detected, but Risk:Reward ({rr_tp1}:1 to TP1, {rr_tp2}:1 to TP2) is below threshold."
-        else:
-            status = "WATCHING"
-            trigger_note = f"Oversold setup developing near support ({pivot_s1:.2f}). Waiting for confirmation."
+        # --- Tiered model (signal v2) for the tactical mean-reversion track ---
+        # A relief bounce is judged on conviction, not on a perfect 8/8 day. The
+        # risk gates below are what protect capital; the rest is scored so a
+        # "one confirmation away" setup still reaches the trader as BUY ZONE
+        # with the exact candle/level it needs.
+        hard_gates = {
+            "Verified intraday OHLC": c_true_ohlc,
+            "20-day liquidity >= 80k shares": c_liquidity,
+            f"Reward:Risk >= {p_min_rr_tp2:.1f}:1 to TP2": rr_tp2 >= p_min_rr_tp2,
+            "First-target payoff >= 1.0:1": rr_tp1 >= 1.0,
+            "Stop distance within 0.4-12% of price": 0.4 <= (risk / entry_max * 100) <= 12.0,
+            "Strategy B regime condition satisfied": c_mr_macro,
+        }
+        blockers = [f"failed gate: {msg}" for msg, passed in hard_gates.items() if not passed]
+
+        evidence = {
+            f"Oversold Momentum (RSI <= {p_oversold_rsi_max:.0f} or Lower BB)": (is_oversold, 15),
+            "Classical Support Confluence (S1/S2/20-Low)": (is_near_support, 15),
+            "Intraday Reversal / Bounce Confirmation": (c_bounce_candle, 15),
+            "Momentum Stabilization (RSI / MACD Curl)": (c_momentum_turn, 15),
+            **({} if benchmark_stale else {"Relative Strength Leader (vs KSE-100)": (c_rs_leader, 10)}),
+            "Volume Support": (volume >= 1.0 * vol_ma, 10),
+            "Reward:Risk >= 2:1 to TP2": (rr_tp2 >= 2.0, 10),
+            "First-Target Payoff >= 1.5:1": (rr_tp1 >= 1.5, 10),
+            "Counter-Trend Context (Market in Correction)": (not is_market_bullish, 10),
+        }
+        score = _score_evidence(evidence)
+        grade = _grade_for(score, rr_tp1)
+        # A tactical relief bounce only earns BUY NOW with a real first-target
+        # payoff: 1.25:1 scalp geometry stays in the buy zone instead.
+        trigger_met = c_bounce_candle and c_momentum_turn and rr_tp1 >= 1.5
+        in_zone = is_near_support
+        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=True)
+        entry_trigger = round(max(open_price, price) * 1.005, 2)
+        confirmation_txt = "a green close or lower-wick absorption candle above the prior day's low"
+        trigger_condition = f"{confirmation_txt} (confirm at/above {entry_trigger:.2f})"
+        status = "TRIGGERED" if state == "BUY_NOW" else "WATCHING"
+        trigger_note = _state_note(state, blockers, score, grade, trigger_condition, (
+            f"Oversold {('bull-market dip' if is_market_bullish else 'counter-trend bounce')} "
+            f"(RSI {rsi:.1f}) off support {pivot_s1:.2f} with a reversal candle and curling momentum; "
+            f"R:R {rr_tp1}:1 to TP1, {rr_tp2}:1 to TP2 (grade {grade})."
+        ))
+        if p_mr_regime == "correction_only" and not c_mr_macro:
+            trigger_note = (
+                f"Strategy B is configured for correction_only mode, but KSE-100 is in {regime_name}. "
+                "Mean-reversion bounces are suppressed."
+            )
 
         return {
             "strategy": strategy,
@@ -605,6 +749,15 @@ def evaluate_bar_strategy(
             "has_true_ohlc": c_true_ohlc,
             "is_rs_leader": c_rs_leader,
             "is_squeeze": c_squeeze,
+            "signal_version": SIGNAL_VERSION,
+            "state": state,
+            "score": score,
+            "grade": grade,
+            "entry_trigger": entry_trigger,
+            "trigger_condition": trigger_condition,
+            "blockers": blockers,
+            "hard_gates": hard_gates,
+            "evidence": {k: {"passed": v[0], "weight": v[1]} for k, v in evidence.items()},
             "mode": mode,
             "trailing_ema_period": p_trailing_ema,
             "pivot": round(pivot, 2),
@@ -621,6 +774,14 @@ def evaluate_bar_strategy(
         "exit_mode": "none",
         "time_stop_bars": 0,
         "status": "NEUTRAL",
+        "signal_version": SIGNAL_VERSION,
+        "state": "WATCH",
+        "score": 0,
+        "grade": "D",
+        "entry_trigger": None,
+        "trigger_condition": "No qualifying setup.",
+        "blockers": ["no qualifying setup"],
+        "evidence": {},
         "date": date_str,
         "price": price,
         "trigger_note": "Consolidating / Choppy. No high-probability breakout or pullback setup.",
@@ -685,13 +846,18 @@ def generate_signal(
 
     # Strict Session Freshness Guard:
     # If today's market has already closed, but the feed is still on the previous session,
-    # prevent triggering fresh entry alerts on stale data.
-    if not setup["is_settled"] and setup.get("status") == "TRIGGERED":
-        setup["status"] = "WATCHING"
-        setup["trigger_note"] = (
-            f"Setup matched on {setup['last_date']} close, but today's EOD bar ({setup['expected_date']}) "
-            f"is pending exchange settlement. Order execution paused pending latest bar."
-        )
+    # prevent triggering fresh entry alerts on stale data. A BUY NOW is demoted to
+    # BUY ZONE (levels stay visible, execution is paused) rather than disappearing.
+    if not setup["is_settled"]:
+        if setup.get("state") == "BUY_NOW":
+            setup["state"] = "BUY_ZONE"
+        if setup.get("status") == "TRIGGERED":
+            setup["status"] = "WATCHING"
+        if setup.get("state") in ("BUY_NOW", "BUY_ZONE"):
+            setup["trigger_note"] = (
+                f"Setup matched on {setup['last_date']} close, but today's EOD bar ({setup['expected_date']}) "
+                f"is pending exchange settlement. Levels shown; execution paused until the latest bar lands."
+            )
 
     return setup
 
@@ -735,10 +901,40 @@ def format_actionable_card(setup: dict, company_name: str = "", mode: str = None
     def esc(text: str) -> str:
         return html.escape(str(text), quote=False)
 
+    # --- Tiered signal presentation (v2) ---
+    state = setup.get("state")
+    score = setup.get("score")
+    grade = setup.get("grade")
+    entry_trigger = setup.get("entry_trigger")
+    trigger_condition = setup.get("trigger_condition") or ""
+    blockers = setup.get("blockers") or []
+
+    if state:
+        state_display = {
+            "BUY_NOW": ("🟢", "BUY NOW"),
+            "BUY_ZONE": ("🟡", "BUY ZONE — awaiting confirmation"),
+            "WATCH": ("⚪", "WATCH"),
+            "AVOID": ("⛔", "NOT TRADEABLE"),
+        }.get(state, ("⚪", state))
+        badge_emoji, status_label = state_display[0], state_display[1]
+
     checklist = setup.get("checklist", {})
-    checklist_lines = "\n".join([
+    evidence = setup.get("evidence") or {}
+    hard_gates = setup.get("hard_gates") or {}
+    evidence_lines = []
+    for label, meta in evidence.items():
+        passed = bool((meta or {}).get("passed"))
+        weight = (meta or {}).get("weight") or 0
+        mark = "[✓]" if passed else "[✗]"
+        evidence_lines.append(f"   {mark} {esc(label)}  <i>(+{weight})</i>")
+    gate_lines = []
+    for label, passed in hard_gates.items():
+        mark = "[✓]" if passed else "[✗]"
+        gate_lines.append(f"   {mark} {esc(label)}")
+    checklist_lines = "\n".join(evidence_lines) if evidence_lines else "\n".join(
         f"   {'[✓]' if passed else '[✗]'} {esc(k)}" for k, passed in checklist.items()
-    ])
+    )
+    gate_block = "\n".join(gate_lines)
 
     trigger_note = esc(setup.get('trigger_note', ''))
     source_esc = esc(source)
@@ -768,6 +964,19 @@ def format_actionable_card(setup: dict, company_name: str = "", mode: str = None
     track = setup.get("track", "swing" if strategy in ["BREAKOUT", "PULLBACK"] else "tactical")
     track_badge = "SWING TRACK" if track == "swing" else "TACTICAL TRACK"
 
+    # Conviction + the exact price at which this becomes a buy
+    signal_line = ""
+    if state and score is not None:
+        signal_line = f"🎚 <b>Conviction:</b> grade {grade} ({score}/100)\n"
+
+    trigger_line = ""
+    if state == "BUY_NOW":
+        trigger_line = "✅ <b>Trigger:</b> MET — setup is confirmed for entry\n"
+    elif state == "BUY_ZONE" and entry_trigger:
+        trigger_line = f"🔔 <b>Buy Trigger:</b> {esc(trigger_condition)}\n"
+    elif state == "AVOID":
+        trigger_line = f"⛔ <b>Blocked by:</b> {esc('; '.join(blockers))}\n"
+
     card = (
         f"{badge_emoji} <b>${sym} — {status_label}</b>\n"
         f"🏢 {company_esc}\n"
@@ -775,14 +984,17 @@ def format_actionable_card(setup: dict, company_name: str = "", mode: str = None
         f"📅 <b>Data:</b> {last_date} Close ({source_esc}) | Age: {age}d\n"
         f"🎯 <b>Strategy:</b> {strategy.title()} Setup | <b>{track_badge}</b>\n"
         f"⚙️ <b>Mode:</b> {cfg['name']} ({mode_detail})\n"
-        f"📍 <b>Trigger Condition:</b> {trigger_note}\n"
+        f"{signal_line}"
+        f"{trigger_line}"
+        f"📍 <b>Reasoning:</b> {trigger_note}\n"
         f"💰 <b>Current Price:</b> {price:.2f} PKR\n"
         f"🛒 <b>Planned Entry:</b> {setup.get('entry_min', 0):.2f} – {setup.get('entry_max', 0):.2f} PKR\n"
         f"🛑 <b>Invalidation / SL:</b> {setup.get('stop_loss', 0):.2f} PKR (Risk: -{setup.get('risk_pct', 0)}%)\n"
         f"🎯 <b>Targets:</b> TP1: {setup.get('tp1', 0):.2f} PKR | TP2: {setup.get('tp2', 0):.2f} PKR\n"
         f"📈 <b>Exit Model:</b> {exit_model_str}\n"
         f"⚖️ <b>Reward:Risk:</b> {setup.get('rr_tp1', 0)}:1 (to TP1) | {setup.get('rr_tp2', 0)}:1 (to TP2)\n"
-        f"📋 <b>Condition Checklist:</b>\n{checklist_lines}\n"
-        f"⚡ <b>Status:</b> <b>{status}</b>\n"
+        f"{'🛡 <b>Risk Gates:</b>' + chr(10) + gate_block + chr(10) if gate_block else ''}"
+        f"📋 <b>Evidence (weighted):</b>\n{checklist_lines}\n"
+        f"⚡ <b>Status:</b> <b>{status}</b> | <b>{state or 'n/a'}</b>\n"
     )
     return card

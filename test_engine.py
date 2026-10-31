@@ -128,19 +128,30 @@ def test_strategy_and_checklist(df):
     for rule, passed in setup["checklist"].items():
         assert isinstance(passed, (bool, np.bool_)), f"Rule '{rule}' must be boolean"
 
-    # CRITICAL: Verify TRIGGERED is strictly gated on 100% checklist pass
-    if setup["status"] == "TRIGGERED":
-        assert all(setup["checklist"].values()), "TRIGGERED status must have 100% checklist pass rate"
-    else:
-        # If any checklist item is False, status cannot be TRIGGERED
-        if not all(setup["checklist"].values()):
-            assert setup["status"] != "TRIGGERED", "Status cannot be TRIGGERED when checklist items fail"
+    # CRITICAL: BUY NOW (TRIGGERED) must satisfy the tiered model's guarantees:
+    # no hard-gate blocker, the entry trigger met, and conviction >= the buy floor.
+    assert setup.get("state") in ("BUY_NOW", "BUY_ZONE", "WATCH", "AVOID")
+    assert isinstance(setup.get("score"), int) and 0 <= setup["score"] <= 100
+    assert setup.get("grade") in ("A", "B", "C", "D")
+    if setup["state"] == "BUY_NOW":
+        assert setup["status"] == "TRIGGERED"
+        assert not setup["blockers"], "BUY NOW cannot carry a hard-gate blocker"
+        assert setup["score"] >= 80, "BUY NOW requires conviction >= 80"
+    if setup["state"] == "BUY_ZONE":
+        assert setup["status"] == "WATCHING"
+        assert not setup["blockers"], "BUY ZONE cannot carry a hard-gate blocker"
+        assert setup["score"] >= 60, "BUY ZONE requires conviction >= 60"
+    if setup["blockers"]:
+        assert setup["state"] == "AVOID", "A failed hard gate must resolve to AVOID"
+    if setup["state"] == "AVOID":
+        assert setup["status"] != "TRIGGERED"
 
-    # Verify user's edge case: Pinned RSI=100 must be rejected from TRIGGERED
+    # Verify user's edge case: Pinned RSI=100 must be rejected from BUY NOW
     df_pinned = df_ind.copy()
     df_pinned.loc[df_pinned.index[-1], "RSI"] = 100.0
     setup_pinned = evaluate_bar_strategy(df_pinned, bar_idx=-1)
-    assert setup_pinned["status"] != "TRIGGERED", "Setup with RSI=100 must NOT be TRIGGERED"
+    assert setup_pinned["state"] != "BUY_NOW", "Setup with RSI=100 must NOT be BUY NOW"
+    assert setup_pinned["status"] != "TRIGGERED"
 
     # Test actionable card formatting & HTML escaping
     card = format_actionable_card(setup, company_name="Test Company")
@@ -766,26 +777,48 @@ def test_mean_reversion_strategy():
     setup = evaluate_bar_strategy(df_mr, bar_idx=-1, has_true_ohlc=True)
     assert setup["strategy"] == "MEAN_REVERSION", f"Expected MEAN_REVERSION, got {setup.get('strategy')}"
     assert "checklist" in setup
-    assert setup["status"] == "TRIGGERED", f"Expected TRIGGERED, got {setup['status']} (note: {setup.get('trigger_note')})"
-    assert setup["checklist"][list(setup["checklist"].keys())[0]] is True
+    # With the default pivot geometry the first target sits under 1R, so the tiered
+    # model must refuse the trade outright instead of issuing a buy.
+    assert setup["state"] == "AVOID", f"Thin first target must be AVOID, got {setup['state']}"
+    assert any("First-target payoff" in b for b in setup["blockers"])
 
-    # 3. Actionable card verification
-    card = format_actionable_card(setup, company_name="Test Mean Reversion Co")
+    # 2b. Same reversal candle, but with a realistic target geometry -> BUY NOW.
+    def _mr_fixture(mult: float):
+        d = df_mr.copy()
+        base = s1_level * 1.010
+        d.loc[d.index[probe_idx], "Pivot"] = base * mult
+        d.loc[d.index[probe_idx], "Pivot_R1"] = base * mult * 1.03
+        d.loc[d.index[probe_idx], "Pivot_R2"] = base * mult * 1.06
+        d.loc[d.index[probe_idx], "EMA_20"] = base * mult * 1.05
+        return d
+
+    df_wide = _mr_fixture(1.10)
+    setup_wide = evaluate_bar_strategy(df_wide, bar_idx=-1, has_true_ohlc=True)
+    assert setup_wide["state"] == "BUY_NOW", f"Expected BUY_NOW, got {setup_wide['state']}"
+    assert setup_wide["status"] == "TRIGGERED"
+    assert setup_wide["score"] >= 80 and setup_wide["grade"] == "A"
+    assert setup_wide["rr_tp1"] >= 1.5
+    assert setup_wide["entry_trigger"] and setup_wide["trigger_condition"]
+
+    # 3. Actionable card verification (state, conviction and trigger are explicit)
+    card = format_actionable_card(setup_wide, company_name="Test Mean Reversion Co")
     assert "Mean_Reversion" in card or "Mean-Reversion" in card
-    assert "2-Day Time Stop" in card or "Time Stop" in card
+    assert "Time Stop" in card
+    assert "BUY NOW" in card and "Conviction" in card
+    assert "Trigger:" in card
 
     # 4. Transparent Macro Context verification in both regimes (default "all" mode)
-    setup_bull = evaluate_bar_strategy(df_mr, bar_idx=-1, market_regime={"is_bullish": True, "regime": "BULL_MARKET"})
+    setup_bull = evaluate_bar_strategy(df_wide, bar_idx=-1, market_regime={"is_bullish": True, "regime": "BULL_MARKET"})
     assert setup_bull["status"] == "TRIGGERED"
     assert any("BULL_MARKET" in k for k in setup_bull["checklist"].keys()), "Bull market regime must be transparently tagged"
 
-    setup_bear = evaluate_bar_strategy(df_mr, bar_idx=-1, market_regime={"is_bullish": False, "regime": "MARKET_CORRECTION"})
+    setup_bear = evaluate_bar_strategy(df_wide, bar_idx=-1, market_regime={"is_bullish": False, "regime": "MARKET_CORRECTION"})
     assert setup_bear["status"] == "TRIGGERED"
     assert any("MARKET_CORRECTION" in k for k in setup_bear["checklist"].keys()), "Correction regime must be transparently tagged"
 
     # 5. Configurable "correction_only" mode verification
     setup_corr_bull = evaluate_bar_strategy(
-        df_mr,
+        df_wide,
         bar_idx=-1,
         market_regime={"is_bullish": True, "regime": "BULL_MARKET"},
         params={"mean_rev_regime": "correction_only"},
@@ -794,7 +827,7 @@ def test_mean_reversion_strategy():
     assert "correction_only mode" in setup_corr_bull["trigger_note"]
 
     setup_corr_bear = evaluate_bar_strategy(
-        df_mr,
+        df_wide,
         bar_idx=-1,
         market_regime={"is_bullish": False, "regime": "MARKET_CORRECTION"},
         params={"mean_rev_regime": "correction_only"},
@@ -812,14 +845,15 @@ def test_mean_reversion_strategy():
     mr_stalled_3d = [t for _, t in bt_3d["trades_df"].iterrows() if "Mean Reversion 3-Day Limit" in str(t.get("outcome"))]
     assert len(mr_stalled_3d) >= 1, "Backtester must support 3-day buffer (72h)"
 
-    # 7. Red candle should disqualify from TRIGGERED to WATCHING
-    df_mr_red = df_mr.copy()
+    # 7. Red candle should disqualify from BUY NOW / TRIGGERED
+    df_mr_red = _mr_fixture(1.10)
     df_mr_red.loc[df_mr_red.index[probe_idx], "Close"] = s1_level * 0.994  # red close below open
     df_mr_red.loc[df_mr_red.index[probe_idx], "Open"] = s1_level * 1.010
     df_mr_red.loc[df_mr_red.index[probe_idx], "Low"] = s1_level * 0.993
     setup_red = evaluate_bar_strategy(df_mr_red, bar_idx=-1, has_true_ohlc=True)
     if setup_red["strategy"] == "MEAN_REVERSION":
         assert setup_red["status"] == "WATCHING", "Red candle without absorption must be WATCHING, not TRIGGERED"
+        assert setup_red["state"] != "BUY_NOW", "Red candle without absorption cannot be BUY NOW"
 
     print("  ✓ Mean-Reversion / Oversold Rebound Model passed (Pivots, Macro Context Gating, Reversal Candle & Card).")
 
@@ -1030,6 +1064,76 @@ def test_swing_tactical_two_track_segregation():
     print("  ✓ Swing Track vs. Tactical Track segregation passed (Filters, metadata, cards & ledger isolation).")
 
 
+def test_tiered_signal_model():
+    print("24. Testing tiered signal model (hard gates, scoring, buy-zone upgrades)...")
+    from signal_engine import _score_evidence, _grade_for, _resolve_state
+
+    # 1. Weighted scoring is monotonic and normalised to 0-100
+    assert _score_evidence({"a": (True, 50), "b": (True, 50)}) == 100
+    assert _score_evidence({"a": (True, 50), "b": (False, 50)}) == 50
+    assert _score_evidence({"a": (False, 50), "b": (False, 50)}) == 0
+    assert _score_evidence({}) == 0
+
+    # 2. Grades follow the score bands, with an R:R cap of B below 1.5R
+    assert _grade_for(90) == "A"
+    assert _grade_for(70) == "B"
+    assert _grade_for(55) == "C"
+    assert _grade_for(30) == "D"
+    assert _grade_for(90, rr_tp1=1.2) == "B", "A-grade requires at least 1.5:1 to the first target"
+
+    # 3. State resolution: hard gates veto, zone vs trigger, macro suppression
+    assert _resolve_state(["bad data"], 95, True, True) == "AVOID"
+    assert _resolve_state([], 85, True, True) == "BUY_NOW"
+    assert _resolve_state([], 85, False, True) == "BUY_ZONE", "In-zone but unconfirmed must be BUY ZONE"
+    assert _resolve_state([], 55, False, True) == "WATCH", "Low conviction in zone is only WATCH"
+    assert _resolve_state([], 85, True, True, macro_ok=False) == "WATCH", "Macro gate suppresses buying"
+
+    # 4. A real ledger upgrade path must notify once per step: WATCH -> BUY_ZONE -> BUY_NOW
+    sym = "TESTTIER"
+    base_setup = {
+        "strategy": "BREAKOUT",
+        "track": "swing",
+        "status": "WATCHING",
+        "entry_min": 100.0,
+        "entry_max": 102.0,
+        "stop_loss": 95.0,
+        "tp1": 112.0,
+        "tp2": 120.0,
+        "trigger_note": "tier test",
+        "signal_version": "2.0",
+    }
+    with signal_tracker.get_connection() as conn:
+        conn.execute("DELETE FROM signal_events WHERE signal_id LIKE 'TESTTIER%'")
+        conn.execute("DELETE FROM signals WHERE symbol = ?", (sym,))
+        conn.commit()
+
+    watch_setup = dict(base_setup, state="WATCH", score=58, grade="C")
+    created, _ = signal_tracker.record_or_update_setup(watch_setup, sym)
+    assert created, "First observation must create the ledger row"
+
+    zone_setup = dict(base_setup, state="BUY_ZONE", score=72, grade="B", entry_trigger=103.0,
+                      trigger_condition="daily close above 103.00")
+    upgraded, msg = signal_tracker.record_or_update_setup(zone_setup, sym)
+    assert upgraded, f"WATCH -> BUY_ZONE must notify, got: {msg}"
+
+    again, msg = signal_tracker.record_or_update_setup(zone_setup, sym)
+    assert not again, f"Repeated BUY_ZONE must not re-alert, got: {msg}"
+
+    buy_setup = dict(base_setup, state="BUY_NOW", score=88, grade="A", status="TRIGGERED",
+                     entry_trigger=103.0, trigger_condition="daily close above 103.00")
+    upgraded, msg = signal_tracker.record_or_update_setup(buy_setup, sym)
+    assert upgraded, f"BUY_ZONE -> BUY_NOW must notify, got: {msg}"
+
+    with signal_tracker.get_connection() as conn:
+        row = conn.execute("SELECT state, grade, score FROM signals WHERE symbol = ? AND status IN ('WATCHING','TRIGGERED')", (sym,)).fetchone()
+        assert row["state"] == "BUY_NOW" and row["grade"] == "A" and row["score"] == 88
+        conn.execute("DELETE FROM signal_events WHERE signal_id LIKE 'TESTTIER%'")
+        conn.execute("DELETE FROM signals WHERE symbol = ?", (sym,))
+        conn.commit()
+
+    print("  ✓ Tiered model passed (gates, scoring, grades, BUY ZONE/BUY NOW transitions & ledger upgrades).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -1056,6 +1160,7 @@ if __name__ == "__main__":
     test_mean_reversion_strategy()
     test_session_freshness_guard()
     test_swing_tactical_two_track_segregation()
+    test_tiered_signal_model()
     print("=== All Verification Tests Passed Successfully! ===")
 
 

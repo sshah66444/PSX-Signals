@@ -99,6 +99,38 @@ Both live alerts and historical backtests use the **exact same deterministic str
   * `/performance` — View audited live ledger performance after costs.
   * `/watchlist` — List all 75 tracked PSX equities.
 
+### 9. Tiered Signal Model (v2): BUY NOW / BUY ZONE / WATCH
+
+Every setup is graded on **conviction** instead of being gated on an all-or-nothing checklist:
+
+| State | Meaning |
+|---|---|
+| 🟢 **BUY NOW** | Every hard risk gate passes, the entry trigger is met, conviction ≥ 80 |
+| 🟡 **BUY ZONE** | Price is inside the entry zone and every risk gate passes — the card prints the exact trigger price |
+| ⚪ **WATCH** | Setup forming; kept in the dashboard/ledger, not sent to Telegram |
+| ⛔ **AVOID** | A hard risk gate failed (approximated OHLC, thin liquidity, R:R below the mode minimum, absurd stop distance) |
+
+**Hard gates** (the only vetoes): verified intraday OHLC, 20-day liquidity ≥ 80k shares,
+reward:risk ≥ the mode minimum (swing 1.5:1; tactical 2:1 to TP2), stop distance between
+0.4% and 12% of price, RSI not overbought.
+
+**Evidence** (weighted, 0–100): trend alignment, relative strength, volume, MACD, RSI,
+volatility compression, proximity to the trigger, candle confirmation. Missing
+confirmations cost points — they do not veto. Relative strength is excluded from scoring
+while the KSE-100 benchmark feed is stale.
+
+**Entry archetypes** — all three can reach BUY NOW / BUY ZONE:
+
+* **Breakout** — close above the range high with volume.
+* **Pullback (shallow)** — uptrend intact, price tags the 20 EMA.
+* **Pullback (deep)** — long-term uptrend intact, price retraces into the 50 EMA.
+* **Mean reversal** — oversold at support with a reversal candle and ≥ 1.5:1 to TP1.
+
+Each card carries the conviction score, a grade (A requires ≥ 1.5:1 to the first target),
+the exact buy trigger, stop, targets and the full gate/evidence breakdown. Setups upgrade
+`WATCH → BUY ZONE → BUY NOW`, and each step notifies once. Backtests enter on both
+`BUY_NOW` and `BUY_ZONE` (`entry_states` parameter), matching what the bot tells you to do.
+
 ---
 
 ## 🛠️ Getting Started

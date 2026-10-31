@@ -4,6 +4,12 @@ Configuration file for swing trading parameters.
 Extends holding periods, widens targets, and adjusts indicators for multi-week positions.
 """
 
+# Scoring thresholds for the tiered signal model (shared by all modes)
+MIN_SCORE_BUY_NOW = 80     # hard gates + this score -> BUY NOW
+MIN_SCORE_BUY_ZONE = 60    # hard gates + in entry zone + this score -> BUY ZONE
+SIGNAL_VERSION = "2.0"
+STATE_RANK = {"WATCH": 1, "BUY_ZONE": 2, "BUY_NOW": 3}
+
 # Trading Mode Configuration
 TRADING_MODES = {
     "day_trade": {
@@ -27,6 +33,9 @@ TRADING_MODES = {
         "bb_period": 20,
         "squeeze_lookback": 60,
         "stop_atr_multiplier": 0.8,
+        "min_rr_tp1": 1.20,          # hard gate: reward:risk to the first target
+        "min_rr_tp2": 2.00,          # hard gate for mean-reversion: reward:risk to the second target
+        "entry_zone_atr": 1.0,       # how close (in ATRs) counts as being in the buy zone
         "mr_time_stop_bars": 2,
         "rsi_period": 14,
         "macd_fast": 12,
@@ -54,6 +63,9 @@ TRADING_MODES = {
         "bb_period": 50,
         "squeeze_lookback": 120,
         "stop_atr_multiplier": 1.2,
+        "min_rr_tp1": 1.50,          # hard gate: reward:risk to the first target
+        "min_rr_tp2": 2.00,          # hard gate for mean-reversion: reward:risk to the second target
+        "entry_zone_atr": 1.0,       # how close (in ATRs) counts as being in the buy zone
         "mr_time_stop_bars": 5,
         "rsi_period": 14,
         "macd_fast": 12,
@@ -81,6 +93,9 @@ TRADING_MODES = {
         "bb_period": 100,
         "squeeze_lookback": 200,
         "stop_atr_multiplier": 1.5,
+        "min_rr_tp1": 2.00,          # hard gate: reward:risk to the first target
+        "min_rr_tp2": 2.50,          # hard gate for mean-reversion: reward:risk to the second target
+        "entry_zone_atr": 1.0,       # how close (in ATRs) counts as being in the buy zone
         "mr_time_stop_bars": 10,
         "rsi_period": 14,
         "macd_fast": 12,

@@ -131,6 +131,20 @@ def run_bootstrap_simulation(
     }
 
 
+def _is_entry_state(setup: dict, entry_states: tuple) -> bool:
+    """
+    Decides whether a setup is an entry under the tiered signal model.
+
+    The bot tells the user to buy inside the zone (BUY_ZONE) and adds to a
+    confirmed trigger (BUY_NOW), so backtests must model both. Legacy payloads
+    without a 'state' fall back to the old TRIGGERED check.
+    """
+    state = setup.get("state")
+    if state is None:
+        return setup.get("status") == "TRIGGERED"
+    return state in entry_states
+
+
 def run_signal_backtest(
     df: pd.DataFrame,
     symbol: str,
@@ -144,6 +158,7 @@ def run_signal_backtest(
     strategy_params: dict = None,
     exit_mode: str = "trailing_ema",  # "trailing_ema" (default, lets winners run) or "fixed_tp" (legacy)
     mode: str = "swing_trade",
+    entry_states: tuple = ("BUY_NOW", "BUY_ZONE"),
 ) -> dict:
     """
     Backtests strategy performance bar-by-bar across historical data.
@@ -752,7 +767,7 @@ def run_signal_backtest(
                 params=strategy_params,
                 mode=mode,
             )
-            if setup.get("status") == "TRIGGERED":
+            if _is_entry_state(setup, entry_states):
                 if use_next_day_open:
                     pending_entry = {
                         "strategy": setup["strategy"],
@@ -1070,6 +1085,7 @@ def run_portfolio_backtest(
     time_stop_bars: int = 4,
     holding_max_bars: int = 30,
     strategy_params: dict = None,
+    entry_states: tuple = ("BUY_NOW", "BUY_ZONE"),
 ) -> dict:
     """
     Multi-symbol portfolio simulation with realistic account cash management,
@@ -1528,7 +1544,7 @@ def run_portfolio_backtest(
                 market_regime=hist_regime,
                 params=strategy_params,
             )
-            if setup.get("status") == "TRIGGERED":
+            if _is_entry_state(setup, entry_states):
                 pending_entries.append({
                     "symbol": sym,
                     "strategy": setup["strategy"],

@@ -10,6 +10,8 @@ import sqlite3
 import datetime
 import pandas as pd
 
+from swing_config import STATE_RANK
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "signals.db")
 
 
@@ -52,6 +54,21 @@ def init_db():
         columns = [col[1] for col in cursor.fetchall()]
         if "track" not in columns:
             cursor.execute("ALTER TABLE signals ADD COLUMN track TEXT DEFAULT 'swing'")
+
+        # Tiered-signal columns (signal v2). Added in place so existing ledgers
+        # keep their history and old rows simply read back as version 1.0.
+        tiered_columns = {
+            "signal_version": "TEXT DEFAULT '1.0'",
+            "state": "TEXT",
+            "score": "INTEGER",
+            "grade": "TEXT",
+            "entry_trigger": "REAL",
+            "trigger_condition": "TEXT",
+        }
+        for col_name, col_type in tiered_columns.items():
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+                columns.append(col_name)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS signal_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,25 +109,60 @@ def record_or_update_setup(setup: dict, symbol: str) -> tuple[bool, str]:
         )
         existing = cursor.fetchone()
 
+        new_state = setup.get("state") or ("BUY_NOW" if status == "TRIGGERED" else "WATCH")
+
         if existing:
-            # Check if status transitioned from WATCHING to TRIGGERED
-            old_status = existing["status"]
-            if old_status == "WATCHING" and status == "TRIGGERED":
+            # Tiered upgrades: WATCH -> BUY_ZONE -> BUY_NOW must each notify once,
+            # otherwise a setup that moves into the buy zone is never announced.
+            old_state = existing["state"] if "state" in existing.keys() else None
+            if not old_state:
+                old_state = "BUY_NOW" if existing["status"] == "TRIGGERED" else "WATCH"
+            old_rank = STATE_RANK.get(old_state, 0)
+            new_rank = STATE_RANK.get(new_state, 0)
+
+            if new_rank > old_rank:
+                new_status = "TRIGGERED" if new_state == "BUY_NOW" else "WATCHING"
                 cursor.execute(
                     """
-                    UPDATE signals 
-                    SET status = 'TRIGGERED', triggered_date = ?, notes = ?
+                    UPDATE signals
+                    SET status = ?, state = ?, score = ?, grade = ?, entry_trigger = ?,
+                        trigger_condition = ?, signal_version = ?,
+                        triggered_date = COALESCE(triggered_date, ?), notes = ?
                     WHERE id = ?
                     """,
-                    (today_str, setup.get("trigger_note", ""), existing["id"]),
+                    (
+                        new_status,
+                        new_state,
+                        setup.get("score"),
+                        setup.get("grade"),
+                        setup.get("entry_trigger"),
+                        setup.get("trigger_condition"),
+                        setup.get("signal_version"),
+                        today_str if new_state == "BUY_NOW" else None,
+                        setup.get("trigger_note", ""),
+                        existing["id"],
+                    ),
                 )
                 cursor.execute(
                     "INSERT INTO signal_events (signal_id, timestamp, event_type, details) VALUES (?, ?, ?, ?)",
-                    (existing["id"], now_ts, "TRIGGERED", f"Triggered: {setup.get('trigger_note')}"),
+                    (
+                        existing["id"],
+                        now_ts,
+                        new_state,
+                        f"{old_state} -> {new_state}: {setup.get('trigger_note')}",
+                    ),
                 )
                 conn.commit()
-                return True, f"Updated ${symbol} from WATCHING to TRIGGERED."
-            return False, f"Setup for ${symbol} already active ({old_status}). Levels unchanged."
+                return True, f"Upgraded ${symbol} from {old_state} to {new_state}."
+
+            # Refresh conviction on an active setup without re-alerting
+            if new_state == old_state:
+                cursor.execute(
+                    "UPDATE signals SET score = ?, grade = ? WHERE id = ?",
+                    (setup.get("score"), setup.get("grade"), existing["id"]),
+                )
+                conn.commit()
+            return False, f"Setup for ${symbol} already active ({old_state}). Levels unchanged."
 
         # New setup detected
         sig_id = f"{symbol}-{datetime.datetime.now().strftime('%Y%m%d%H%M')}-{strategy[:3]}"
@@ -121,8 +173,9 @@ def record_or_update_setup(setup: dict, symbol: str) -> tuple[bool, str]:
             """
             INSERT INTO signals (
                 id, symbol, strategy, track, status, created_date, triggered_date,
-                entry_min, entry_max, stop_loss, tp1, tp2, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entry_min, entry_max, stop_loss, tp1, tp2, notes,
+                signal_version, state, score, grade, entry_trigger, trigger_condition
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sig_id,
@@ -138,14 +191,20 @@ def record_or_update_setup(setup: dict, symbol: str) -> tuple[bool, str]:
                 setup.get("tp1"),
                 setup.get("tp2"),
                 setup.get("trigger_note"),
+                setup.get("signal_version"),
+                new_state,
+                setup.get("score"),
+                setup.get("grade"),
+                setup.get("entry_trigger"),
+                setup.get("trigger_condition"),
             ),
         )
         cursor.execute(
             "INSERT INTO signal_events (signal_id, timestamp, event_type, details) VALUES (?, ?, ?, ?)",
-            (sig_id, now_ts, "CREATED", f"Setup created ({status}): {setup.get('trigger_note')}"),
+            (sig_id, now_ts, "CREATED", f"Setup created ({new_state}): {setup.get('trigger_note')}"),
         )
         conn.commit()
-        return True, f"New setup recorded for ${symbol} ({status})."
+        return True, f"New setup recorded for ${symbol} ({new_state})."
 
 
 def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35) -> list[dict]:

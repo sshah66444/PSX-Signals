@@ -269,6 +269,9 @@ with tab2:
                     "Price (PKR)": sig["price"],
                     "Strategy": sig["strategy"],
                     "Status": sig["status"],
+                    "Signal": sig.get("state", ""),
+                    "Grade": sig.get("grade", ""),
+                    "Score": sig.get("score", 0),
                     "RS vs KSE-100": "🟢 Leader" if sig.get("is_rs_leader") else "🔴 Lagging",
                     "Volatility Base": "🟢 Tight Base" if sig.get("is_squeeze") else "⚪ Loose",
                     "Entry Range": f"{sig.get('entry_min', 0):.2f} – {sig.get('entry_max', 0):.2f}",
@@ -287,6 +290,9 @@ with tab2:
                 "Price (PKR)": "-",
                 "Strategy": "-",
                 "Status": "UNAVAILABLE",
+                "Signal": "",
+                "Grade": "",
+                "Score": 0,
                 "RS vs KSE-100": "-",
                 "Volatility Base": "-",
                 "Entry Range": "-",
@@ -306,31 +312,46 @@ with tab2:
         # Keep quote/level columns strictly numeric: unavailable symbols write "-"
         # into these fields, and the resulting object dtype makes Arrow serialization
         # fail on every rerun ("Could not convert '-' ... to double").
-        for num_col in ["Price (PKR)", "Stop Loss", "TP1", "RSI"]:
+        for num_col in ["Price (PKR)", "Stop Loss", "TP1", "RSI", "Score"]:
             if num_col in df_scan.columns:
                 df_scan[num_col] = pd.to_numeric(df_scan[num_col], errors="coerce")
 
         # Filters
-        c_filter1, c_filter2 = st.columns([1, 1])
+        c_filter1, c_filter2, c_filter3 = st.columns([1, 1, 1])
         with c_filter1:
+            state_filter = st.selectbox(
+                "Filter by Signal State:",
+                ["All", "BUY_NOW", "BUY_ZONE", "WATCH", "AVOID"]
+            )
+        with c_filter2:
             status_filter = st.selectbox(
                 "Filter by Setup Status:",
                 ["All", "TRIGGERED", "WATCHING", "NEUTRAL", "UNAVAILABLE"]
             )
-        with c_filter2:
+        with c_filter3:
             strategy_filter = st.selectbox(
                 "Filter by Strategy:",
                 ["All", "BREAKOUT", "PULLBACK", "MEAN_REVERSION", "NONE"]
             )
 
         df_filtered = df_scan.copy()
+        if state_filter != "All":
+            df_filtered = df_filtered[df_filtered["Signal"] == state_filter]
         if status_filter != "All":
             df_filtered = df_filtered[df_filtered["Status"] == status_filter]
         if strategy_filter != "All":
             df_filtered = df_filtered[df_filtered["Strategy"] == strategy_filter]
 
-        st.dataframe(df_filtered, use_container_width=True, hide_index=True)
-        st.caption(f"Showing {len(df_filtered)} of {len(df_scan)} PSX companies.")
+        st.dataframe(
+            df_filtered.sort_values("Score", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            f"Showing {len(df_filtered)} of {len(df_scan)} PSX companies. "
+            "Signal: BUY_NOW = actionable, BUY_ZONE = in the entry zone awaiting the trigger, "
+            "WATCH = forming, AVOID = failed a risk gate."
+        )
 
 # ----------------- TAB 3: RIGOROUS BACKTESTER -----------------
 with tab3:

@@ -236,12 +236,16 @@ def run_daily_market_cycle(
     # 4. Evaluate setups for new/updated triggers. Collected only, same reason.
     print("4. Evaluating setups across watchlist...")
     new_setup_cards = []
+    state_counts = {"BUY_NOW": 0, "BUY_ZONE": 0, "WATCH": 0, "AVOID": 0}
     for sym, m_info in market_data.items():
         df = m_info["df"]
         setup = generate_signal(sym, df, data_meta=m_info, df_kse=df_kse, market_regime=regime_info, mode=mode)
-        status = setup.get("status")
+        state = setup.get("state")
+        state_counts[state] = state_counts.get(state, 0) + 1
 
-        if status in ["TRIGGERED", "WATCHING"]:
+        # Only tradeable states are delivered. WATCH stays in the dashboard/ledger
+        # so the chat is not flooded with "still waiting" noise.
+        if state in ("BUY_NOW", "BUY_ZONE"):
             if dry_run:
                 # A dry run must never mutate the live ledger: otherwise the real
                 # scan that follows sees the setup as "already active" and stays
@@ -249,11 +253,17 @@ def run_daily_market_cycle(
                 is_new_or_updated = True
             else:
                 is_new_or_updated, note = record_or_update_setup(setup, sym)
-            # Only send card if this is a newly detected setup or transitioned to TRIGGERED
             if is_new_or_updated:
                 comp_name = watchlist.get(sym, {}).get("name", sym)
                 card = format_actionable_card(setup, company_name=comp_name, mode=mode)
                 new_setup_cards.append(card)
+    print(
+        "   Signal states: "
+        f"BUY_NOW={state_counts.get('BUY_NOW', 0)} "
+        f"BUY_ZONE={state_counts.get('BUY_ZONE', 0)} "
+        f"WATCH={state_counts.get('WATCH', 0)} "
+        f"AVOID={state_counts.get('AVOID', 0)}"
+    )
 
     # 5. Summary header
     today_str = datetime.date.today().strftime("%d-%b-%Y")
@@ -268,7 +278,8 @@ def run_daily_market_cycle(
         f"<i>{regime_info.get('note', '')}</i>\n"
         f"────────────────────────\n"
         f"Audited active signals: {len(lifecycle_updates)} updates.\n"
-        f"New/Triggered setups: {len(new_setup_cards)}.\n"
+        f"🟢 BUY NOW: {state_counts.get('BUY_NOW', 0)} | 🟡 BUY ZONE: {state_counts.get('BUY_ZONE', 0)} | ⚪ WATCH: {state_counts.get('WATCH', 0)}\n"
+        f"New alerts in this scan: {len(new_setup_cards)}.\n"
     )
     if skipped_symbols:
         header += f"<i>Note: {len(skipped_symbols)} symbols skipped due to data unavailability.</i>\n"
