@@ -1387,6 +1387,44 @@ def test_psx_snapshot():
     print("  ✓ PSX snapshot passed (parse, sector/status, append-only merge, idempotency, source preference).")
 
 
+def test_watchlist_currency():
+    print("29. Testing watchlist currency against the live PSX listing...")
+    from data_engine import get_watchlist, audit_watchlist
+
+    wl = get_watchlist()
+
+    # Renamed tickers must point at the currently-listed symbol
+    for live_ticker in ("ENGROH", "CNERGY", "GGL"):
+        assert live_ticker in wl, f"{live_ticker} missing (ticker rename not applied)"
+    # Delisted securities must be removed, they can never produce data
+    for dead in ("ENGRO", "FFBL", "SHEL", "CYNERGICO", "GLL"):
+        assert dead not in wl, f"{dead} is delisted/renamed and must not be tracked"
+
+    # Audit ignores derivative suffixes (-OCT/-NOV) and reports real gaps
+    full = audit_watchlist(list(wl) + ["OGDC-OCT", "OGDC-NOV"])
+    assert full["missing"] == [] and full["live"] == full["total"] == len(wl)
+
+    partial = audit_watchlist([s for s in wl if s != "OGDC"])
+    assert partial["missing"] == ["OGDC"]
+    assert partial["live"] == len(wl) - 1
+
+    # Gap guard: a multi-week hole must cut the series, not be averaged over
+    from data_engine import _trim_at_gaps
+
+    gapped = pd.DataFrame(
+        {"Open": [1.0] * 40, "High": [1.0] * 40, "Low": [1.0] * 40, "Close": [1.0] * 40, "Volume": [1] * 40},
+        index=pd.to_datetime([f"2026-01-{d:02d}" for d in range(1, 21)] + [f"2026-03-{d:02d}" for d in range(1, 21)]),
+    )
+    trimmed, was_trimmed, gap_days = _trim_at_gaps(gapped)
+    assert was_trimmed and gap_days >= 15
+    assert len(trimmed) == 20 and trimmed.index[0].month == 3
+
+    contiguous = gapped.iloc[:20]
+    assert _trim_at_gaps(contiguous)[1] is False
+
+    print("  ✓ Watchlist currency passed (renames applied, delisted dropped, audit + gap guard).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -1418,6 +1456,7 @@ if __name__ == "__main__":
     test_broker_import()
     test_auto_import()
     test_psx_snapshot()
+    test_watchlist_currency()
     print("=== All Verification Tests Passed Successfully! ===")
 
 

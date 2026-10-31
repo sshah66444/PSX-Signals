@@ -37,9 +37,8 @@ PSX_WATCHLIST = {
     # --- Fertilizer ---
     "FFC": {"name": "Fauji Fertilizer Company Limited", "sector": "Fertilizer"},
     "EFERT": {"name": "Engro Fertilizers Limited", "sector": "Fertilizer"},
-    "ENGRO": {"name": "Engro Corporation Limited", "sector": "Fertilizer / Conglomerate"},
+    "ENGROH": {"name": "Engro Holdings Limited (formerly Engro Corporation)", "sector": "Fertilizer / Conglomerate"},
     "FATIMA": {"name": "Fatima Fertilizer Company Limited", "sector": "Fertilizer"},
-    "FFBL": {"name": "Fauji Fertilizer Bin Qasim Limited", "sector": "Fertilizer"},
 
     # --- Cement ---
     "LUCK": {"name": "Lucky Cement Limited", "sector": "Cement"},
@@ -71,7 +70,6 @@ PSX_WATCHLIST = {
     # --- Oil & Gas Marketing (OMCs) & Distribution ---
     "PSO": {"name": "Pakistan State Oil Company", "sector": "Oil & Gas Marketing"},
     "APL": {"name": "Attock Petroleum Limited", "sector": "Oil & Gas Marketing"},
-    "SHEL": {"name": "Shell Pakistan Limited", "sector": "Oil & Gas Marketing"},
     "SNGP": {"name": "Sui Northern Gas Pipelines Limited", "sector": "Gas Distribution"},
     "SSGC": {"name": "Sui Southern Gas Company Limited", "sector": "Gas Distribution"},
     "HASCOL": {"name": "Hascol Petroleum Limited", "sector": "Oil & Gas Marketing"},
@@ -80,7 +78,7 @@ PSX_WATCHLIST = {
     "ATRL": {"name": "Attock Refinery Limited", "sector": "Refinery"},
     "PRL": {"name": "Pakistan Refinery Limited", "sector": "Refinery"},
     "NRL": {"name": "National Refinery Limited", "sector": "Refinery"},
-    "CYNERGICO": {"name": "Cynergico PK Limited", "sector": "Refinery"},
+    "CNERGY": {"name": "Cnergyico PK Limited (formerly Cynergico/Byco)", "sector": "Refinery"},
 
     # --- Pharmaceuticals & Chemicals ---
     "SEARL": {"name": "The Searle Company Limited", "sector": "Pharmaceuticals"},
@@ -90,7 +88,7 @@ PSX_WATCHLIST = {
     "HINOON": {"name": "Highnoon Laboratories Limited", "sector": "Pharmaceuticals"},
     "LOTCHEM": {"name": "Lotte Chemical Pakistan Limited", "sector": "Chemicals"},
     "EPCL": {"name": "Engro Polymer & Chemicals Limited", "sector": "Chemicals"},
-    "GLL": {"name": "Ghani Global Limited", "sector": "Chemicals"},
+    "GGL": {"name": "Ghani Global Holdings Limited (formerly Ghani Global)", "sector": "Chemicals"},
 
     # --- Automobile & Engineering ---
     "MTL": {"name": "Millat Tractors Limited", "sector": "Automobile Assembler"},
@@ -113,6 +111,23 @@ PSX_WATCHLIST = {
     "FCEPL": {"name": "FrieslandCampina Engro Pakistan", "sector": "Food & Personal Care"},
     "NATF": {"name": "National Foods Limited", "sector": "Food & Personal Care"},
 }
+
+
+def audit_watchlist(live_symbols) -> dict:
+    """
+    Compares the tracked watchlist against a live PSX symbol list.
+
+    Tickers get renamed (ENGRO -> ENGROH) and delisted (FFBL, SHEL), which would
+    otherwise leave the screener querying symbols that can never return data.
+    Derivative suffixes such as -OCT/-NOV (futures) are ignored.
+    """
+    base = {str(s).strip().upper().split("-")[0] for s in (live_symbols or []) if str(s).strip()}
+    missing = sorted(sym for sym in PSX_WATCHLIST if sym not in base)
+    return {
+        "total": len(PSX_WATCHLIST),
+        "live": len(PSX_WATCHLIST) - len(missing),
+        "missing": missing,
+    }
 
 
 def get_watchlist() -> dict:
@@ -466,6 +481,36 @@ def _load_preferred_cache(clean_symbol: str, cache_file: str, max_age_days: int)
     return None, None
 
 
+MAX_SERIES_GAP_DAYS = 15  # PSX holidays rarely exceed a week; bigger means missing data
+
+
+def _trim_at_gaps(df: pd.DataFrame, max_gap_days: int = MAX_SERIES_GAP_DAYS):
+    """
+    Trims a price series at its most recent large gap.
+
+    Archived backfills can leave multi-year holes (e.g. ENGRO: 2020-2025 archive +
+    fresh bars from today). Computing EMA-200 across such a hole would be
+    meaningless, so indicators are only ever fed a contiguous recent segment.
+
+    Returns (frame, trimmed: bool, gap_days: int|None).
+    """
+    if df is None or len(df) < 2:
+        return df, False, None
+
+    index = df.index
+    gaps = index.to_series().diff().dt.days
+    large = gaps[gaps > max_gap_days]
+    if large.empty:
+        return df, False, None
+
+    # Always cut at the most recent hole — including when it sits immediately
+    # before the final bar. A short tail is then rejected by the caller's
+    # minimum-history check, which is the honest outcome: indicators computed
+    # across a multi-week hole are not tradeable.
+    start = index.searchsorted(large.index[-1])
+    return df.iloc[start:], True, int(large.iloc[-1])
+
+
 def fetch_psx_stock(
     symbol: str,
     period: str = "6mo",
@@ -583,6 +628,18 @@ def fetch_psx_stock(
             df = None
 
     # 5. Final Validation & Return
+    gap_trimmed, gap_days, gap_note = False, None, ""
+    if df is not None:
+        # Only feed indicators a contiguous recent segment: backfilled archives can
+        # leave multi-year holes that would corrupt EMA/ATR calculations.
+        df, gap_trimmed, gap_days = _trim_at_gaps(df)
+        if df is not None and len(df) < 20:
+            gap_note = (
+                f"Only {len(df)} contiguous session(s) after a {gap_days}-day data gap "
+                f"(minimum 20 needed for indicators)."
+            )
+            df = None
+
     if df is not None:
         latest_date_str = df.index[-1].strftime("%Y-%m-%d")
         latest_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
@@ -600,6 +657,8 @@ def fetch_psx_stock(
             "expected_date": str(expected_date),
             "freshness_note": freshness_note,
             "error": None,
+            "gap_trimmed": gap_trimmed,
+            "gap_days": gap_days,
         }
 
     # Explicit failure: Never fabricate prices!
@@ -614,7 +673,7 @@ def fetch_psx_stock(
         "is_settled": False,
         "expected_date": str(expected_sess_date),
         "freshness_note": f"Data unavailable for session {expected_sess_date}.",
-        "error": f"Real market data unavailable for {clean_symbol}. Alert skipped to maintain data integrity.",
+        "error": gap_note or f"Real market data unavailable for {clean_symbol}. Alert skipped to maintain data integrity.",
     }
 
 

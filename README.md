@@ -161,8 +161,17 @@ Because PSX withdrew its public history API, the bot no longer depends on it:
   run on that proxy. Telegram labels it `📈 Market Proxy (equal-weight, N names)`.
 * **Circuit breaker** — a 404/403 (or three consecutive failures) marks the DPS endpoint
   retired for the process, so a 75-symbol scan makes **one** attempt instead of 150.
-* **Honest gaps** — `ENGRO`, `FFBL`, `SHEL`, `CYNERGICO`, `GLL`, `IPAK` have no Yahoo data
-  and no PSX fallback, so they are skipped and reported rather than fabricated.
+* **Ticker drift** — five watchlist entries had gone stale: `ENGRO → ENGROH`,
+  `CYNERGICO → CNERGY` and `GLL → GGL` were renamed, while `FFBL` and `SHEL` were
+  delisted and removed. `audit_watchlist()` compares the watchlist against the live
+  PSX listing, and `--check-feeds` prints coverage, so this cannot silently rot again.
+* **Coverage today** — 71 of 73 tracked symbols are usable. `ENGROH` and `IPAK` have
+  no Yahoo history and accumulate from the daily snapshot until they own a contiguous
+  run (20+ sessions).
+* **Archived backfill (optional)** — `python wayback_backfill.py --symbols ENGRO --snapshots 30`
+  recovers bars from Internet Archive captures of the retired API and of historical
+  market-summary pages. Good for history and backtests; a series with a multi-week
+  hole is never fed to indicators (`_trim_at_gaps` cuts at the last gap).
 * **Health check** — `python telegram_notifier.py --check-feeds` prints Yahoo coverage, DPS
   status and the benchmark source.
 

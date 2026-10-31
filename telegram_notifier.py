@@ -29,6 +29,7 @@ from data_engine import (
     fetch_psx_stock,
     fetch_kse100_index,
     build_synthetic_benchmark,
+    audit_watchlist,
 )
 from signal_engine import generate_signal, format_actionable_card
 from signal_tracker import (
@@ -592,6 +593,10 @@ def main():
                 f"PSX market-summary page: OK ({len(snap)} symbols, session "
                 f"'{parse_session_status(page)}')"
             )
+            audit = audit_watchlist(snap["symbol"].tolist())
+            print(f"Watchlist coverage: {audit['live']}/{audit['total']} live")
+            if audit["missing"]:
+                print(f"  ⚠ delisted/renamed (fix the watchlist): {audit['missing']}")
         except Exception as exc:
             print(f"PSX market-summary page: unavailable -> {exc}")
         bench, reg = build_synthetic_benchmark(frames)
