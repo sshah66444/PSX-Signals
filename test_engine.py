@@ -1134,6 +1134,59 @@ def test_tiered_signal_model():
     print("  ✓ Tiered model passed (gates, scoring, grades, BUY ZONE/BUY NOW transitions & ledger upgrades).")
 
 
+def test_benchmark_fallback_and_feed_breaker():
+    print("25. Testing benchmark fallback (equal-weight proxy) & PSX feed circuit breaker...")
+    from data_engine import build_synthetic_benchmark, dps_is_retired
+
+    # 1. Synthetic benchmark builds from plain frames and from fetch payloads alike
+    base = generate_isolated_test_data(days=160, base_price=100.0)
+    frames = {}
+    for i, sym in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH", "III", "JJJ", "KKK", "LLL"]):
+        frames[sym] = base.copy() * (1.0 + i * 0.01)
+    frames["MMM"] = {"df": base.copy()}
+
+    df_bench, regime = build_synthetic_benchmark(frames)
+    assert df_bench is not None and len(df_bench) >= 50
+    assert "Close" in df_bench.columns and "EMA_50" in df_bench.columns
+    assert regime["regime"] in ("BULL_MARKET", "RECOVERY_ZONE", "MARKET_CORRECTION")
+    assert regime["benchmark_source"] == "synthetic_equal_weight"
+    assert regime["benchmark_stale"] is False
+    assert regime["constituents"] == 13, f"expected 13 constituents, got {regime['constituents']}"
+    assert regime["close"] > 0 and regime["ema50"] > 0
+
+    # 2. Too few symbols -> explicit unavailable state, never a fabricated regime
+    df_small, regime_small = build_synthetic_benchmark({"AAA": base})
+    assert df_small is None
+    assert regime_small["benchmark_stale"] is True
+    assert regime_small["regime"] == "UNKNOWN"
+
+    # 3. Empty input must not raise
+    df_empty, regime_empty = build_synthetic_benchmark({})
+    assert df_empty is None and regime_empty["benchmark_stale"] is True
+
+    # 4. A retired PSX portal must short-circuit instead of retrying per symbol
+    import data_engine
+
+    assert isinstance(dps_is_retired(), bool)
+    data_engine._DPS_STATE["retired"] = True
+    original_get = data_engine.requests.get
+    calls = {"n": 0}
+
+    def _counting_get(*args, **kwargs):
+        calls["n"] += 1
+        return original_get(*args, **kwargs)
+
+    data_engine.requests.get = _counting_get
+    try:
+        assert data_engine._fetch_from_psx_dps("OGDC") is None
+        assert calls["n"] == 0, "retired portal must not issue any HTTP request"
+    finally:
+        data_engine.requests.get = original_get
+        data_engine._DPS_STATE["retired"] = False
+
+    print("  ✓ Benchmark fallback passed (proxy regime, insufficient-data guard, feed breaker).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -1161,6 +1214,7 @@ if __name__ == "__main__":
     test_session_freshness_guard()
     test_swing_tactical_two_track_segregation()
     test_tiered_signal_model()
+    test_benchmark_fallback_and_feed_breaker()
     print("=== All Verification Tests Passed Successfully! ===")
 
 

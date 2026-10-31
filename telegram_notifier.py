@@ -24,7 +24,12 @@ if os.path.exists(env_file):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-from data_engine import get_watchlist, fetch_psx_stock, fetch_kse100_index
+from data_engine import (
+    get_watchlist,
+    fetch_psx_stock,
+    fetch_kse100_index,
+    build_synthetic_benchmark,
+)
 from signal_engine import generate_signal, format_actionable_card
 from signal_tracker import (
     record_or_update_setup,
@@ -225,6 +230,25 @@ def run_daily_market_cycle(
         else:
             skipped_symbols.append((sym, res.get("error", "Data unavailable")))
 
+    # 1b. Benchmark fallback. PSX retired the public KSE-100 history endpoint, so a
+    # stale/missing official index would gate every breakout on month-old data.
+    # Build an equal-weight proxy from the constituent data we just fetched.
+    if df_kse is None or regime_info.get("benchmark_stale"):
+        df_synth, regime_synth = build_synthetic_benchmark(market_data)
+        if df_synth is not None and len(df_synth) >= 50:
+            df_kse, regime_info = df_synth, regime_synth
+            regime_name = regime_info.get("regime", "UNKNOWN")
+            is_bullish = regime_info.get("is_bullish", True)
+            kse_close = regime_info.get("close", 0.0)
+            kse_ema50 = regime_info.get("ema50", 0.0)
+            is_kse_settled = regime_info.get("is_settled", True)
+            expected_sess_date = regime_info.get("expected_date", "")
+            kse_last_date = regime_info.get("last_date", "")
+            print(
+                f"   Benchmark: PSX index feed unavailable -> equal-weight proxy "
+                f"({regime_info.get('constituents')} names, {regime_name}, last {kse_last_date})"
+            )
+
     # 3. Audit existing open setups. Collected only -- broadcasting happens
     # after the header is built (see step 6), so subscribers always see the
     # summary banner before the detail alerts it summarizes, not after.
@@ -270,11 +294,20 @@ def run_daily_market_cycle(
     regime_badge = "🟢 BULL MARKET" if is_bullish else "🔴 MARKET CORRECTION (Cash Preservation Mode)"
     if regime_info.get("benchmark_stale"):
         regime_badge = "⚪ BENCHMARK STALE (Macro Gate Neutral)"
+
+    if regime_info.get("benchmark_source") == "synthetic_equal_weight":
+        bench_line = (
+            f"📈 <b>Market Proxy</b> (equal-weight, {regime_info.get('constituents')} names): "
+            f"<b>{kse_close:,.2f}</b> | 50 EMA: <b>{kse_ema50:,.2f}</b>\n"
+        )
+    else:
+        bench_line = f"📈 KSE-100: <b>{kse_close:,.2f}</b> | 50 EMA: <b>{kse_ema50:,.2f}</b>\n"
+
     header = (
         f"📊 <b>PSX AlphaSignals Daily Market Scan</b>\n"
         f"📅 Date: <b>{today_str}</b>\n"
         f"🏛️ <b>Macro Regime:</b> {regime_badge}\n"
-        f"📈 KSE-100: <b>{kse_close:,.2f}</b> | 50 EMA: <b>{kse_ema50:,.2f}</b>\n"
+        f"{bench_line}"
         f"<i>{regime_info.get('note', '')}</i>\n"
         f"────────────────────────\n"
         f"Audited active signals: {len(lifecycle_updates)} updates.\n"
@@ -478,6 +511,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print output without delivering to Telegram")
     parser.add_argument("--check-commands", action="store_true", help="Poll and execute interactive Telegram commands")
     parser.add_argument("--test", action="store_true", help="Send a single diagnostic message to Telegram and exit")
+    parser.add_argument("--check-feeds", action="store_true", help="Report data-feed health (Yahoo, PSX DPS, benchmark) and exit")
     parser.add_argument("--allow-stale", action="store_true", default=True, help="Bypass strict session freshness guard (default: on, so a one-session feed lag still delivers alerts with a pending notice)")
     parser.add_argument("--strict-freshness", action="store_true", help="Halt the scan when today's EOD bar has not settled yet")
     parser.add_argument("--mode", type=str, default=None, choices=["day_trade", "swing_trade", "position_trade"],
@@ -486,6 +520,37 @@ def main():
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if args.check_feeds:
+        from data_engine import dps_is_retired, _fetch_from_psx_dps
+
+        print("=== DATA FEED HEALTH ===")
+        probes = ["OGDC", "MEBL", "LUCK"]
+        frames = {}
+        for sym in probes:
+            res = fetch_psx_stock(sym, period="6mo")
+            status = res.get("status")
+            print(f"Yahoo {sym:6s}: {status:11s} last={res.get('last_date')} source={res.get('source')}")
+            if status == "OK":
+                frames[sym] = res
+
+        try:
+            df_dps = _fetch_from_psx_dps("OGDC")
+            print(f"PSX DPS: {'OK rows=' + str(len(df_dps)) if df_dps is not None else 'unavailable'}")
+        except Exception as exc:
+            print(f"PSX DPS: unavailable -> {exc}")
+        print(f"PSX DPS retired flag: {dps_is_retired()}")
+
+        print(f"Official KSE-100: {'available' if not fetch_kse100_index()[1].get('benchmark_stale') else 'stale/unavailable'}")
+        bench, reg = build_synthetic_benchmark(frames)
+        if bench is not None:
+            print(
+                f"Synthetic benchmark: OK ({reg.get('constituents')} probes, last {reg.get('last_date')}, "
+                f"regime {reg.get('regime')})"
+            )
+        else:
+            print("Synthetic benchmark: unavailable (needs >= 10 symbols with data)")
+        return
 
     if args.test:
         if not token or not chat_id:

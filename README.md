@@ -131,6 +131,30 @@ the exact buy trigger, stop, targets and the full gate/evidence breakdown. Setup
 `WATCH → BUY ZONE → BUY NOW`, and each step notifies once. Backtests enter on both
 `BUY_NOW` and `BUY_ZONE` (`entry_states` parameter), matching what the bot tells you to do.
 
+### 10. Data Feeds & Failure Handling
+
+| Feed | Role | Status |
+|---|---|---|
+| **Yahoo Finance (`.KA`)** | Primary OHLCV for all price/indicator work | ✅ 69 of 75 watchlist symbols, verified true OHLC |
+| **PSX Data Portal (DPS)** | Official EOD timeseries + KSE-100 history | ❌ Retired: `/timeseries/*` answers 404/403, downloads are CSRF-gated |
+| **Equal-weight proxy** | Macro regime + relative-strength benchmark | ✅ Built from the watchlist itself |
+
+Because PSX withdrew its public history API, the bot no longer depends on it:
+
+* **Benchmark fallback** — if the official KSE-100 series is missing or older than a week,
+  `build_synthetic_benchmark()` rebases every fetched symbol to 100 at its first session and
+  averages them into an equal-weight index. Regime rules, macro gate and relative strength
+  run on that proxy. Telegram labels it `📈 Market Proxy (equal-weight, N names)`.
+* **Circuit breaker** — a 404/403 (or three consecutive failures) marks the DPS endpoint
+  retired for the process, so a 75-symbol scan makes **one** attempt instead of 150.
+* **Honest gaps** — `ENGRO`, `FFBL`, `SHEL`, `CYNERGICO`, `GLL`, `IPAK` have no Yahoo data
+  and no PSX fallback, so they are skipped and reported rather than fabricated.
+* **Health check** — `python telegram_notifier.py --check-feeds` prints Yahoo coverage, DPS
+  status and the benchmark source.
+
+If PSX restores or licenses the feed, no code change is needed for the official index — the
+proxy is only used when the official series is stale or missing.
+
 ---
 
 ## 🛠️ Getting Started

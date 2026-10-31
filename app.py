@@ -7,8 +7,14 @@ Built with real PSX market data, transparent condition checklists, and strict ac
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import os
 
-from data_engine import get_watchlist, fetch_psx_stock, fetch_kse100_index
+from data_engine import (
+    get_watchlist,
+    fetch_psx_stock,
+    fetch_kse100_index,
+    build_synthetic_benchmark,
+)
 from signal_engine import generate_signal, format_actionable_card
 from chart_engine import create_signal_chart
 from backtester import (
@@ -117,9 +123,36 @@ def get_cached_stock_data(symbol: str, period: str = "6mo", force_refresh: bool 
     return fetch_psx_stock(symbol, period=period, force_refresh=force_refresh)
 
 @st.cache_data(ttl=900, show_spinner=False)
+def _load_cached_frames() -> dict:
+    """Loads every cached symbol CSV so a benchmark can be built without the index feed."""
+    import glob
+    frames = {}
+    for path in glob.glob(os.path.join(os.path.dirname(__file__), ".cache", "*_real.csv")):
+        sym = os.path.basename(path).replace("_real.csv", "")
+        if sym == "KSE100":
+            continue
+        try:
+            frames[sym] = pd.read_csv(path, index_col=0, parse_dates=True)
+        except Exception:
+            continue
+    return frames
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def get_cached_kse100(force_refresh: bool = False):
-    """Cached accessor for KSE-100 index timeseries and macro regime."""
-    return fetch_kse100_index(force_refresh=force_refresh)
+    """
+    Cached accessor for the KSE-100 index timeseries and macro regime.
+
+    PSX retired the public index history endpoint, so when the official feed is
+    stale/missing an equal-weight benchmark is built from the cached constituents
+    rather than gating the macro filter on month-old data.
+    """
+    df_kse, regime = fetch_kse100_index(force_refresh=force_refresh)
+    if df_kse is None or regime.get("benchmark_stale"):
+        df_synth, regime_synth = build_synthetic_benchmark(_load_cached_frames())
+        if df_synth is not None and len(df_synth) >= 50:
+            return df_synth, regime_synth
+    return df_kse, regime
 
 
 # ----------------- DATA LOADING -----------------
@@ -143,6 +176,10 @@ signal_data = generate_signal(
 # ----------------- HEADER & MACRO REGIME BANNER -----------------
 company_info = watchlist.get(active_symbol, {"name": f"{active_symbol} (Custom PSX Stock)", "sector": "Equities"})
 
+bench_label = ("Market Proxy (equal-weight)"
+               if regime_info.get("benchmark_source") == "synthetic_equal_weight"
+               else "KSE-100")
+
 col_title, col_status = st.columns([3, 1])
 with col_title:
     st.markdown('<div class="main-header">PSX AlphaSignals</div>', unsafe_allow_html=True)
@@ -165,7 +202,7 @@ if regime_info.get("is_bullish"):
         f"""
         <div class="macro-banner-bull">
             <b>🟢 Macro Market Regime: BULL MARKET</b><br>
-            KSE-100 Closed at <b>{regime_info['close']:,.2f}</b> (above 50 EMA: <b>{regime_info['ema50']:,.2f}</b> | 200 EMA: <b>{regime_info['ema200']:,.2f}</b>).<br>
+            {bench_label} Closed at <b>{regime_info['close']:,.2f}</b> (above 50 EMA: <b>{regime_info['ema50']:,.2f}</b> | 200 EMA: <b>{regime_info['ema200']:,.2f}</b>).<br>
             <span style="font-size: 0.88rem; opacity: 0.95;">Institutional participation is favorable. Full breakout and pullback triggers enabled.</span>
         </div>
         """,
@@ -176,7 +213,7 @@ else:
         f"""
         <div class="macro-banner-bear">
             <b>🔴 Macro Market Regime: MARKET CORRECTION (Cash Preservation Mode)</b><br>
-            KSE-100 Closed at <b>{regime_info['close']:,.2f}</b> (below 50 EMA: <b>{regime_info['ema50']:,.2f}</b>).<br>
+            {bench_label} Closed at <b>{regime_info['close']:,.2f}</b> (below 50 EMA: <b>{regime_info['ema50']:,.2f}</b>).<br>
             <span style="font-size: 0.88rem; opacity: 0.95;">Long breakouts are strictly suppressed across the screener. In a correcting market, cash is a valid defensive position.</span>
         </div>
         """,

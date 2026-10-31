@@ -257,26 +257,59 @@ def is_session_settled(
         )
 
 
+# --- PSX Data Portal (DPS) endpoint state -------------------------------------
+# PSX retired the public /timeseries/eod|int/{symbol} JSON routes (they answer
+# 404/403 now) and CSRF-gated the bulk download endpoints. Once the portal has
+# failed, stop hammering it for every symbol in the same run.
+_DPS_STATE = {"failures": 0, "retired": False}
+DPS_FAILURE_LIMIT = 3
+
+
+def dps_is_retired() -> bool:
+    return _DPS_STATE["retired"]
+
+
+def _note_dps_result(ok: bool, reason: str = "") -> None:
+    if ok:
+        _DPS_STATE["failures"] = 0
+        return
+    _DPS_STATE["failures"] += 1
+    # A 404/403 is not transient: the route is gone or gated.
+    if reason.startswith("HTTP 40") or _DPS_STATE["failures"] >= DPS_FAILURE_LIMIT:
+        if not _DPS_STATE["retired"]:
+            print(
+                "   [DPS] PSX data-portal API unavailable "
+                f"({reason or 'repeated failures'}). Skipping it for the rest of this run; "
+                "Yahoo Finance + the synthetic benchmark will be used."
+            )
+        _DPS_STATE["retired"] = True
+
+
 def _http_get_json(url: str, timeout: int = 15):
     """
     GETs a JSON payload from the PSX data portal.
 
-    The portal's edge nodes intermittently close plain `requests` connections
-    (RemoteDisconnected) while still serving the same path to a browser TLS
-    fingerprint, so each URL is tried once with requests and once with
-    curl_cffi impersonating Chrome before giving up.
+    Tries plain `requests` first, then curl_cffi impersonating Chrome, because the
+    portal has historically served browsers while resetting other clients.
+    Raises RuntimeError with the HTTP status so callers can detect a retired route.
     """
+    if _DPS_STATE["retired"]:
+        raise RuntimeError("PSX data-portal API disabled for this run")
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
     }
     last_error = "unknown error"
+    last_status = ""
 
     try:
         resp = requests.get(url, headers=headers, timeout=timeout)
         if resp.status_code == 200:
+            _note_dps_result(True)
             return resp.json()
         last_error = f"HTTP {resp.status_code}"
+        last_status = f"HTTP {resp.status_code}"
     except Exception as exc:
         last_error = f"{type(exc).__name__}: {exc}"
 
@@ -285,11 +318,14 @@ def _http_get_json(url: str, timeout: int = 15):
 
         resp = curl_requests.get(url, impersonate="chrome", timeout=timeout)
         if resp.status_code == 200:
+            _note_dps_result(True)
             return resp.json()
         last_error = f"HTTP {resp.status_code} (curl_cffi)"
+        last_status = f"HTTP {resp.status_code}"
     except Exception as exc:
         last_error = f"{last_error}; curl_cffi {type(exc).__name__}: {exc}"
 
+    _note_dps_result(False, last_status or last_error)
     raise RuntimeError(f"PSX feed unavailable for {url}: {last_error}")
 
 
@@ -309,7 +345,10 @@ def _fetch_from_psx_dps(clean_symbol: str) -> pd.DataFrame:
     try:
         data = _http_get_json(url, timeout=15)
     except Exception as exc:
-        print(f"   [DPS] {clean_symbol} unavailable: {exc}")
+        # Once the portal is marked retired the reason is already printed once;
+        # don't repeat it for every symbol in the scan.
+        if not _DPS_STATE["retired"]:
+            print(f"   [DPS] {clean_symbol} unavailable: {exc}")
         return None
 
     rows = data.get("data", [])
@@ -671,6 +710,122 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
         "note": note,
         "benchmark_stale": False,
         "benchmark_age_days": benchmark_age_days,
+    }
+
+
+def build_synthetic_benchmark(frames: dict) -> tuple:
+    """
+    Builds an equal-weight benchmark from the symbols we actually fetched.
+
+    PSX's public KSE-100 history endpoint is retired, so relying on it leaves the
+    macro gate permanently stale. This constructs a self-contained proxy instead:
+    each constituent's close is rebased to 100 at its first available session and
+    the cross-section is averaged per date, which behaves like an equal-weight
+    index of the watchlist.
+
+    Args:
+        frames: {symbol: {"df": DataFrame}} or {symbol: DataFrame}
+
+    Returns:
+        (df_benchmark, regime_info) using the same regime rules and keys as
+        fetch_kse100_index(), with benchmark_source="synthetic_equal_weight".
+    """
+    closes = {}
+    for sym, payload in (frames or {}).items():
+        df = payload.get("df") if isinstance(payload, dict) else payload
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        series = df["Close"].dropna()
+        if len(series) < 30 or float(series.iloc[0]) <= 0:
+            continue
+        closes[sym] = series / float(series.iloc[0]) * 100.0
+
+    expected_sess_date = get_expected_session_date()
+
+    if len(closes) < 10:
+        return None, {
+            "regime": "UNKNOWN",
+            "is_bullish": True,
+            "close": 0.0,
+            "ema50": 0.0,
+            "ema200": 0.0,
+            "last_date": "N/A",
+            "is_settled": False,
+            "expected_date": str(expected_sess_date),
+            "freshness_note": "Not enough constituents for a synthetic benchmark.",
+            "note": "Benchmark unavailable: too few symbols returned data.",
+            "benchmark_stale": True,
+            "benchmark_age_days": None,
+            "benchmark_source": "synthetic_equal_weight",
+            "constituents": len(closes),
+        }
+
+    panel = pd.DataFrame(closes)
+    index_series = panel.mean(axis=1).dropna()
+    index_series = index_series[index_series > 0]
+    if len(index_series) < 50:
+        return None, {
+            "regime": "UNKNOWN",
+            "is_bullish": True,
+            "close": 0.0,
+            "ema50": 0.0,
+            "ema200": 0.0,
+            "last_date": "N/A",
+            "is_settled": False,
+            "expected_date": str(expected_sess_date),
+            "freshness_note": "Synthetic benchmark history too short.",
+            "note": "Benchmark unavailable: insufficient history.",
+            "benchmark_stale": True,
+            "benchmark_age_days": None,
+            "benchmark_source": "synthetic_equal_weight",
+            "constituents": len(closes),
+        }
+
+    df_bench = index_series.to_frame(name="Close")
+    df_bench["EMA_50"] = df_bench["Close"].ewm(span=50, adjust=False).mean()
+    df_bench["EMA_200"] = df_bench["Close"].ewm(span=min(200, len(df_bench) - 1), adjust=False).mean()
+
+    latest_close = float(df_bench["Close"].iloc[-1])
+    latest_ema50 = float(df_bench["EMA_50"].iloc[-1])
+    latest_ema200 = float(df_bench["EMA_200"].iloc[-1])
+    last_dt = df_bench.index[-1]
+    last_date = last_dt.strftime("%Y-%m-%d")
+    is_settled, expected_date, freshness_note = is_session_settled(last_dt)
+
+    if latest_close >= latest_ema50 and latest_ema50 >= latest_ema200:
+        regime, is_bullish = "BULL_MARKET", True
+        note = (
+            f"Synthetic equal-weight benchmark ({len(closes)} names) at {latest_close:,.1f} is above its "
+            f"50 EMA ({latest_ema50:,.1f}) and 200 EMA. Full breakout participation enabled."
+        )
+    elif latest_close >= latest_ema50:
+        regime, is_bullish = "RECOVERY_ZONE", True
+        note = (
+            f"Synthetic equal-weight benchmark ({len(closes)} names) at {latest_close:,.1f} is above its "
+            f"50 EMA ({latest_ema50:,.1f}) in recovery. Selective setups permitted."
+        )
+    else:
+        regime, is_bullish = "MARKET_CORRECTION", False
+        note = (
+            f"Synthetic equal-weight benchmark ({len(closes)} names) at {latest_close:,.1f} is below its "
+            f"50 EMA ({latest_ema50:,.1f}). Broad market in correction: long breakouts suppressed."
+        )
+
+    return df_bench, {
+        "regime": regime,
+        "is_bullish": is_bullish,
+        "close": round(latest_close, 2),
+        "ema50": round(latest_ema50, 2),
+        "ema200": round(latest_ema200, 2),
+        "last_date": last_date,
+        "is_settled": is_settled,
+        "expected_date": str(expected_date),
+        "freshness_note": freshness_note,
+        "note": note + " Source: equal-weight watchlist proxy (PSX index feed retired).",
+        "benchmark_stale": False,
+        "benchmark_age_days": max(0, (datetime.date.today() - last_dt.date()).days),
+        "benchmark_source": "synthetic_equal_weight",
+        "constituents": len(closes),
     }
 
 
