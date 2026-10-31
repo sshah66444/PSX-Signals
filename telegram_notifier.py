@@ -182,7 +182,27 @@ def run_daily_market_cycle(
     config = get_config(mode)
     print(f"Running in {config['name']} mode (time_stop: {config['time_stop_bars']} days, targets: {config['tp1_risk_multiplier']}x/{config['tp2_risk_multiplier']}x)")
 
-    # 0. Optional broker feed. Point PSX_BROKER_DIR at the folder your broker's
+    # 0. Official PSX EOD snapshot (all listed symbols). This is the exchange's own
+    # close, so refresh it before scoring — it also covers symbols Yahoo dropped.
+    if os.environ.get("PSX_SNAPSHOT", "1") != "0":
+        try:
+            from psx_snapshot import refresh as refresh_psx_snapshot
+
+            snap = refresh_psx_snapshot(dry_run=dry_run)
+            if snap.get("deferred"):
+                print(
+                    f"   PSX snapshot: session '{snap.get('session')}' — not settled yet; "
+                    "using cached/other sources"
+                )
+            else:
+                print(
+                    f"   PSX snapshot: {snap['updated']} symbols for {snap['date']} "
+                    f"(session {snap.get('session')})"
+                )
+        except Exception as exc:
+            print(f"   PSX snapshot: skipped ({exc})")
+
+    # 0b. Optional broker feed. Point PSX_BROKER_DIR at the folder your broker's
     # downloads/cloud sync land in; any new export is imported before scoring, so
     # the daily run needs no manual step.
     broker_dir = os.environ.get("PSX_BROKER_DIR")
@@ -563,6 +583,17 @@ def main():
         print(f"PSX DPS retired flag: {dps_is_retired()}")
 
         print(f"Official KSE-100: {'available' if not fetch_kse100_index()[1].get('benchmark_stale') else 'stale/unavailable'}")
+        try:
+            from psx_snapshot import fetch_html, parse_snapshot, parse_session_status
+
+            page = fetch_html()
+            snap = parse_snapshot(page)
+            print(
+                f"PSX market-summary page: OK ({len(snap)} symbols, session "
+                f"'{parse_session_status(page)}')"
+            )
+        except Exception as exc:
+            print(f"PSX market-summary page: unavailable -> {exc}")
         bench, reg = build_synthetic_benchmark(frames)
         if bench is not None:
             print(

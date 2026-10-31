@@ -135,9 +135,23 @@ the exact buy trigger, stop, targets and the full gate/evidence breakdown. Setup
 
 | Feed | Role | Status |
 |---|---|---|
-| **Yahoo Finance (`.KA`)** | Primary OHLCV for all price/indicator work | ✅ 69 of 75 watchlist symbols, verified true OHLC |
-| **PSX Data Portal (DPS)** | Official EOD timeseries + KSE-100 history | ❌ Retired: `/timeseries/*` answers 404/403, downloads are CSRF-gated |
+| **PSX market-summary (HTML)** | Official EOD snapshot: LDCP/Open/High/Low/Current/Volume for ~688 listed symbols | ✅ Scraped once per trading day, imported first |
+| **Yahoo Finance (`.KA`)** | Deep price history for indicator warm-up | ✅ 69 of 75 watchlist symbols, verified true OHLC |
+| **PSX Data Portal JSON API** | Official timeseries + KSE-100 history | ❌ Retired: `/timeseries/*` answers 404/403, downloads are CSRF-gated |
 | **Equal-weight proxy** | Macro regime + relative-strength benchmark | ✅ Built from the watchlist itself |
+
+The snapshot is the important one: PSX's JSON API may be gone, but the public
+market-summary page still publishes the exchange's own closing prices for the
+whole market. `psx_snapshot.py` parses it (only when the session banner says
+**Closed**, so intraday prices are never stored as EOD), appends one bar per
+symbol to the cache and marks it `PSX official EOD`, which outranks every other
+source.
+
+Because a snapshot yields **one bar per day**, symbols that Yahoo never carried
+(`ENGRO`, `FFBL`, `SHEL`, `CYNERGICO`, `GLL`, `IPAK`) accumulate history from the
+first run onward: they become signal-capable after ~20 sessions (RSI/ATR warm-up)
+and fully comparable after ~50 (50 EMA). Symbols Yahoo already covers keep their
+deep history and simply gain today's official bar.
 
 Because PSX withdrew its public history API, the bot no longer depends on it:
 
@@ -214,6 +228,10 @@ tracked by `.cache/broker_import_state.json`. You never run the importer manuall
 **Failure visibility:** if a scheduled run throws, it now sends
 `⚠️ PSX scan FAILED` with the traceback to Telegram and marks the CI job failed,
 so silence in your chat means "nothing to buy", not "the bot died".
+
+The official PSX snapshot is refreshed automatically at the start of every scan
+(`PSX_SNAPSHOT=0` disables it), so the cloud job needs no broker at all. The
+broker folder is an optional extra layer, not a requirement.
 
 #### Choosing an automation path for broker data
 

@@ -432,28 +432,38 @@ def validate_market_data(
     return True, "Data valid and verified", age_days
 
 
-def _load_broker_cache(clean_symbol: str, cache_file: str, max_age_days: int):
+def _load_preferred_cache(clean_symbol: str, cache_file: str, max_age_days: int):
     """
-    Returns (df, source_label) when this symbol's cache was populated by
-    import_broker_data.py and is still fresh, otherwise (None, None).
+    Returns (df, source_label) when this symbol's cache carries a provenance
+    marker from a higher-quality feed (official PSX snapshot, or a broker import)
+    and the data is still fresh; otherwise (None, None).
 
-    Broker-imported data is the client's own traded feed, so it takes precedence
-    over scraped sources and covers symbols those sources have dropped.
+    Precedence: official PSX exchange snapshot > broker export > scraped sources.
     """
-    marker_path = os.path.join(CACHE_DIR, f"{clean_symbol}_broker.json")
-    if not (os.path.exists(marker_path) and os.path.exists(cache_file)):
+    if not os.path.exists(cache_file):
         return None, None
-    try:
-        with open(marker_path) as fh:
-            meta = json.load(fh)
-        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        is_valid, reason, age = validate_market_data(df, max_age_days=max_age_days)
-        if not is_valid:
-            return None, None
-        imported = str(meta.get("imported_at", ""))[:10]
-        return df, f"Broker EOD import ({imported})"
-    except Exception:
-        return None, None
+
+    sources = (
+        (f"{clean_symbol}_psx.json", "PSX official EOD"),
+        (f"{clean_symbol}_broker.json", "Broker EOD import"),
+    )
+    for filename, label in sources:
+        marker_path = os.path.join(CACHE_DIR, filename)
+        if not os.path.exists(marker_path):
+            continue
+        try:
+            with open(marker_path) as fh:
+                meta = json.load(fh)
+            df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            is_valid, reason, age = validate_market_data(df, max_age_days=max_age_days)
+            if not is_valid:
+                continue
+            stamp = str(meta.get("session") or meta.get("imported_at") or "")[:10]
+            return df, f"{label} ({stamp})"
+        except Exception:
+            continue
+
+    return None, None
 
 
 def fetch_psx_stock(
@@ -490,9 +500,9 @@ def fetch_psx_stock(
     source = "None"
     has_true_ohlc = False
 
-    # 0. Broker-imported EOD (see import_broker_data.py) wins when fresh, because it
-    # is the client's own traded feed and covers symbols Yahoo has dropped.
-    df_broker, broker_source = _load_broker_cache(clean_symbol, cache_file, max_age_days)
+    # 0. Official PSX snapshot / broker-imported EOD wins when fresh: it is the
+    # exchange's own feed and covers symbols scraped sources have dropped.
+    df_broker, broker_source = _load_preferred_cache(clean_symbol, cache_file, max_age_days)
     if df_broker is not None:
         df = df_broker
         has_true_ohlc = check_has_true_ohlc(df)

@@ -1306,6 +1306,87 @@ def test_auto_import():
     print("  ✓ Auto-import passed (new vs unchanged, malformed file tolerated, missing folder soft-fails).")
 
 
+def test_psx_snapshot():
+    print("28. Testing official PSX market-summary snapshot (parse, idempotency, preference)...")
+    import tempfile
+    import json
+    import data_engine
+    import psx_snapshot as snap
+
+    # 1. Parser: sector heading, header row, data-srip tickers, LDCP/O/H/L/C/V
+    page = """
+    <table><tr><td>Exchange</td><td>Status: Closed</td></tr></table>
+    <table>
+      <tr><td>APPAREL</td></tr>
+      <tr><td>SCRIP</td><td>LDCP</td><td>OPEN</td><td>HIGH</td><td>LOW</td><td>CURRENT</td><td>CHANGE</td><td>VOLUME</td></tr>
+      <tr class="red-text-td">
+        <td class="dataportal" data-srip="IMAGE">Image PakistanXD</td>
+        <td>23.25</td><td>23.27</td><td>23.98</td><td>21.51</td><td>22.83</td>
+        <td> -0.42</td><td>231,693</td>
+      </tr>
+      <tr class="green-text-td">
+        <td class="dataportal" data-srip="OGDC">Oil &amp; Gas Development Company</td>
+        <td>300.50</td><td>301.00</td><td>302.00</td><td>298.00</td><td>301.25</td>
+        <td>0.75</td><td>1,500,000</td>
+      </tr>
+    </table>
+    """
+    frame = snap.parse_snapshot(page)
+    assert len(frame) == 2, frame
+    assert snap.parse_session_status(page) == "Closed"
+
+    ogdc = frame[frame["symbol"] == "OGDC"].iloc[0]
+    assert ogdc["close"] == 301.25 and ogdc["open"] == 301.00
+    assert ogdc["high"] == 302.00 and ogdc["low"] == 298.00
+    assert ogdc["volume"] == 1_500_000
+    assert ogdc["sector"].upper() == "APPAREL"
+    assert "Oil" in ogdc["name"]
+
+    image = frame[frame["symbol"] == "IMAGE"].iloc[0]
+    assert image["close"] == 22.83 and image["change"] == -0.42
+
+    # 2. An open session must defer (never store intraday prices as EOD)
+    open_page = page.replace("Status: Closed", "Status: Open")
+    assert snap.parse_session_status(open_page) == "Open"
+
+    # 3. update_cache merges into history, is idempotent and marks provenance
+    original_cache = data_engine.CACHE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        data_engine.CACHE_DIR = tmp
+        snap.CACHE_DIR = tmp
+        try:
+            history = generate_isolated_test_data(days=40, base_price=300.0)
+            history.to_csv(os.path.join(tmp, "OGDC_real.csv"), index_label="Date")
+
+            # Use the session immediately after the seeded history so the merge
+            # behaviour is deterministic regardless of when the suite runs.
+            session = (history.index[-1] + pd.Timedelta(days=1)).date()
+            first = snap.update_cache(frame, session_date=session)
+            assert first["updated"] == 2 and first["skipped"] == 0, first
+
+            merged = pd.read_csv(os.path.join(tmp, "OGDC_real.csv"), index_col=0, parse_dates=True)
+            assert len(merged) == 41, "snapshot bar must be appended, not replace history"
+            assert pd.Timestamp(session) in merged.index
+            assert float(merged.loc[pd.Timestamp(session), "Close"]) == 301.25
+
+            second = snap.update_cache(frame, session_date=session)
+            assert second["updated"] == 2 and second["skipped"] == 2, second
+
+            marker = json.load(open(os.path.join(tmp, "OGDC_psx.json")))
+            assert marker["source"] == "psx_market_summary" and marker["session"] == str(session)
+
+            # 4. The engine must now prefer official PSX data for this symbol
+            res = data_engine.fetch_psx_stock("OGDC", max_age_days=60)
+            assert res["status"] == "OK"
+            assert res["source"].startswith("PSX official EOD"), res["source"]
+            assert res["last_date"] == str(session)
+        finally:
+            data_engine.CACHE_DIR = original_cache
+            snap.CACHE_DIR = original_cache
+
+    print("  ✓ PSX snapshot passed (parse, sector/status, append-only merge, idempotency, source preference).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -1336,6 +1417,7 @@ if __name__ == "__main__":
     test_benchmark_fallback_and_feed_breaker()
     test_broker_import()
     test_auto_import()
+    test_psx_snapshot()
     print("=== All Verification Tests Passed Successfully! ===")
 
 
