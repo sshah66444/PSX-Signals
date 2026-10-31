@@ -186,6 +186,50 @@ they can never trigger a live entry.
 
 Set `PSX_CACHE_DIR` to import into an isolated cache (useful for testing).
 
+### 12. Running Fully Unattended
+
+The scan itself needs nothing from you: `.github/workflows/swing_signals.yml`
+runs it in the cloud at **20:45 PKT** every trading day (with a 21:45 retry),
+delivers to Telegram and commits the ledger. Your Mac does not have to be on and
+no local cron/launchd job is involved.
+
+To make the **broker feed** equally hands-off, point the app at a folder once:
+
+```env
+# .env (local runs)
+PSX_BROKER_DIR=/Users/you/Dropbox/jsg_reports
+```
+
+Any export that appears there (browser download, cloud-sync, SFTP mirror) is
+imported automatically at the start of each scan — **only new or changed files**,
+tracked by `.cache/broker_import_state.json`. You never run the importer manually.
+
+| Piece | Manual? |
+|---|---|
+| Daily scan + Telegram delivery | No |
+| Broker file → cache → signals | No (drop the file, nothing else) |
+| Credentials / API keys (one-time) | Yes, once |
+| Re-auth if the broker enforces SMS OTP | Yes — see below |
+
+**Failure visibility:** if a scheduled run throws, it now sends
+`⚠️ PSX scan FAILED` with the traceback to Telegram and marks the CI job failed,
+so silence in your chat means "nothing to buy", not "the bot died".
+
+#### Choosing an automation path for broker data
+
+| What JS Global gives you | Automation | Notes |
+|---|---|---|
+| API key + secret (no interactive login) | **Fully unattended** | Store in GitHub Secrets, call from the workflow |
+| Username/password API | **Unattended** | Automate login + token refresh; alert on expiry |
+| Login with **SMS OTP** | Needs input per login | Ask for a data-only/service account, or a long-lived refresh token |
+| Login with **authenticator-app 2FA** | **Unattended** | Store the TOTP seed secret and generate codes in code |
+| Daily EOD file (portal download / email) | **Unattended** | Folder watch (above), or IMAP attachment pickup |
+| Terminal/desktop app only | Fragile | Headless automation is possible but breaks on UI changes |
+
+The blocker to avoid is **SMS-based OTP** — that is the one thing that genuinely
+forces your involvement every time. Ask specifically for a service account or
+refresh token when you request access.
+
 ---
 
 ## 🛠️ Getting Started

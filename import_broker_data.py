@@ -312,6 +312,66 @@ def merge_with_cache(df: pd.DataFrame, symbol: str, dry_run: bool = False) -> di
     }
 
 
+def auto_import_dir(directory: str, state_path: str = None, dry_run: bool = False) -> dict:
+    """
+    Imports any NEW or CHANGED export files in a folder, exactly once each.
+
+    A small JSON state file records (name, size, mtime) per processed file, so a
+    scheduled run can point at the broker's download folder every day and only do
+    work when a new report actually appears. This is what makes the broker feed
+    hands-off: drop/auto-sync files into the folder, nothing else to run.
+
+    Returns {"imported": [...], "skipped": [...], "failed": [...]}.
+    """
+    directory = os.path.expanduser(directory)
+    state_path = state_path or os.path.join(CACHE_DIR, "broker_import_state.json")
+
+    state = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path) as fh:
+                state = json.load(fh)
+        except Exception:
+            state = {}
+
+    if not os.path.isdir(directory):
+        return {"imported": [], "skipped": [], "failed": [], "missing_dir": directory}
+
+    paths = sorted(
+        p for ext in ("csv", "txt", "xlsx", "xlsm", "xls")
+        for p in glob.glob(os.path.join(directory, f"*.{ext}"))
+    )
+
+    imported, skipped, failed = [], [], []
+    for path in paths:
+        key = os.path.basename(path)
+        try:
+            signature = f"{os.path.getsize(path)}:{int(os.path.getmtime(path))}"
+        except OSError:
+            continue
+
+        if state.get(key) == signature:
+            skipped.append(key)
+            continue
+
+        try:
+            result = import_file(path, dry_run=dry_run, verbose=False)
+            imported.append((key, result))
+            if not dry_run:
+                state[key] = signature
+        except Exception as exc:
+            failed.append((key, str(exc)))
+
+    if not dry_run:
+        try:
+            with open(state_path, "w") as fh:
+                json.dump(state, fh, indent=2, sort_keys=True)
+        except Exception:
+            pass
+
+    return {"imported": imported, "skipped": skipped, "failed": failed}
+
+
 def import_file(path: str, symbol: str = None, sheet: str = None, header_row: int = 0,
                 dry_run: bool = False, verbose: bool = True) -> dict:
     """Imports one export file end-to-end and returns a summary dict."""
@@ -346,6 +406,8 @@ def main(argv=None) -> int:
     parser.add_argument("--header-row", type=int, default=0, help="Row index containing headers")
     parser.add_argument("--dry-run", action="store_true", help="Parse and report without writing")
     parser.add_argument("--list-columns", action="store_true", help="Show detected columns and exit")
+    parser.add_argument("--auto", action="store_true",
+                        help="With --dir: import only new/changed files (state-tracked), for scheduled runs")
     args = parser.parse_args(argv)
 
     if args.list_columns:
@@ -370,6 +432,26 @@ def main(argv=None) -> int:
             p for ext in ("csv", "txt", "xlsx", "xlsm", "xls")
             for p in glob.glob(os.path.join(args.dir, f"*.{ext}"))
         )
+
+    # Scheduled/unattended mode: only touch files that are new or changed.
+    if args.auto and args.dir:
+        summary = auto_import_dir(args.dir, dry_run=args.dry_run)
+        if summary.get("missing_dir"):
+            print(f"Broker folder not found: {summary['missing_dir']}")
+            return 2
+        for name, result in summary["imported"]:
+            print(
+                f"  {result.get('symbol', '?'):9s} imported rows={result['rows_used']:5d} "
+                f"added={result['rows_added']:4d} -> {result['last_date']}  ({name})"
+            )
+        for name, error in summary["failed"]:
+            print(f"  {name:40s} FAILED: {error}")
+        print(
+            f"Auto-import: {len(summary['imported'])} new, "
+            f"{len(summary['skipped'])} unchanged, {len(summary['failed'])} failed."
+        )
+        return 0 if not summary["failed"] else 1
+
     if not files:
         print("No export files found.")
         return 2

@@ -182,6 +182,27 @@ def run_daily_market_cycle(
     config = get_config(mode)
     print(f"Running in {config['name']} mode (time_stop: {config['time_stop_bars']} days, targets: {config['tp1_risk_multiplier']}x/{config['tp2_risk_multiplier']}x)")
 
+    # 0. Optional broker feed. Point PSX_BROKER_DIR at the folder your broker's
+    # downloads/cloud sync land in; any new export is imported before scoring, so
+    # the daily run needs no manual step.
+    broker_dir = os.environ.get("PSX_BROKER_DIR")
+    if broker_dir:
+        try:
+            from import_broker_data import auto_import_dir
+
+            summary = auto_import_dir(broker_dir, dry_run=dry_run)
+            if summary.get("missing_dir"):
+                print(f"   Broker feed: folder not found ({broker_dir}) — continuing without it")
+            else:
+                print(
+                    f"   Broker feed: {len(summary['imported'])} new file(s), "
+                    f"{len(summary['skipped'])} unchanged, {len(summary['failed'])} failed"
+                )
+                for name, err in summary["failed"]:
+                    print(f"      {name}: {err}")
+        except Exception as exc:
+            print(f"   Broker feed: auto-import skipped ({exc})")
+
     watchlist = get_watchlist()
     target_symbols = symbols if symbols else list(watchlist.keys())
     messages = []
@@ -575,14 +596,32 @@ def main():
         return
 
     symbols = [args.symbol.upper()] if args.symbol else None
-    messages = run_daily_market_cycle(
-        token,
-        chat_id,
-        symbols=symbols,
-        dry_run=args.dry_run,
-        strict_freshness=args.strict_freshness,
-        mode=args.mode,
-    )
+    try:
+        messages = run_daily_market_cycle(
+            token,
+            chat_id,
+            symbols=symbols,
+            dry_run=args.dry_run,
+            strict_freshness=args.strict_freshness,
+            mode=args.mode,
+        )
+    except Exception:
+        # An unattended run must never fail silently: alert the chat, then re-raise
+        # so the scheduler/CI marks the job failed.
+        import traceback
+        import html as _html
+
+        if token and chat_id and not args.dry_run:
+            detail = _html.escape(traceback.format_exc(limit=3))[-700:]
+            send_telegram_message(
+                token,
+                chat_id,
+                "⚠️ <b>PSX scan FAILED</b> "
+                f"({datetime.date.today():%d-%b-%Y})\n"
+                "No signals were sent for this run.\n"
+                f"<pre>{detail}</pre>",
+            )
+        raise
 
     if args.dry_run or not token or not chat_id:
         print("\n=== [ACTIONABLE MARKET CARDS PREVIEW] ===")

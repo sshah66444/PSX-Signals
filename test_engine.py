@@ -1261,6 +1261,51 @@ def test_broker_import():
     print("  ✓ Broker import passed (headers, day-first dates, close-only flag, idempotent merge).")
 
 
+def test_auto_import():
+    print("27. Testing unattended broker auto-import (new/changed files only)...")
+    import tempfile
+    import import_broker_data as ibd
+
+    base = generate_isolated_test_data(days=80, base_price=200.0)
+    def _write(path, frame):
+        frame.to_csv(path, index_label="Date", date_format="%d/%m/%Y")
+
+    original_cache = ibd.CACHE_DIR
+    with tempfile.TemporaryDirectory() as inbox, tempfile.TemporaryDirectory() as cache:
+        ibd.CACHE_DIR = cache
+        try:
+            csv_path = os.path.join(inbox, "JSG_OGDC.csv")
+            _write(csv_path, base)
+
+            first = ibd.auto_import_dir(inbox)
+            assert len(first["imported"]) == 1 and not first["skipped"], first
+            assert first["imported"][0][1]["symbol"] == "OGDC"
+
+            # Unchanged file must be skipped on the next scheduled run
+            second = ibd.auto_import_dir(inbox)
+            assert not second["imported"] and len(second["skipped"]) == 1, second
+
+            # A changed/new file is picked up again
+            _write(csv_path, base.iloc[:-1])
+            third = ibd.auto_import_dir(inbox)
+            assert len(third["imported"]) == 1, third
+
+            # A malformed export is reported, never raised (scheduler keeps going)
+            with open(os.path.join(inbox, "JSG_BROKEN.csv"), "w") as fh:
+                fh.write("foo,bar,baz\n1,2,3\n")
+            fourth = ibd.auto_import_dir(inbox)
+            assert len(fourth["failed"]) == 1, fourth
+            assert "JSG_BROKEN.csv" in fourth["failed"][0][0]
+
+            # Missing folder is a soft failure (scan continues without broker data)
+            missing = ibd.auto_import_dir(os.path.join(inbox, "nope"))
+            assert missing.get("missing_dir") and not missing["imported"]
+        finally:
+            ibd.CACHE_DIR = original_cache
+
+    print("  ✓ Auto-import passed (new vs unchanged, malformed file tolerated, missing folder soft-fails).")
+
+
 if __name__ == "__main__":
     print("=== Running Overhauled PSX AlphaSignals Test Suite ===")
     df_test = test_data_integrity()
@@ -1290,6 +1335,7 @@ if __name__ == "__main__":
     test_tiered_signal_model()
     test_benchmark_fallback_and_feed_breaker()
     test_broker_import()
+    test_auto_import()
     print("=== All Verification Tests Passed Successfully! ===")
 
 
