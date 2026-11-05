@@ -122,9 +122,22 @@ while the KSE-100 benchmark feed is stale.
 **Entry archetypes** — all three can reach BUY NOW / BUY ZONE:
 
 * **Breakout** — close above the range high with volume.
+* **Momentum (breakout continuation)** — price already 0.5–12% above the 20-day high with
+  price above both EMAs and the 20 EMA rising. Without this, anything that ran past its
+  breakout level was reported as "Consolidating / Choppy" and silently ignored — which is
+  exactly what happens in a fast recovery.
 * **Pullback (shallow)** — uptrend intact, price tags the 20 EMA.
 * **Pullback (deep)** — long-term uptrend intact, price retraces into the 50 EMA.
 * **Mean reversal** — oversold at support with a reversal candle and ≥ 1.5:1 to TP1.
+
+**Graded macro gate** — `bull` (index above its 50 EMA) and `early` (back above its 20 EMA)
+allow longs; `correction` (below the 20 EMA) and `bear` (below the 200 EMA) block them. The
+previous binary "index above its 50 EMA" veto kept the engine silent through every recovery,
+because the index has to first reclaim a *falling* 50 EMA.
+
+**Delivery cap** — Telegram sends at most `PSX_MAX_CARDS` (default 12) cards per run, ranked
+by conviction; the header reports the full count (e.g. "35 alerts — showing top 12"), and
+everything is always recorded in the ledger and visible in the dashboard.
 
 Each card carries the conviction score, a grade (A requires ≥ 1.5:1 to the first target),
 the exact buy trigger, stop, targets and the full gate/evidence breakdown. Setups upgrade

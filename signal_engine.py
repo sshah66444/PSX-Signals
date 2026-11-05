@@ -375,6 +375,16 @@ def evaluate_bar_strategy(
     is_market_bullish = market_regime.get("is_bullish", True) if market_regime else True
     regime_name = market_regime.get("regime", "UNKNOWN") if market_regime else "UNKNOWN"
     c_market_gate = bool(is_market_bullish)
+    # Graded macro gate. A binary "index above its 50 EMA" veto kept the engine
+    # silent through every recovery, because price must first reclaim a *falling*
+    # 50 EMA. Block longs only while the index is below its short-term trend.
+    trend_state = (market_regime or {}).get("trend_state")
+    if trend_state in ("bull", "early"):
+        macro_ok = True
+    elif trend_state in ("correction", "bear"):
+        macro_ok = False
+    else:
+        macro_ok = c_market_gate  # legacy regimes without a trend_state
     c_rs_leader = bool(bar["Is_RS_Leader"]) if "Is_RS_Leader" in bar else True
     c_squeeze = bool(bar["Is_Squeeze"]) if "Is_Squeeze" in bar else True
     # Relative strength is only meaningful when the benchmark is fresh; scoring it
@@ -391,9 +401,16 @@ def evaluate_bar_strategy(
     c_liquidity = vol_ma >= 80_000
     is_oversold = (rsi <= p_oversold_rsi_max) or (price <= bb_lower * 1.015)
 
+    # Price structure shared by the trend-following archetypes. In a fast recovery
+    # price reclaims both EMAs before EMA-20 crosses back above EMA-50, so the
+    # entry test uses "above both + EMA-20 rising"; full alignment is scored.
+    ema20_prev5 = float(df_ind["EMA_20"].iloc[max(0, idx - 5)])
+    c_ema20_rising = ema20 > ema20_prev5
+    c_above_both = price > ema20 and price > ema50
+
     # --- STRATEGY 1: 20-Day Range Breakout ---
     dist_to_res = (res20 - price) / price
-    if c_trend and (-0.015 <= dist_to_res <= 0.03) and not is_oversold:
+    if c_above_both and (-0.015 <= dist_to_res <= 0.03) and not is_oversold:
         strategy = "BREAKOUT"
         entry_min = round(max(res20 * 0.995, price - 0.3 * atr), 2)
         entry_max = round(max(price, res20 * 1.01), 2)
@@ -410,7 +427,7 @@ def evaluate_bar_strategy(
             "Relative Strength Leader (vs KSE-100)": c_rs_leader,
             "Volatility Compression (Tight Base)": c_squeeze,
             "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
-            "Trend Alignment (Price > 20 & 50 EMA)": c_trend,
+            "Trend Alignment (Price > 20 & 50 EMA)": c_above_both,
             "Resistance Test / Clearance": c_breakout_level,
             f"Volume Surge (Vol >= {p_vol_mult:.2f}x 20MA)": c_volume_surge,
             "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
@@ -434,7 +451,8 @@ def evaluate_bar_strategy(
         blockers = [f"failed gate: {msg}" for msg, passed in hard_gates.items() if not passed]
 
         evidence = {
-            "Trend Alignment (Price > 20 EMA > 50 EMA)": (c_trend, 20),
+            "Trend Alignment (Price > 20 & 50 EMA)": (c_above_both, 20),
+            "Full Alignment (EMA20 > EMA50)": (c_trend, 10),
             **({} if benchmark_stale else {"Relative Strength Leader (vs KSE-100)": (c_rs_leader, 15)}),
             "Volume Surge": (c_volume_surge, 15),
             "Momentum Health (MACD Expanding)": (c_macd_turn, 15),
@@ -447,7 +465,7 @@ def evaluate_bar_strategy(
         grade = _grade_for(score, rr_tp1)
         trigger_met = c_breakout_level and c_volume_surge
         in_zone = (-0.015 <= dist_to_res <= 0.03)
-        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=c_market_gate)
+        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=macro_ok)
         entry_trigger = round(res20 * 1.005, 2)
         trigger_condition = f"daily close above {entry_trigger:.2f} on volume >= {p_vol_mult:.2f}x the 50-day average"
         status = "TRIGGERED" if state == "BUY_NOW" else "WATCHING"
@@ -455,7 +473,7 @@ def evaluate_bar_strategy(
             f"Breakout confirmed: close {price:.2f} cleared {res20:.2f} on {volume / vol_ma:.1f}x volume "
             f"with R:R {rr_tp1}:1 (grade {grade})."
         ))
-        if not c_market_gate and not blockers:
+        if not macro_ok and not blockers:
             trigger_note = f"Macro gate: KSE-100 regime is {regime_name}. Long breakouts suppressed until the index reclaims its 50 EMA."
 
         return {
@@ -562,7 +580,7 @@ def evaluate_bar_strategy(
         grade = _grade_for(score, rr_tp1)
         trigger_met = c_bounce_candle and rsi < p_pb_rsi_max and price > support_ref * 0.995
         in_zone = abs(dist_to_support) <= 0.03
-        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=c_market_gate)
+        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=macro_ok)
         entry_trigger = round(max(price, support_ref), 2)
         trigger_condition = f"daily close back above {entry_trigger:.2f} (the {support_label}) holding the trend"
         status = "TRIGGERED" if state == "BUY_NOW" else "WATCHING"
@@ -570,8 +588,133 @@ def evaluate_bar_strategy(
             f"Pullback entry confirmed: bullish close at the {support_label} ({support_ref:.2f}) "
             f"with trend structure intact and R:R {rr_tp1}:1 (grade {grade})."
         ))
-        if not c_market_gate and not blockers:
+        if not macro_ok and not blockers:
             trigger_note = f"Macro gate: KSE-100 regime is {regime_name}. Long pullbacks suppressed until the index reclaims its 50 EMA."
+
+        return {
+            "strategy": strategy,
+            "track": "swing",
+            "exit_mode": "trailing_ema",
+            "time_stop_bars": p_time_stop_bars,
+            "status": status,
+            "date": date_str,
+            "price": price,
+            "entry_min": entry_min,
+            "entry_max": entry_max,
+            "stop_loss": invalidation,
+            "tp1": tp1,
+            "tp2": tp2,
+            "trailing_stop_ema": round(trailing_ema_val, 2),
+            "trailing_ema_period": p_trailing_ema,
+            "trailing_rule": f"Exit on daily close below EMA-{p_trailing_ema} (Trailing Trend Model)",
+            "risk_pct": round((risk / entry_max) * 100, 1),
+            "rr_tp1": rr_tp1,
+            "rr_tp2": rr_tp2,
+            "trigger_note": trigger_note,
+            "checklist": checklist,
+            "rsi": round(rsi, 1),
+            "atr": round(atr, 2),
+            "vol_ratio": round(volume / vol_ma, 2),
+            "has_true_ohlc": c_true_ohlc,
+            "is_rs_leader": c_rs_leader,
+            "is_squeeze": c_squeeze,
+            "signal_version": SIGNAL_VERSION,
+            "state": state,
+            "score": score,
+            "grade": grade,
+            "entry_trigger": entry_trigger,
+            "trigger_condition": trigger_condition,
+            "blockers": blockers,
+            "hard_gates": hard_gates,
+            "evidence": {k: {"passed": v[0], "weight": v[1]} for k, v in evidence.items()},
+            "mode": mode,
+        }
+
+    # --- STRATEGY 4: Breakout continuation / first pullback after a breakout ---
+    # A stock that has already cleared its 20-day high and is trending is the most
+    # common swing entry, yet STRATEGY 1 only fires within 1.5% of the breakout
+    # level. Without this, every name that runs 5-10% past resistance is reported
+    # as "Consolidating / Choppy" and is invisible to the trader.
+    extension = (price - res20) / res20
+    c_above_breakout = extension > 0.005
+    c_tight_hold = ((high - low) <= 1.5 * atr) or (price >= open_price)
+    # In a fast recovery price reclaims both EMAs before the 20 EMA crosses back
+    # above the 50 EMA, so require "above both + 20 EMA rising" rather than full
+    # alignment (full alignment is scored as evidence instead).
+    if (
+        c_above_both
+        and c_ema20_rising
+        and c_above_breakout
+        and extension <= 0.12
+        and not is_oversold
+        and 50.0 <= rsi <= 78.0
+    ):
+        strategy = "MOMENTUM"
+        # Buy the retest of the breakout level, not the extended print
+        entry_min = round(max(res20, price - 0.75 * atr), 2)
+        entry_max = round(price + 0.20 * atr, 2)
+        invalidation = round(min(res20 * 0.985, price - stop_atr_mult * atr), 2)
+        risk = max(entry_max - invalidation, 0.01)
+        tp1 = round(entry_max + max(tp1_risk_mult * risk, tp1_atr_mult * atr), 2)
+        tp2 = round(entry_max + max(tp2_risk_mult * risk, tp2_atr_mult * atr), 2)
+        rr_tp1 = round((tp1 - entry_max) / (risk + 1e-6), 2)
+        rr_tp2 = round((tp2 - entry_max) / (risk + 1e-6), 2)
+
+        checklist = {
+            f"Macro Market Gate (KSE-100 trend: {regime_name})": c_market_gate,
+            "Relative Strength Leader (vs KSE-100)": c_rs_leader,
+            "Verified Intraday OHLC (True High/Low)": c_true_ohlc,
+            "Price Above 20 & 50 EMA": c_above_both,
+            "EMA-20 Rising (5 sessions)": c_ema20_rising,
+            "Full Alignment (EMA20 > EMA50)": ema20 > ema50,
+            f"Cleared 20-Day High ({res20:.2f})": c_above_breakout,
+            "Holding Above Breakout (Tight Range)": c_tight_hold,
+            f"Momentum Range (RSI 50-78)": 50.0 <= rsi <= 78.0,
+            "Minimum Liquidity (20MA Vol >= 80k)": c_liquidity,
+            "Momentum Health (MACD Histogram Expanding)": c_macd_turn,
+        }
+
+        hard_gates = {
+            "Verified intraday OHLC": c_true_ohlc,
+            "20-day liquidity >= 80k shares": c_liquidity,
+            f"Reward:Risk >= {p_min_rr_tp1:.1f}:1 to TP1": rr_tp1 >= p_min_rr_tp1,
+            "Stop distance within 0.4-12% of price": 0.4 <= (risk / entry_max * 100) <= 12.0,
+            "RSI not overbought (<= 80)": rsi <= 80.0,
+        }
+        blockers = [f"failed gate: {msg}" for msg, passed in hard_gates.items() if not passed]
+
+        evidence = {
+            "Price Above 20 & 50 EMA": (c_above_both, 20),
+            "EMA-20 Rising (5 sessions)": (c_ema20_rising, 10),
+            "Full Alignment (EMA20 > EMA50)": (ema20 > ema50, 10),
+            **({} if benchmark_stale else {"Relative Strength Leader (vs KSE-100)": (c_rs_leader, 15)}),
+            "Volume Confirmation": (c_volume_surge, 15),
+            "Momentum Health (MACD Expanding)": (c_macd_turn, 15),
+            "Healthy RSI (50-78)": (50.0 <= rsi <= 78.0, 10),
+            "Holding Above Breakout (Tight Range)": (c_tight_hold, 10),
+            "Not Over-Extended (<= 6% past breakout)": (extension <= 0.06, 10),
+            "Bullish Close": (price >= open_price, 5),
+        }
+        score = _score_evidence(evidence)
+        grade = _grade_for(score, rr_tp1)
+        # Confirmation is a fresh close at the highs, not a stale extension
+        trigger_met = c_tight_hold and price >= open_price and extension <= 0.06
+        in_zone = extension <= 0.08
+        state = _resolve_state(blockers, score, trigger_met, in_zone, macro_ok=macro_ok)
+        entry_trigger = round(price + 0.20 * atr, 2)
+        trigger_condition = (
+            f"daily close above {entry_trigger:.2f} holding the {res20:.2f} breakout level"
+        )
+        status = "TRIGGERED" if state == "BUY_NOW" else "WATCHING"
+        trigger_note = _state_note(state, blockers, score, grade, trigger_condition, (
+            f"Breakout continuation: {extension * 100:.1f}% above the {res20:.2f} breakout with trend "
+            f"alignment intact; R:R {rr_tp1}:1 (grade {grade})."
+        ))
+        if not macro_ok and not blockers:
+            trigger_note = (
+                f"Macro gate: market trend is {regime_name}. Momentum entries suppressed until the "
+                "index reclaims its short-term trend."
+            )
 
         return {
             "strategy": strategy,

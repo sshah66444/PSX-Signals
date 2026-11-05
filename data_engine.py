@@ -749,10 +749,12 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
         }
 
     # Compute Moving Averages
+    df_kse["EMA_20"] = df_kse["Close"].ewm(span=20, adjust=False).mean()
     df_kse["EMA_50"] = df_kse["Close"].ewm(span=50, adjust=False).mean()
     df_kse["EMA_200"] = df_kse["Close"].ewm(span=min(200, len(df_kse) - 1), adjust=False).mean()
 
     latest_close = float(df_kse["Close"].iloc[-1])
+    latest_ema20 = float(df_kse["EMA_20"].iloc[-1])
     latest_ema50 = float(df_kse["EMA_50"].iloc[-1])
     latest_ema200 = float(df_kse["EMA_200"].iloc[-1])
     last_date = df_kse.index[-1].strftime("%Y-%m-%d")
@@ -771,7 +773,11 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
             "regime": "BENCHMARK_STALE",
             "is_bullish": True,
             "close": round(latest_close, 2),
-            "ema50": round(latest_ema50, 2),
+            "ema20": round(latest_ema20, 2),
+            "ema20": round(latest_ema20, 2),
+        "ema50": round(latest_ema50, 2),
+        "trend_state": _trend_state(latest_close, latest_ema20, latest_ema50, latest_ema200),
+            "trend_state": _trend_state(latest_close, latest_ema20, latest_ema50, latest_ema200),
             "ema200": round(latest_ema200, 2),
             "last_date": last_date,
             "is_settled": is_settled,
@@ -804,7 +810,9 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
         "regime": regime,
         "is_bullish": is_bullish,
         "close": round(latest_close, 2),
+        "ema20": round(latest_ema20, 2),
         "ema50": round(latest_ema50, 2),
+        "trend_state": _trend_state(latest_close, latest_ema20, latest_ema50, latest_ema200),
         "ema200": round(latest_ema200, 2),
         "last_date": last_date,
         "is_settled": is_settled,
@@ -814,6 +822,24 @@ def fetch_kse100_index(force_refresh: bool = False) -> tuple[pd.DataFrame | None
         "benchmark_stale": False,
         "benchmark_age_days": benchmark_age_days,
     }
+
+
+def _trend_state(close: float, ema20: float, ema50: float, ema200: float) -> str:
+    """
+    Classifies the market trend for the macro gate.
+
+    bull       - index above its 50 EMA (established uptrend: all longs allowed)
+    early      - above the 20 EMA but below the 50 EMA (recovery: longs allowed)
+    correction - below the 20 EMA but above the 200 EMA (defensive: no longs)
+    bear       - below the 200 EMA (cash preservation: no longs)
+    """
+    if close >= ema50:
+        return "bull"
+    if close >= ema20:
+        return "early"
+    if close >= ema200:
+        return "correction"
+    return "bear"
 
 
 def build_synthetic_benchmark(frames: dict) -> tuple:
@@ -885,10 +911,12 @@ def build_synthetic_benchmark(frames: dict) -> tuple:
         }
 
     df_bench = index_series.to_frame(name="Close")
+    df_bench["EMA_20"] = df_bench["Close"].ewm(span=20, adjust=False).mean()
     df_bench["EMA_50"] = df_bench["Close"].ewm(span=50, adjust=False).mean()
     df_bench["EMA_200"] = df_bench["Close"].ewm(span=min(200, len(df_bench) - 1), adjust=False).mean()
 
     latest_close = float(df_bench["Close"].iloc[-1])
+    latest_ema20 = float(df_bench["EMA_20"].iloc[-1])
     latest_ema50 = float(df_bench["EMA_50"].iloc[-1])
     latest_ema200 = float(df_bench["EMA_200"].iloc[-1])
     last_dt = df_bench.index[-1]
@@ -918,7 +946,9 @@ def build_synthetic_benchmark(frames: dict) -> tuple:
         "regime": regime,
         "is_bullish": is_bullish,
         "close": round(latest_close, 2),
+        "ema20": round(latest_ema20, 2),
         "ema50": round(latest_ema50, 2),
+        "trend_state": _trend_state(latest_close, latest_ema20, latest_ema50, latest_ema200),
         "ema200": round(latest_ema200, 2),
         "last_date": last_date,
         "is_settled": is_settled,

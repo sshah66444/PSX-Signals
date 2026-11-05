@@ -44,6 +44,10 @@ from swing_config import get_config
 TELEGRAM_TEXT_LIMIT = 3800        # Telegram rejects text > 4096 chars; keep headroom for entities
 TELEGRAM_MAX_ATTEMPTS = 4         # Retries per chunk (rate limits + transient failures)
 TELEGRAM_PACING_SECONDS = 1.1     # ~1 message/sec per chat stays under flood limits
+# A broad market-wide rally can confirm dozens of setups on the same session.
+# Deliver the highest-conviction ones and report the rest in the header, so the
+# chat stays readable (the full list is always in the ledger/dashboard).
+MAX_CARDS_PER_RUN = int(os.environ.get("PSX_MAX_CARDS", "12"))
 
 
 def _split_message(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
@@ -322,7 +326,7 @@ def run_daily_market_cycle(
             if is_new_or_updated:
                 comp_name = watchlist.get(sym, {}).get("name", sym)
                 card = format_actionable_card(setup, company_name=comp_name, mode=mode)
-                new_setup_cards.append(card)
+                new_setup_cards.append((setup.get("score") or 0, card))
     print(
         "   Signal states: "
         f"BUY_NOW={state_counts.get('BUY_NOW', 0)} "
@@ -354,7 +358,9 @@ def run_daily_market_cycle(
         f"────────────────────────\n"
         f"Audited active signals: {len(lifecycle_updates)} updates.\n"
         f"🟢 BUY NOW: {state_counts.get('BUY_NOW', 0)} | 🟡 BUY ZONE: {state_counts.get('BUY_ZONE', 0)} | ⚪ WATCH: {state_counts.get('WATCH', 0)}\n"
-        f"New alerts in this scan: {len(new_setup_cards)}.\n"
+        f"New alerts in this scan: {len(new_setup_cards)}"
+        + (f" (showing top {MAX_CARDS_PER_RUN} by conviction)" if len(new_setup_cards) > MAX_CARDS_PER_RUN else "")
+        + "\n"
     )
     if skipped_symbols:
         header += f"<i>Note: {len(skipped_symbols)} symbols skipped due to data unavailability.</i>\n"
@@ -367,7 +373,8 @@ def run_daily_market_cycle(
     # be broadcast below -- so the returned list (used for the dry-run
     # preview) always matches what a live subscriber actually receives.
     messages.insert(0, header)
-    messages.extend(new_setup_cards)
+    ranked_cards = [card for _, card in sorted(new_setup_cards, key=lambda x: -x[0])]
+    messages.extend(ranked_cards[:MAX_CARDS_PER_RUN])
     if no_signals_note:
         messages.append(no_signals_note)
 
@@ -378,7 +385,7 @@ def run_daily_market_cycle(
     if not dry_run and token and chat_id:
         outbox = [header]
         outbox.extend([upd["text"] for upd in lifecycle_updates])
-        outbox.extend(new_setup_cards)
+        outbox.extend(ranked_cards[:MAX_CARDS_PER_RUN])
         if no_signals_note:
             outbox.append(no_signals_note)
 
