@@ -1,11 +1,12 @@
 name: PSX Telegram Commands
 on:
   schedule:
-    # Preserve the old command-polling windows without running its stale daily scan.
-    - cron: '41 19 * * 1-5'
-      timezone: 'Asia/Karachi'
-    - cron: '17 21 * * 1-5'
-      timezone: 'Asia/Karachi'
+    # Pakistan is UTC+5 year-round. GitHub cron is UTC-only (a `timezone:` key is
+    # NOT honoured, causing runs to trigger at written UTC times in the middle of the night).
+    # 14:41 UTC = 19:41 PKT
+    # 16:17 UTC = 21:17 PKT
+    - cron: '41 14 * * 1-5'
+    - cron: '17 16 * * 1-5'
   workflow_dispatch:
 permissions:
   contents: write
