@@ -272,12 +272,39 @@ def fold_of(date, bounds) -> int:
     return len(bounds)
 
 
-def signal_trades(frames: dict, mode: str = "swing_trade", bench=None, warmup: int = WARMUP_BARS):
+def gap_event_proxy(df, idx: int, lookback: int = 5, gap_pct: float = 0.05,
+                    vol_mult: float = 2.5) -> bool:
+    """
+    PROXY for "something happened here": a >=5% session or >=2.5x volume in the last
+    `lookback` bars. Cached history has no announcement archive, so this stands in for
+    corporate news when measuring the gate. It is a market-reaction proxy, not the
+    announcement agent -- label it that way in any report.
+    """
+    if df is None or idx < 26:
+        return False
+    closes = df["Close"].to_numpy(dtype=float)
+    volumes = df["Volume"].to_numpy(dtype=float) if "Volume" in df else None
+    start = max(1, idx - lookback + 1)
+    for position in range(start, idx + 1):
+        previous = closes[position - 1]
+        if previous > 0 and abs(closes[position] / previous - 1.0) >= gap_pct:
+            return True
+    if volumes is not None:
+        baseline = float(np.median(volumes[max(0, idx - 20):idx])) if idx > 0 else 0.0
+        if baseline > 0 and np.any(volumes[start: idx + 1] >= vol_mult * baseline):
+            return True
+    return False
+
+
+def signal_trades(frames: dict, mode: str = "swing_trade", bench=None, warmup: int = WARMUP_BARS,
+                  event_filter=None):
     """
     Runs the live engine bar-by-bar and simulates the Stage-1 exits.
 
     One position per symbol at a time (the ledger's per-symbol dedupe, mirrored),
-    entry on the next open, and unfillable >7.5% gap-ups skipped.
+    entry on the next open, and unfillable >7.5% gap-ups skipped. When `event_filter`
+    is given it is called as (symbol, date, frame, index) and a truthy result blocks
+    the entry -- that is how the event gate is measured against the null model.
     """
     cfg = get_config(mode)
     regimes = regime_series(bench)
@@ -306,6 +333,8 @@ def signal_trades(frames: dict, mode: str = "swing_trade", bench=None, warmup: i
                 mode=mode,
             )
             if setup.get("state") not in ENTRY_STATES:
+                continue
+            if event_filter is not None and event_filter(symbol, ind.index[idx], ind, idx):
                 continue
             entry_idx = idx + 1
             entry_price = float(ind.iloc[entry_idx]["Open"])
@@ -408,7 +437,8 @@ def _trade_stats(trades):
 
 
 def walk_forward(frames=None, mode: str = "swing_trade", folds: int = 3, iterations: int = 200,
-                 seed: int = 7, cache_dirs=None, symbols=None) -> dict:
+                 seed: int = 7, cache_dirs=None, symbols=None, event_filter=None,
+                 event_label: str = None) -> dict:
     """
     Evaluates the fixed rule set across folds and against matched random entries.
 
@@ -421,7 +451,7 @@ def walk_forward(frames=None, mode: str = "swing_trade", folds: int = 3, iterati
         return {"error": "No cached history found. Run a scan first or point --cache at a folder."}
 
     bench = build_benchmark(frames)
-    trades, skipped = signal_trades(frames, mode=mode, bench=bench)
+    trades, skipped = signal_trades(frames, mode=mode, bench=bench, event_filter=event_filter)
     report = {
         "mode": mode,
         "folds": max(1, int(folds)),
@@ -429,6 +459,7 @@ def walk_forward(frames=None, mode: str = "swing_trade", folds: int = 3, iterati
         "symbols": sorted(frames),
         "skipped": skipped,
         "trades": trades,
+        "event_gate": event_label,
         "bounds": [],
         "by_fold": [],
         "overall": _trade_stats([]),
@@ -515,6 +546,8 @@ def format_report_text(report: dict) -> str:
         f"null iterations={report['null_iterations']}",
         f"symbols: {', '.join(report['symbols']) or '(none)'}",
     ]
+    if report.get("event_gate"):
+        lines.append(f"event gate: {report['event_gate']}")
     for skipped in report.get("skipped", []):
         lines.append(f"  skipped {skipped['symbol']}: {skipped['reason']}")
     lines.append("=" * 74)
@@ -562,14 +595,39 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=7, help="Null-model RNG seed")
     parser.add_argument("--symbols", nargs="*", help="Limit to these symbols (default: all cached)")
     parser.add_argument("--cache", nargs="*", help="Override cache directories")
+    parser.add_argument("--event-proxy", action="store_true",
+                        help="Also run with a gap/volume event gate (proxy for announcements)")
     parser.add_argument("--json", help="Also write the full report to this JSON path")
     args = parser.parse_args(argv)
 
-    report = walk_forward(
-        mode=args.mode, folds=args.folds, iterations=args.iterations,
-        seed=args.seed, cache_dirs=args.cache, symbols=args.symbols,
-    )
-    print(format_report_text(report))
+    if args.event_proxy:
+        frames = load_frames(args.symbols, args.cache)
+        base = walk_forward(frames=frames, mode=args.mode, folds=args.folds,
+                            iterations=args.iterations, seed=args.seed)
+        gated = walk_forward(
+            frames=frames, mode=args.mode, folds=args.folds, iterations=args.iterations,
+            seed=args.seed,
+            event_filter=lambda symbol, date, frame, idx: gap_event_proxy(frame, idx),
+            event_label="gap/volume proxy: >=5% session or >=2.5x volume in the last 5 bars",
+        )
+        print(format_report_text(base))
+        print()
+        print(format_report_text(gated))
+        if base.get("error") or gated.get("error"):
+            return 1
+        print(
+            f"\nEvent-gate comparison: {base['overall']['n']} trades -> {gated['overall']['n']} trades | "
+            f"expectancy {base['overall']['expectancy_pct']:+.2f}% -> "
+            f"{gated['overall']['expectancy_pct']:+.2f}% | "
+            f"win {base['overall']['win_rate_pct']}% -> {gated['overall']['win_rate_pct']}%"
+        )
+        report = gated
+    else:
+        report = walk_forward(
+            mode=args.mode, folds=args.folds, iterations=args.iterations,
+            seed=args.seed, cache_dirs=args.cache, symbols=args.symbols,
+        )
+        print(format_report_text(report))
 
     if args.json and not report.get("error"):
         import json

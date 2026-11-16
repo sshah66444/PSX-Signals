@@ -418,6 +418,83 @@ walk-forward with a fresh cache every month.
 
 ---
 
+## 🗓 Stage 2: The Event-Risk Agent (veto only, and measured)
+
+Stage 1 showed the entry logic is indistinguishable from matched random entries
+(p = 0.055) and regime-dependent. The first agent that earns its place is therefore
+**not** another opinion generator — it is the one input technicals cannot see: the
+corporate calendar.
+
+### What it does
+
+`event_risk.py` is a deterministic gate with veto rights. It classifies stored
+announcements, scores them, and **cites the row it acted on**:
+
+| Verdict | Window | Effect |
+|---|---|---|
+| `BLOCK` | results ±2d, board meeting ±1d, book closure ±2d, ex-dividend ±2d, right/bonus ±3d, suspension ±30d, material notice ±1d | `BUY_NOW`/`BUY_ZONE` → `AVOID` |
+| `WATCH` | the escalate window (results 6d, AGM 2d, …) | `BUY_NOW`/`BUY_ZONE` → `WATCH` |
+| `CLEAR` | nothing inside the window | passes through untouched |
+
+The session **after** an event is still blocked (`LOOKBACK_DAYS`), because that is
+where the gap repricing lands. No stored event → `CLEAR`, and the assessment says
+`events_known: 0` so silence stays visible instead of implying safety.
+
+Every downgrade is applied by `apply_event_gate()` (pure, returns a copy), which keeps
+`gate_downgraded_from` so a card can never be mistaken for a fresh signal, appends the
+reason to `blockers`, and prefixes the trigger note. The daily scan reports
+`event-gated: N` in its header, and `/events OGDC` shows the verdict plus the next
+90 days of the calendar.
+
+### Data reality (the honest part)
+
+PSX serves announcements as an HTML fragment from a form `POST` to
+`dps.psx.com.pk/announcements` — the visible page is a JS shell, and automated requests
+currently come back **403**. So the module does not pretend:
+
+* `--refresh` tries the documented POST and the public pages; on failure it reports why
+  and **leaves the store untouched** (a failed fetch never wipes known events).
+* `--import page.html` / `--import events.json` is the supported path: save the
+  announcements page from a browser (or export rows) and import it. Unrecognised files
+  add nothing and say so.
+* `--add OGDC RESULTS 2026-11-20 --headline "..."` seeds a known event by hand.
+* `--check OGDC MEBL` prints the verdicts.
+
+Store: `.state/events.json` (atomic writes, deduped by symbol+type+date+headline).
+Vetoes are appended to `.state/event_gate_log.jsonl` — blocked setups never reach the
+trade ledger, so this is the only way to price them later.
+
+### The measurement
+
+The announcement archive is not available historically, so the gate was evaluated with
+an **explicit proxy**: block entries when the last 5 bars contain a ≥5% session or
+≥2.5× median volume (i.e. "something just happened here").
+
+```
+python walkforward.py --event-proxy --folds 3 --iterations 200
+```
+
+| Run | Trades | Expectancy | Win rate | p vs random |
+|---|---|---|---|---|
+| No gate | 450 | **+0.38%** | 33.6% | 0.055 |
+| Gap/volume proxy gate | 310 | **−0.54%** | 29.0% | 0.851 |
+
+**The veto hurt.** Filtering recently-active names removed precisely the momentum
+continuations carrying the positive expectancy (expectancy fell 0.92pp, win rate 4.6pp).
+That is a legitimate negative result and it sets the rule:
+
+> The event gate stays **narrow** — scheduled corporate events only (results, book
+> closure, ex-dividend, right/bonus, suspension). It is not a general "avoid volatility"
+> filter, and the proxy test forbids widening it into one.
+
+What is still unproven is the *real* announcement gate, because no historical archive of
+PSX announcements exists in the repo. That is what `.state/event_gate_log.jsonl` is for:
+each live veto is recorded with its symbol, verdict, original state and cited event, so
+after a few months the blocked names can be priced against the taken trades and the gate
+can be judged on evidence rather than intent.
+
+---
+
 ## 📂 Project Architecture
 
 ```
@@ -430,10 +507,13 @@ psx-signal-screener/
 ├── signal_tracker.py       # Persistent SQLite ledger (signals.db) with WAL concurrency
 ├── attribution.py          # Settled-trade attribution, excess vs KSE-100, sample guards
 ├── walkforward.py          # Out-of-sample replay + matched random-entry null model
+├── event_risk.py           # Announcement store, event verdicts, veto gate & forward log
 ├── telegram_notifier.py    # Telegram bot with daily scans, lifecycle updates & /commands
 ├── run_swing_scan.command  # macOS double-click launcher for a live swing scan
 ├── test_engine.py          # Automated verification test suite
 ├── test_ledger_integrity.py # Stage-0 ledger tests (isolated temp DB, never signals.db)
+├── test_stage1.py          # Exit profile + walk-forward/null-model tests
+├── test_stage2.py          # Event gate: classification, store, verdicts, parser, log
 ├── signals.db              # SQLite persistent trade ledger (WAL enabled)
 └── .github/workflows/
     ├── daily_psx_signals.yml # Telegram /command polling runner

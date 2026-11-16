@@ -42,6 +42,15 @@ from signal_tracker import (
     backfill_benchmark_returns,
 )
 from attribution import build_attribution, format_attribution_text, load_ledger
+from event_risk import (
+    assess as assess_event_risk,
+    apply_event_gate,
+    load_events,
+    log_gate_decision,
+    refresh_events,
+    upcoming_events,
+)
+from html import escape as _escape
 from swing_config import get_config
 
 
@@ -327,13 +336,41 @@ def run_daily_market_cycle(
     for upd in lifecycle_updates:
         messages.append(upd["text"])
 
+    # 3c. Event-risk agent: corporate announcements are the one input technicals
+    # cannot see. The refresh is best-effort -- a failed fetch keeps the previous
+    # store intact rather than inventing events, and dry runs never write to it.
+    events = []
+    if not dry_run and os.environ.get("PSX_EVENTS_REFRESH", "1") != "0":
+        try:
+            refreshed = refresh_events()
+            if refreshed.get("error"):
+                print(f"   Events: refresh skipped ({refreshed['error']})")
+            else:
+                print(f"   Events: {refreshed['added']} new announcement(s), "
+                      f"{refreshed['total']} stored")
+        except Exception as exc:  # never let the news feed break the scan
+            print(f"   Events: refresh failed ({exc})")
+    event_store = load_events()
+    if event_store.get("error"):
+        print(f"   Events: store warning ({event_store['error']})")
+    events = event_store["events"]
+
     # 4. Evaluate setups for new/updated triggers. Collected only, same reason.
     print("4. Evaluating setups across watchlist...")
     new_setup_cards = []
+    event_blocked = 0
     state_counts = {"BUY_NOW": 0, "BUY_ZONE": 0, "WATCH": 0, "AVOID": 0}
     for sym, m_info in market_data.items():
         df = m_info["df"]
         setup = generate_signal(sym, df, data_meta=m_info, df_kse=df_kse, market_regime=regime_info, mode=mode)
+        # Veto rights for the calendar: results days, book closures, suspensions.
+        setup = apply_event_gate(setup, assess_event_risk(sym, events=events))
+        if setup.get("gate_downgraded_from"):
+            event_blocked += 1
+            if not dry_run:
+                # Blocked setups never reach the ledger, so log the veto itself --
+                # otherwise the gate could never be priced against what it avoided.
+                log_gate_decision(setup.get("event_risk"), setup["gate_downgraded_from"])
         state = setup.get("state")
         state_counts[state] = state_counts.get(state, 0) + 1
 
@@ -356,7 +393,8 @@ def run_daily_market_cycle(
         f"BUY_NOW={state_counts.get('BUY_NOW', 0)} "
         f"BUY_ZONE={state_counts.get('BUY_ZONE', 0)} "
         f"WATCH={state_counts.get('WATCH', 0)} "
-        f"AVOID={state_counts.get('AVOID', 0)}"
+        f"AVOID={state_counts.get('AVOID', 0)} "
+        f"(event-gated: {event_blocked})"
     )
 
     # 5. Summary header
@@ -373,6 +411,13 @@ def run_daily_market_cycle(
     else:
         bench_line = f"📈 KSE-100: <b>{kse_close:,.2f}</b> | 50 EMA: <b>{kse_ema50:,.2f}</b>\n"
 
+    event_line = ""
+    if event_blocked:
+        event_line = (
+            f"🗓 Event gate suppressed: {event_blocked} setup(s) — "
+            "results / book-closure / suspension windows.\n"
+        )
+
     header = (
         f"📊 <b>PSX AlphaSignals Daily Market Scan</b>\n"
         f"📅 Date: <b>{today_str}</b>\n"
@@ -385,6 +430,7 @@ def run_daily_market_cycle(
         f"New alerts in this scan: {len(new_setup_cards)}"
         + (f" (showing top {MAX_CARDS_PER_RUN} by conviction)" if len(new_setup_cards) > MAX_CARDS_PER_RUN else "")
         + "\n"
+        + event_line
     )
     if skipped_symbols:
         header += f"<i>Note: {len(skipped_symbols)} symbols skipped due to data unavailability.</i>\n"
@@ -442,6 +488,7 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
             "• <b>/why &lt;SYM&gt;</b> — Detailed pass/fail reasoning for a stock\n"
             "• <b>/performance</b> — Audited track record from the live signal ledger\n"
             "• <b>/attribution</b> — Settled-trade expectancy, excess vs KSE-100, sample warnings\n"
+            "• <b>/events &lt;SYM&gt;</b> — Upcoming announcements and the event-risk verdict\n"
             f"• <b>/watchlist</b> — List all {len(watchlist)} tracked PSX equities\n"
         )
         send_telegram_message(token, chat_id, reply)
@@ -510,6 +557,37 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
         rows = load_ledger(track=track_arg)
         stats = build_attribution(rows)
         send_telegram_message(token, chat_id, format_attribution_text(stats))
+
+    elif cmd == "/events":
+        if len(parts) < 2:
+            send_telegram_message(token, chat_id, "Please specify a symbol, e.g. <code>/events OGDC</code>")
+            return
+        sym = parts[1].upper().replace("$", "")
+        store = load_events()
+        assessment = assess_event_risk(sym, events=store["events"])
+        lines = [
+            f"🗓 <b>Event risk — ${sym}</b>",
+            f"Verdict: <b>{assessment['verdict']}</b> (risk {assessment['risk_score']}/100, "
+            f"as of {assessment['as_of']})",
+        ]
+        for blocker in assessment["blockers"]:
+            lines.append(f"⛔ {_escape(blocker)}")
+        for warning in assessment["warnings"]:
+            lines.append(f"⚠️ {_escape(warning)}")
+        if not assessment["cited"]:
+            lines.append("<i>No stored events inside the window.</i>")
+        upcoming = upcoming_events(store["events"], sym, horizon_days=90)
+        if upcoming:
+            lines += ["", "<b>Next 90 days:</b>"]
+            for event in upcoming[:8]:
+                lines.append(
+                    f"• {event['event_date']} ({event['days_ahead']:+d}d) "
+                    f"{event['type']}: {_escape(event['headline'][:70])}"
+                )
+        if store.get("error"):
+            lines.append(f"\n<i>Store warning: {_escape(store['error'])}</i>")
+        lines.append(f"<i>Store updated: {store.get('updated_at') or 'never'}</i>")
+        send_telegram_message(token, chat_id, "\n".join(lines))
 
     elif cmd in ["/stock", "/why"]:
         if len(parts) < 2:
