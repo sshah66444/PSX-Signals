@@ -396,25 +396,32 @@ against that null distribution.
 python walkforward.py --folds 3 --iterations 200 --json wf_report.json
 ```
 
-Result on the 16 Nov 2026 cache (74 symbols, Sep-2024 → Nov-2026, 450 trades):
+Result on the uniform 2-year cache (71 symbols, 18 Nov 2024 → 13 Nov 2026, **1,361
+trades**, identical coverage in every fold):
 
 | Window | Trades | Expectancy | Win rate | Profit factor | Random entries |
 |---|---|---|---|---|---|
-| Pooled | 450 | **+0.38%** | 33.6% | 1.14 | −0.10% |
-| Fold 1 (2024-09 → 2025-05) | 66 | +2.45% | 37.9% | 1.71 | −0.18% |
-| Fold 2 (2025-05 → 2026-02) | 70 | +4.54% | 50.0% | 2.76 | **+4.61%** |
-| Fold 3 (2026-02 → 2026-11) | 314 | −0.99% | 29.0% | 0.61 | −1.14% |
+| Pooled | 1361 | **−0.06%** | 35.5% | 0.98 | **+0.49%** |
+| Fold 1 (2025-02 → 2025-09) | 420 | +1.15% | 39.3% | 1.40 | +1.70% |
+| Fold 2 (2025-09 → 2026-04) | 466 | −0.47% | 33.7% | 0.85 | +0.38% |
+| Fold 3 (2026-04 → 2026-11) | 475 | −0.72% | 33.9% | 0.73 | −0.45% |
 
-**Verdict: indistinguishable from matched random entries (p = 0.055).** The edge is
-not established: fold 2's random control did as well as the signal, fold 3 is
-negative, and the pooled p-value misses 0.05. The `maxDD` figure in that report
-compounds every trade at full size and is a sequence artifact, not a portfolio
-drawdown.
+**Verdict: no edge — p = 0.99, and matched random entries did better (+0.49% vs
+−0.06%).** The signal sits at the bottom of the random distribution, not the top.
+
+An earlier run on the *mixed* cache (12 symbols with two years, 62 with about six
+months) showed +0.38%/trade and p = 0.055. `refresh_cache.py` exists precisely to test
+whether that was regime or coverage — it was coverage. On equal data the apparent edge
+disappears and reverses. The old number stays documented because it is the cleanest
+example of why this harness exists: a promising result evaporated once the comparison
+was made fair. (The `maxDD` column compounds every trade at full size; it is a
+sequence artifact, not a portfolio drawdown.)
 
 What this means in practice: Stage 1 made the *exits* honest and the *measurement*
-auditable, but it did **not** prove an entry edge. Do not add agents, size up, or
-tune parameters on this evidence — collect more settled trades first, and re-run the
-walk-forward with a fresh cache every month.
+auditable, but the **entry logic has no demonstrated edge**. Do not add agents, size up
+or tune parameters on this evidence. The next honest step is to change what is tested
+(different universe, different archetype weighting, a longer window) rather than
+re-cutting the same rules.
 
 ---
 
@@ -448,19 +455,28 @@ reason to `blockers`, and prefixes the trigger note. The daily scan reports
 
 ### Data reality (the honest part)
 
-PSX serves announcements as an HTML fragment from a form `POST` to
-`dps.psx.com.pk/announcements` — the visible page is a JS shell, and automated requests
-currently come back **403**. So the module does not pretend:
+PSX's own endpoints do **not** serve announcements to scripts: the page is a JS shell
+and the underlying `POST dps.psx.com.pk/announcements` answers **403**. The working
+source is the SCS Trade announcement grid
+(`POST scstrade.com/MarketStatistics/MS_Announcements.aspx/chartact`), which returns
+real JSON rows: company code, board-meeting date, quarter, EPS, declared dividend,
+bonus, right %, book-closure/ex-dividend date and the PSX PDF link.
 
-* `--refresh` tries the documented POST and the public pages; on failure it reports why
-  and **leaves the store untouched** (a failed fetch never wipes known events).
-* `--import page.html` / `--import events.json` is the supported path: save the
-  announcements page from a browser (or export rows) and import it. Unrecognised files
-  add nothing and say so.
-* `--add OGDC RESULTS 2026-11-20 --headline "..."` seeds a known event by hand.
-* `--check OGDC MEBL` prints the verdicts.
+`parse_scstrade_announcements()` turns one row into up to four gate events, because
+they carry different risk windows — the board meeting (results date), the book closure
+(ex-dividend), a bonus issue and a right issue.
 
-Store: `.state/events.json` (atomic writes, deduped by symbol+type+date+headline).
+Resolution order, so nothing is ever invented:
+
+1. `--refresh` → SCS Trade feed (primary), then PSX pages as fallback. On total failure
+   it reports why and **leaves the store untouched**.
+2. `--import page.html` / `--import events.json` — saved page or export.
+3. `--add OGDC RESULTS 2026-11-20 --headline "..."` — seed a known event by hand.
+4. `--check OGDC MEBL` — print verdicts.
+
+Store: `.state/events.json` (atomic writes, deduped). The first live refresh (16 Nov
+2026) imported **20 real watchlist events** (17 results, 3 ex-dividend, 28 Oct → 19 Nov)
+and the gate immediately did its job: `SNGP — WATCH`, ex-dividend 30% in 3 days.
 Vetoes are appended to `.state/event_gate_log.jsonl` — blocked setups never reach the
 trade ledger, so this is the only way to price them later.
 
@@ -471,21 +487,29 @@ an **explicit proxy**: block entries when the last 5 bars contain a ≥5% sessio
 ≥2.5× median volume (i.e. "something just happened here").
 
 ```
-python walkforward.py --event-proxy --folds 3 --iterations 200
+python walkforward.py --cache .cache_2y --event-proxy --folds 3 --iterations 200
 ```
 
-| Run | Trades | Expectancy | Win rate | p vs random |
+| Cache | No gate | With proxy gate | Random entries | p |
 |---|---|---|---|---|
-| No gate | 450 | **+0.38%** | 33.6% | 0.055 |
-| Gap/volume proxy gate | 310 | **−0.54%** | 29.0% | 0.851 |
+| Mixed (450 trades) | +0.38% | **−0.54%** | −0.10% | 0.851 |
+| Uniform 2y (1,361 → 765 trades) | −0.06% | **+0.36%** | +0.46% | 0.682 |
 
-**The veto hurt.** Filtering recently-active names removed precisely the momentum
-continuations carrying the positive expectancy (expectancy fell 0.92pp, win rate 4.6pp).
-That is a legitimate negative result and it sets the rule:
+**The proxy's effect flipped sign between the two data sets** — it hurt on the mixed
+cache and helped on the uniform one, and even when it "helped" it still finished below
+matched random entries (+0.36% vs +0.46%, p = 0.68). An unstable effect is not a
+finding, so the proxy justifies nothing either way.
 
-> The event gate stays **narrow** — scheduled corporate events only (results, book
-> closure, ex-dividend, right/bonus, suspension). It is not a general "avoid volatility"
-> filter, and the proxy test forbids widening it into one.
+That fixes the design rule: the event gate stays **narrow** — scheduled corporate
+events only (results, book closure, ex-dividend, right/bonus, suspension). Widening it
+into a general "avoid recently active names" filter has no stable evidence behind it,
+and the harness would reject it again.
+
+What is still unproven is the *real* announcement gate, because no historical archive of
+PSX announcements exists in the repo. `.state/event_gate_log.jsonl` is the answer to
+that: each live veto is recorded with its symbol, verdict, original state and cited
+event, so after a few months the blocked names can be priced against the taken trades
+and the gate can be judged on evidence rather than intent.
 
 What is still unproven is the *real* announcement gate, because no historical archive of
 PSX announcements exists in the repo. That is what `.state/event_gate_log.jsonl` is for:
@@ -507,6 +531,7 @@ psx-signal-screener/
 ├── signal_tracker.py       # Persistent SQLite ledger (signals.db) with WAL concurrency
 ├── attribution.py          # Settled-trade attribution, excess vs KSE-100, sample guards
 ├── walkforward.py          # Out-of-sample replay + matched random-entry null model
+├── refresh_cache.py        # Downloads one uniform history window for the watchlist
 ├── event_risk.py           # Announcement store, event verdicts, veto gate & forward log
 ├── telegram_notifier.py    # Telegram bot with daily scans, lifecycle updates & /commands
 ├── run_swing_scan.command  # macOS double-click launcher for a live swing scan

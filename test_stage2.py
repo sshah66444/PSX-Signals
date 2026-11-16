@@ -304,8 +304,79 @@ class ImportTest(unittest.TestCase):
             self.assertIn("cannot read", result["error"])
 
 
+SCS_PAYLOAD = {
+    "d": [
+        {
+            "company_code": "MEBL", "company_name": "Meezan Bank Limited", "sector_name": "BANK",
+            "bm_date": "/Date(1794769200000)/", "bm_quarter_number": "3Q26",
+            "bm_eps_quarter": "7.5", "bm_eps_cum": "21.1", "bm_dividend": "40%",
+            "bm_bonus": "", "bm_right_per": "",
+            "bm_bc_exp": "/Date(1796065200000)/",
+            "bm_PDFLink": "https://dps.psx.com.pk/download/document/1.pdf",
+        },
+        {
+            "company_code": "XYZ", "company_name": "Example Ltd", "sector_name": "OTHER",
+            "bm_date": "/Date(1794769200000)/", "bm_quarter_number": "1Q27",
+            "bm_eps_quarter": "", "bm_dividend": "", "bm_bonus": "", "bm_right_per": "",
+            "bm_bc_exp": "", "bm_PDFLink": "",
+        },
+    ]
+}
+
+
+class ScstradeFeedTest(unittest.TestCase):
+    """The working live feed: real board-meeting / book-closure rows as JSON."""
+
+    def test_dotnet_dates_are_converted(self):
+        import datetime as dt
+
+        expected = dt.datetime.fromtimestamp(1794769200).date().isoformat()
+        self.assertEqual(event_risk._parse_dotnet_date("/Date(1794769200000)/"), expected)
+        self.assertEqual(event_risk._parse_dotnet_date("2026-11-20"), "2026-11-20")
+        self.assertIsNone(event_risk._parse_dotnet_date(""))
+
+    def test_row_becomes_results_and_ex_dividend_events(self):
+        events = event_risk.parse_scstrade_announcements(SCS_PAYLOAD, symbols=["MEBL"])
+        self.assertEqual(len(events), 2, events)
+        by_type = {event["type"]: event for event in events}
+        self.assertIn("RESULTS", by_type)
+        self.assertIn("EX_DIVIDEND", by_type)
+        results = by_type["RESULTS"]
+        self.assertIn("EPS 7.5", results["headline"])
+        self.assertIn("dividend 40%", results["headline"])
+        self.assertEqual(results["source"], "scstrade")
+        self.assertIn("download/document/1.pdf", results["url"])
+        self.assertEqual(by_type["EX_DIVIDEND"]["event_date"],
+                         event_risk._parse_dotnet_date("/Date(1796065200000)/"))
+        self.assertIn("40%", by_type["EX_DIVIDEND"]["headline"])
+
+    def test_symbol_filter_excludes_other_companies(self):
+        events = event_risk.parse_scstrade_announcements(SCS_PAYLOAD, symbols=["MEBL"])
+        self.assertTrue(all(event["symbol"] == "MEBL" for event in events))
+
+    def test_row_without_details_is_a_board_meeting(self):
+        events = event_risk.parse_scstrade_announcements(SCS_PAYLOAD, symbols=["XYZ"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "BOARD_MEETING")
+
+    def test_bonus_and_right_issues_get_their_own_events(self):
+        payload = {"d": [{
+            "company_code": "OGDC", "bm_date": "/Date(1794769200000)/",
+            "bm_quarter_number": "1Q27", "bm_eps_quarter": "5.1",
+            "bm_dividend": "", "bm_bonus": "10%", "bm_right_per": "20%",
+            "bm_bc_exp": "/Date(1796065200000)/", "bm_PDFLink": "",
+        }]}
+        types = {event["type"] for event in event_risk.parse_scstrade_announcements(payload)}
+        self.assertEqual(types, {"RESULTS", "BONUS_ISSUE", "RIGHT_ISSUE"})
+
+    def test_empty_payload_returns_nothing(self):
+        self.assertEqual(event_risk.parse_scstrade_announcements({"d": []}), [])
+        self.assertEqual(event_risk.parse_scstrade_announcements({}), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

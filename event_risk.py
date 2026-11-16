@@ -50,6 +50,18 @@ PSX_SOURCES = (
 )
 # The announcements page is a JS shell; the rows come from a form POST to this URL.
 PSX_POST_URL = "https://dps.psx.com.pk/announcements"
+# Working feed (verified 2026-11-16): SCS Trade's announcement grid returns real
+# board-meeting / book-closure / dividend rows as JSON. PSX's own endpoints answer
+# 403 to automation, so this is the primary source and the DPS pages are fallbacks.
+SCSTRADE_URL = "https://www.scstrade.com/MarketStatistics/MS_Announcements.aspx/chartact"
+SCSTRADE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+    "Content-Type": "application/json; charset=utf-8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.scstrade.com/MarketStatistics/MS_Announcements.aspx",
+}
 
 # Per-type windows in calendar days. `block` = hard veto lead time, `escalate` =
 # demote-to-WATCH lead time. -1 days of look-back means "also the session after",
@@ -144,6 +156,121 @@ def _as_date(value):
         return datetime.date.fromisoformat(str(value)[:10])
     except (ValueError, TypeError):
         return None
+
+
+def _parse_dotnet_date(value):
+    """PSX/SCS feeds encode dates as /Date(1794769200000)/ (ms since epoch)."""
+    match = re.search(r"/Date\((-?\d+)\)/", str(value or ""))
+    if match:
+        try:
+            return datetime.datetime.fromtimestamp(int(match.group(1)) / 1000.0).date().isoformat()
+        except (ValueError, OSError, OverflowError):
+            return None
+    return _parse_date(value)
+
+
+def parse_scstrade_announcements(payload, symbols=None) -> list:
+    """
+    Maps SCS Trade announcement rows onto gate events.
+
+    One source row can describe several events: the board meeting (results date), the
+    book closure / ex-dividend date, a bonus issue and a right issue. Each is emitted
+    separately with its own date, because they carry different risk windows.
+    """
+    if isinstance(payload, dict):
+        rows = payload.get("d") or payload.get("data") or []
+    else:
+        rows = payload or []
+    wanted = {str(symbol).upper() for symbol in symbols} if symbols else None
+
+    events = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("company_code") or "").strip().upper()
+        if not symbol or (wanted and symbol not in wanted):
+            continue
+        quarter = str(row.get("bm_quarter_number") or "").strip()
+        dividend = str(row.get("bm_dividend") or "").strip()
+        bonus = str(row.get("bm_bonus") or "").strip()
+        right = str(row.get("bm_right_per") or "").strip()
+        eps = str(row.get("bm_eps_quarter") or "").strip()
+        pdf = str(row.get("bm_PDFLink") or "").strip()
+        meeting_date = _parse_dotnet_date(row.get("bm_date"))
+        closure_date = _parse_dotnet_date(row.get("bm_bc_exp"))
+        details = ", ".join(part for part in (
+            f"EPS {eps}" if eps else "",
+            f"dividend {dividend}" if dividend else "",
+            f"bonus {bonus}" if bonus else "",
+            f"right {right}" if right else "",
+        ) if part)
+
+        if meeting_date:
+            events.append(_clean_event({
+                "symbol": symbol,
+                "type": "RESULTS" if details else "BOARD_MEETING",
+                "event_date": meeting_date,
+                "headline": f"Board meeting {quarter}".strip()
+                            + (f" — {details}" if details else ""),
+                "source": "scstrade",
+                "url": pdf,
+            }))
+        if closure_date:
+            label = f" ({quarter})" if quarter else ""
+            if dividend:
+                events.append(_clean_event({
+                    "symbol": symbol, "type": "EX_DIVIDEND", "event_date": closure_date,
+                    "headline": f"Book closure / ex-dividend {dividend}{label}",
+                    "source": "scstrade", "url": pdf,
+                }))
+            if bonus:
+                events.append(_clean_event({
+                    "symbol": symbol, "type": "BONUS_ISSUE", "event_date": closure_date,
+                    "headline": f"Bonus issue {bonus}{label}", "source": "scstrade", "url": pdf,
+                }))
+            if right:
+                events.append(_clean_event({
+                    "symbol": symbol, "type": "RIGHT_ISSUE", "event_date": closure_date,
+                    "headline": f"Right issue {right}{label}", "source": "scstrade", "url": pdf,
+                }))
+            if not (dividend or bonus or right):
+                events.append(_clean_event({
+                    "symbol": symbol, "type": "BOOK_CLOSURE", "event_date": closure_date,
+                    "headline": f"Share transfer book closure{label}",
+                    "source": "scstrade", "url": pdf,
+                }))
+
+    seen, unique = set(), []
+    for event in events:
+        key = _event_key(event)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(event)
+    return unique
+
+
+def fetch_scstrade_announcements(timeout: int = 25, symbols=None) -> dict:
+    """Primary feed: SCS Trade's announcement grid (real board-meeting/book-closure rows)."""
+    try:
+        import requests
+    except ImportError as exc:  # pragma: no cover
+        return {"events": [], "source": None, "error": f"requests unavailable: {exc}"}
+    try:
+        response = requests.post(SCSTRADE_URL, headers=SCSTRADE_HEADERS, json={"par": ""},
+                                 timeout=timeout)
+    except Exception as exc:
+        return {"events": [], "source": None, "error": f"scstrade: {exc}"}
+    if response.status_code != 200:
+        return {"events": [], "source": None, "error": f"scstrade: HTTP {response.status_code}"}
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return {"events": [], "source": None, "error": f"scstrade: invalid JSON ({exc})"}
+    events = parse_scstrade_announcements(payload, symbols=symbols)
+    if not events:
+        return {"events": [], "source": SCSTRADE_URL, "error": "scstrade: no matching rows"}
+    return {"events": events, "source": SCSTRADE_URL, "error": None}
 
 
 def load_events(path: str = None) -> dict:
@@ -434,11 +561,22 @@ def import_file(path: str, event_path: str = None) -> dict:
 
 
 
-def refresh_events(path: str = None, timeout: int = 25) -> dict:
-    """Fetch and merge. A failed fetch leaves the existing store untouched."""
-    fetched = fetch_announcements(timeout=timeout)
+def refresh_events(path: str = None, timeout: int = 25, symbols=None) -> dict:
+    """
+    Fetch and merge. Tries the working SCS Trade feed first, then PSX's own pages.
+    A total failure leaves the existing store untouched.
+    """
+    fetched = fetch_scstrade_announcements(timeout=timeout, symbols=symbols)
+    errors = [fetched["error"]] if fetched.get("error") else []
     if fetched.get("error"):
-        return {"added": 0, "error": fetched["error"], "source": None}
+        fallback = fetch_announcements(timeout=timeout)
+        if fallback.get("error"):
+            errors.append(fallback["error"])
+        else:
+            fetched = fallback
+    if fetched.get("error"):
+        return {"added": 0, "error": " | ".join(errors), "source": None}
+
     result = upsert_events(fetched["events"], path)
     result["source"] = fetched.get("source")
     result["error"] = None
@@ -514,6 +652,7 @@ def main(argv=None):
     )
     parser.add_argument("--path", help="Events store (default: .state/events.json)")
     parser.add_argument("--refresh", action="store_true", help="Fetch announcements and merge them")
+    parser.add_argument("--symbols", nargs="*", help="Limit a refresh to these symbols (default: watchlist)")
     parser.add_argument("--import", dest="import_path", help="Import a saved announcements HTML page or JSON export")
     parser.add_argument("--check", nargs="*", help="Assess these symbols, e.g. --check OGDC MEBL")
     parser.add_argument("--add", nargs=3, metavar=("SYMBOL", "TYPE", "DATE"),
@@ -525,7 +664,14 @@ def main(argv=None):
 
     exit_code = 0
     if args.refresh:
-        result = refresh_events(args.path)
+        symbols = args.symbols
+        if not symbols:
+            try:
+                from data_engine import get_watchlist
+                symbols = list(get_watchlist())
+            except Exception:
+                symbols = None
+        result = refresh_events(args.path, symbols=symbols)
         if result.get("error"):
             print(f"refresh failed (store untouched): {result['error']}")
             exit_code = 1

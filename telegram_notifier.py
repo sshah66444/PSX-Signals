@@ -342,7 +342,7 @@ def run_daily_market_cycle(
     events = []
     if not dry_run and os.environ.get("PSX_EVENTS_REFRESH", "1") != "0":
         try:
-            refreshed = refresh_events()
+            refreshed = refresh_events(symbols=set(market_data))
             if refreshed.get("error"):
                 print(f"   Events: refresh skipped ({refreshed['error']})")
             else:

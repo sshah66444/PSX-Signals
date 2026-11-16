@@ -379,17 +379,27 @@ def matched_random_trades(trades, frames: dict, mode: str = "swing_trade", bound
     rng = rng or np.random.default_rng(7)
     bounds = bounds or fold_bounds(min(t["entry_date"] for t in trades),
                                    max(t["entry_date"] for t in trades), 1)
+    # Per-symbol caches: rebuilding the EMA and the candidate date list for every
+    # single trade made 200 null iterations take minutes. The RNG call order is
+    # unchanged, so results are identical -- just far cheaper.
+    ema_cache = {}
+    position_cache = {}
     out = []
     for trade in trades:
         df = frames.get(trade["symbol"])
         if df is None or len(df) < WARMUP_BARS + 5:
             return None
-        lo, hi = next((window for window in bounds if window[0] <= trade["entry_date"] <= window[1]),
-                      bounds[-1])
-        positions = [
-            pos for pos in range(WARMUP_BARS, len(df) - 2)
-            if lo <= df.index[pos] <= hi
-        ]
+        window_index = next(
+            (i for i, window in enumerate(bounds) if window[0] <= trade["entry_date"] <= window[1]),
+            len(bounds) - 1,
+        )
+        cache_key = (trade["symbol"], window_index)
+        positions = position_cache.get(cache_key)
+        if positions is None:
+            low, high = bounds[window_index]
+            positions = [pos for pos in range(WARMUP_BARS, len(df) - 2)
+                         if low <= df.index[pos] <= high]
+            position_cache[cache_key] = positions
         if not positions:
             return None
         entry_idx = int(rng.choice(positions))
@@ -401,7 +411,10 @@ def matched_random_trades(trades, frames: dict, mode: str = "swing_trade", bound
         tp2_dist = trade["tp2"] - trade["entry_price"]
         if stop_dist <= 0:
             return None
-        ema = df["Close"].ewm(span=ema_period, adjust=False).mean()
+        ema = ema_cache.get(trade["symbol"])
+        if ema is None:
+            ema = df["Close"].ewm(span=ema_period, adjust=False).mean()
+            ema_cache[trade["symbol"]] = ema
         result = simulate_exit(df, entry_idx, entry_price, entry_price - stop_dist,
                                entry_price + tp1_dist, entry_price + tp2_dist, cfg, ema=ema)
         if result is None:
