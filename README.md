@@ -324,6 +324,43 @@ back to the repo so signals are never duplicated.
 
 ---
 
+## 📐 Ledger Integrity & Attribution (Stage 0)
+
+Signals and trades are two different populations, and mixing them made every
+performance number wrong. A setup that never triggered has **no P&L**, yet it used to
+sit in the `/performance` denominator — and a TP1 row fell out of the audit query
+entirely, so a runner stayed "open" forever. Both are fixed at the ledger level:
+
+* **TP1 runners resolve.** After half the position is booked at TP1 the stop moves to
+  breakeven, but the runner is still audited. It now closes at `TP1_BE` (breakeven
+  stop) or `TP2_HIT`, and `finalize_partials()` marks any leftover at the latest
+  *verified* close (`PARTIAL_CLOSED`). No verified close → the row is left open and
+  reported, never guessed.
+* **Stale setups expire.** `resolve_stale()` marks `WATCHING` rows that never triggered
+  within `STALE_WATCH_TRADING_DAYS` (15, Mon–Fri) as `EXPIRED` with `net_pnl_pct`
+  deliberately `NULL`. They are not trades and can never enter a win rate again.
+* **Every trade is measured against the benchmark.** `benchmark_pnl_pct` and
+  `excess_pnl_pct` compare net P&L with KSE-100 over the identical holding window
+  (`backfill_benchmark_returns()`), because +4% is a loss when the index did +7%.
+* **`initial_stop_loss`** preserves the pre-TP1 stop, so R-multiples survive the
+  breakeven move.
+* **`closed_reason`** records *why* a row closed: `STOP`, `STOP_AMBIGUOUS`, `TP1_BE`,
+  `TP2`, `PARTIAL_MARK`, `EXPIRED`, `INVALIDATED`.
+
+`/attribution` reports expectancy, profit factor, payoff, max drawdown, average hold,
+excess return and per-archetype / state / grade / sector buckets — and it refuses to
+let you tune on noise: anything under `MIN_SAMPLE_TRADES` (30) is flagged
+`⚠️n<30`, with an explicit warning rather than a confident-looking number.
+
+**Measured on the live ledger at the time this landed** (16 Sep – 4 Nov 2026):
+166 signals → 14 entered → **11 settled**: expectancy **−2.26%/trade**, win rate
+9.1%, profit factor 0.19, max drawdown −19.97%. Ten setups expired without ever
+triggering. The honest conclusion is that the sample is far too small to tune, and
+that the one archetype producing all the flow (`MEAN_REVERSION`) has no demonstrated
+edge after costs.
+
+---
+
 ## 📂 Project Architecture
 
 ```
@@ -334,9 +371,11 @@ psx-signal-screener/
 ├── chart_engine.py         # 3-tier Plotly candlestick chart with trade level overlays
 ├── backtester.py           # Multi-target backtester with ambiguous bar detection & fee deduction
 ├── signal_tracker.py       # Persistent SQLite ledger (signals.db) with WAL concurrency
+├── attribution.py          # Settled-trade attribution, excess vs KSE-100, sample guards
 ├── telegram_notifier.py    # Telegram bot with daily scans, lifecycle updates & /commands
 ├── run_swing_scan.command  # macOS double-click launcher for a live swing scan
 ├── test_engine.py          # Automated verification test suite
+├── test_ledger_integrity.py # Stage-0 ledger tests (isolated temp DB, never signals.db)
 ├── signals.db              # SQLite persistent trade ledger (WAL enabled)
 └── .github/workflows/
     ├── daily_psx_signals.yml # Telegram /command polling runner

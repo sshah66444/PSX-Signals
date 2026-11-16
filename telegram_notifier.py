@@ -37,7 +37,11 @@ from signal_tracker import (
     audit_active_signals,
     get_active_signals,
     get_performance_summary,
+    resolve_stale,
+    finalize_partials,
+    backfill_benchmark_returns,
 )
+from attribution import build_attribution, format_attribution_text, load_ledger
 from swing_config import get_config
 
 
@@ -299,7 +303,27 @@ def run_daily_market_cycle(
     # after the header is built (see step 6), so subscribers always see the
     # summary banner before the detail alerts it summarizes, not after.
     print("3. Auditing open setups in signals.db...")
-    lifecycle_updates = audit_active_signals(market_data)
+    lifecycle_updates = audit_active_signals(market_data, df_bench=df_kse)
+
+    # 3b. Ledger hygiene (skipped on dry runs so a preview never mutates the live
+    # ledger): expire setups that never triggered, finalise TP1 runners that can no
+    # longer resolve, and attach benchmark/excess returns to settled trades. None of
+    # these steps invents a price -- a symbol without a verified close is left alone.
+    if not dry_run:
+        stale = resolve_stale()
+        if stale:
+            print(f"   Ledger: expired {len(stale)} stale setup(s) that never triggered.")
+        partials = finalize_partials(market_data, df_bench=df_kse)
+        if partials:
+            closed = sum(1 for u in partials if u["type"] == "PARTIAL_CLOSED")
+            print(f"   Ledger: finalised {closed}/{len(partials)} TP1 runner(s).")
+        lifecycle_updates = list(partials) + list(lifecycle_updates)
+        bench_result = backfill_benchmark_returns(df_kse)
+        if bench_result.get("updated"):
+            print(f"   Ledger: measured {bench_result['updated']} trade(s) vs the benchmark.")
+        elif bench_result.get("error"):
+            print(f"   Ledger: benchmark backfill skipped ({bench_result['error']}).")
+
     for upd in lifecycle_updates:
         messages.append(upd["text"])
 
@@ -417,6 +441,7 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
             "• <b>/stock &lt;SYM&gt;</b> — View full checklist and levels for a stock (e.g. <code>/stock OGDC</code>)\n"
             "• <b>/why &lt;SYM&gt;</b> — Detailed pass/fail reasoning for a stock\n"
             "• <b>/performance</b> — Audited track record from the live signal ledger\n"
+            "• <b>/attribution</b> — Settled-trade expectancy, excess vs KSE-100, sample warnings\n"
             f"• <b>/watchlist</b> — List all {len(watchlist)} tracked PSX equities\n"
         )
         send_telegram_message(token, chat_id, reply)
@@ -479,6 +504,12 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
                     f"\n<i>Tip: Use <code>/performance swing</code> or <code>/performance tactical</code> for filtered views.</i>"
                 )
         send_telegram_message(token, chat_id, reply)
+
+    elif cmd == "/attribution":
+        track_arg = parts[1].lower() if len(parts) > 1 and parts[1].lower() in ["swing", "tactical"] else None
+        rows = load_ledger(track=track_arg)
+        stats = build_attribution(rows)
+        send_telegram_message(token, chat_id, format_attribution_text(stats))
 
     elif cmd in ["/stock", "/why"]:
         if len(parts) < 2:
