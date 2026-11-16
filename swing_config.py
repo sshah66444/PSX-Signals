@@ -10,6 +10,21 @@ MIN_SCORE_BUY_ZONE = 60    # hard gates + in entry zone + this score -> BUY ZONE
 SIGNAL_VERSION = "2.0"
 STATE_RANK = {"WATCH": 1, "BUY_ZONE": 2, "BUY_NOW": 3}
 
+# ---------------------------------------------------------------------------
+# Stage 1 exit profile (position management, not signal generation)
+# ---------------------------------------------------------------------------
+# The live ledger used to hold every loser until the stop or a 2.5-4.5R target:
+# 10 stop-outs averaging -3.1% held 23.8 days against a single +5.95% winner.
+# These knobs fix that asymmetry without touching entry logic:
+#   * TP1 is a scale-out at 1.0-1.5R (swing = 1.5R), so half the position banks
+#     something on the moves that never reach the old 2.5R target.
+#   * A runner that makes no progress (MFE < MIN_TIME_STOP_MFE_R x risk) is
+#     closed at the time stop instead of bleeding for another month.
+#   * After TP1 the remainder trails the mode's EMA instead of waiting for TP2.
+MIN_TIME_STOP_MFE_R = 0.5      # "no progress" = never ran 0.5R in favour
+TRAIL_RUNNER_AFTER_TP1 = True  # ratchet the runner's stop up to the trailing EMA
+PARTIAL_EXIT_FRACTION = 0.5    # share of the position booked at TP1
+
 # Trading Mode Configuration
 TRADING_MODES = {
     "day_trade": {
@@ -53,9 +68,12 @@ TRADING_MODES = {
         "time_stop_bars": 15,
         "holding_max_bars": 90,
         "min_hold_before_trail": 10,
-        "tp1_risk_multiplier": 2.5,
+        # Stage 1: TP1 is a scale-out at 1.5R (was 2.5R). Both the risk and ATR
+        # legs move together because the engine takes max(risk_mult x risk,
+        # atr_mult x ATR) -- lowering only one leg would leave TP1 at 2.5 ATR.
+        "tp1_risk_multiplier": 1.5,
         "tp2_risk_multiplier": 4.5,
-        "tp1_atr_multiplier": 2.5,
+        "tp1_atr_multiplier": 1.5,
         "tp2_atr_multiplier": 4.5,
         "trailing_ema": 50,
         "volume_period": 50,

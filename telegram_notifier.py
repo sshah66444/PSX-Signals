@@ -303,7 +303,7 @@ def run_daily_market_cycle(
     # after the header is built (see step 6), so subscribers always see the
     # summary banner before the detail alerts it summarizes, not after.
     print("3. Auditing open setups in signals.db...")
-    lifecycle_updates = audit_active_signals(market_data, df_bench=df_kse)
+    lifecycle_updates = audit_active_signals(market_data, df_bench=df_kse, mode=mode)
 
     # 3b. Ledger hygiene (skipped on dry runs so a preview never mutates the live
     # ledger): expire setups that never triggered, finalise TP1 runners that can no

@@ -11,7 +11,13 @@ import datetime
 import numpy as np
 import pandas as pd
 
-from swing_config import STATE_RANK
+from swing_config import (
+    STATE_RANK,
+    MIN_TIME_STOP_MFE_R,
+    PARTIAL_EXIT_FRACTION,
+    TRAIL_RUNNER_AFTER_TP1,
+    get_config,
+)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "signals.db")
 
@@ -106,9 +112,12 @@ init_db()
 # purpose: the runner is still live after half the position is booked.
 AUDITABLE_STATUSES = ("WATCHING", "TRIGGERED", "TP1_HIT")
 # Statuses that represent a finished trade (net_pnl_pct is always set on these).
-TERMINAL_STATUSES = ("STOPPED_OUT", "TP1_BE", "TP2_HIT", "PARTIAL_CLOSED", "EXPIRED")
+TERMINAL_STATUSES = (
+    "STOPPED_OUT", "TP1_BE", "TP2_HIT", "PARTIAL_CLOSED",
+    "TIME_STOP", "TRAIL_STOP", "HOLDING_CAP", "EXPIRED",
+)
 # Fraction booked at TP1; the remainder runs to TP2 / breakeven / mark-to-market.
-PARTIAL_EXIT_FRACTION = 0.5
+# Defined in swing_config so the walk-forward harness and the live ledger share it.
 # A WATCHING setup that never triggers is not a trade and must not sit in the
 # ledger forever: expire it after this many trading days (Mon-Fri, PSX calendar).
 STALE_WATCH_TRADING_DAYS = 15
@@ -297,7 +306,8 @@ def record_or_update_setup(setup: dict, symbol: str) -> tuple[bool, str]:
         return True, f"New setup recorded for ${symbol} ({new_state})."
 
 
-def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35, df_bench=None) -> list[dict]:
+def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35, df_bench=None,
+                         mode: str = None) -> list[dict]:
     """
     Checks all open setups against the latest market session candle.
     Updates lifecycle states and returns a list of update messages to send.
@@ -309,6 +319,7 @@ def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35, df_ben
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     updates = []
+    exit_cfg = _exit_config(mode)
 
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -339,6 +350,11 @@ def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35, df_ben
             tp1 = sig["tp1"]
             tp2 = sig["tp2"]
 
+            # Stage 1: how long has this trade been open, and how much has it run in R?
+            bars_held = _bars_since(df, sig["triggered_date"]) if sig["triggered_date"] else 0
+            base_stop = sig["initial_stop_loss"] if sig["initial_stop_loss"] else sl
+            risk = (entry - base_stop) if (entry and base_stop and entry > base_stop) else None
+
             # If setup was only WATCHING, check if invalidated by closing below stop
             if sig["status"] == "WATCHING":
                 if close < sl:
@@ -362,19 +378,34 @@ def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35, df_ben
             if sig["status"] == "TP1_HIT":
                 p1_ret = ((tp1 - entry) / entry) if (tp1 and entry) else 0.0
                 be_stop = sl if sl else entry
+                effective_stop = be_stop
+                trail_period = exit_cfg.get("trailing_ema")
+                # Stage 1: once the runner has been open for the keep-before-trail
+                # window it rides the mode's EMA, so a trade that stalls gives back
+                # far less than the old "wait for TP2" model.
+                if TRAIL_RUNNER_AFTER_TP1 and trail_period and bars_held >= exit_cfg.get("min_hold_before_trail", 0):
+                    trail_stop = _ema_value(df, trail_period)
+                    if trail_stop and trail_stop > (effective_stop or 0):
+                        effective_stop = round(trail_stop, 2)
                 gross = None
                 exit_price = None
                 new_status = None
                 reason = None
                 note = None
 
-                if be_stop and low <= be_stop:
+                if effective_stop and low <= effective_stop:
                     # Ambiguous bar favours the conservative outcome, as elsewhere.
-                    gross = PARTIAL_EXIT_FRACTION * p1_ret + (1 - PARTIAL_EXIT_FRACTION) * ((be_stop - entry) / entry)
-                    exit_price = be_stop
-                    new_status = "TP1_BE"
-                    reason = "TP1_BE"
-                    note = "TP1 booked on half; runner closed at breakeven stop"
+                    exit_gain = (effective_stop - entry) / entry
+                    gross = PARTIAL_EXIT_FRACTION * p1_ret + (1 - PARTIAL_EXIT_FRACTION) * exit_gain
+                    exit_price = effective_stop
+                    if be_stop and effective_stop > be_stop:
+                        new_status = "TRAIL_STOP"
+                        reason = "TRAIL_STOP"
+                        note = f"TP1 booked; runner trailed out at EMA-{trail_period}"
+                    else:
+                        new_status = "TP1_BE"
+                        reason = "TP1_BE"
+                        note = "TP1 booked on half; runner closed at breakeven stop"
                 elif tp2 and high >= tp2:
                     gross = PARTIAL_EXIT_FRACTION * p1_ret + (1 - PARTIAL_EXIT_FRACTION) * ((tp2 - entry) / entry)
                     exit_price = tp2
@@ -510,6 +541,75 @@ def audit_active_signals(market_data: dict, broker_fee_pct: float = 0.35, df_ben
                         "symbol": sym,
                         "type": "TP1_HIT",
                         "text": f"🎯 <b>UPDATE on ${sym}</b>: Target 1 HIT at {tp1:.2f} PKR (+{net_tp1*100:.1f}%). 50% profit booked; SL moved to breakeven ({entry:.2f}).",
+                    })
+                    continue
+
+                # --- Stage 1: time stop ------------------------------------------------
+                # A trade that has not run MIN_TIME_STOP_MFE_R in its favour by the
+                # configured time stop is dead money. The live record showed losers
+                # held ~24 trading days while winners were never banked.
+                if risk and bars_held >= exit_cfg.get("time_stop_bars", 10 ** 6):
+                    mfe_r = _mfe_r(df, bars_held, entry, risk)
+                    if mfe_r < MIN_TIME_STOP_MFE_R:
+                        gross = (close - entry) / entry
+                        net = gross - (broker_fee_pct / 100.0)
+                        cursor.execute(
+                            """
+                            UPDATE signals
+                            SET status = 'TIME_STOP', resolved_date = ?, exit_price = ?,
+                                gross_pnl_pct = ?, net_pnl_pct = ?, closed_reason = ?, notes = ?
+                            WHERE id = ?
+                            """,
+                            (today_str, round(close, 2), round(gross * 100, 2), round(net * 100, 2),
+                             "TIME_STOP",
+                             f"No progress ({mfe_r:.2f}R best excursion) after {bars_held} trading days",
+                             sig["id"]),
+                        )
+                        cursor.execute(
+                            "INSERT INTO signal_events (signal_id, timestamp, event_type, details) VALUES (?, ?, ?, ?)",
+                            (sig["id"], now_ts, "TIME_STOP",
+                             f"Time stop after {bars_held} bars at {close:.2f} (MFE {mfe_r:.2f}R)."),
+                        )
+                        _attach_benchmark(cursor, sig, today_str, round(net * 100, 2), df_bench)
+                        updates.append({
+                            "symbol": sym,
+                            "type": "TIME_STOP",
+                            "text": (
+                                f"⏱ <b>UPDATE on ${sym}</b>: Time stop — no progress "
+                                f"({mfe_r:.2f}R in {bars_held} days). Closed at {close:.2f} PKR "
+                                f"(Net: {net*100:+.1f}%)."
+                            ),
+                        })
+                        continue
+
+                # --- Stage 1: hard holding cap -----------------------------------------
+                if exit_cfg.get("holding_max_bars") and bars_held >= exit_cfg["holding_max_bars"]:
+                    gross = (close - entry) / entry
+                    net = gross - (broker_fee_pct / 100.0)
+                    cursor.execute(
+                        """
+                        UPDATE signals
+                        SET status = 'HOLDING_CAP', resolved_date = ?, exit_price = ?,
+                            gross_pnl_pct = ?, net_pnl_pct = ?, closed_reason = ?, notes = ?
+                        WHERE id = ?
+                        """,
+                        (today_str, round(close, 2), round(gross * 100, 2), round(net * 100, 2),
+                         "HOLDING_CAP", f"Maximum holding period reached ({bars_held} trading days)",
+                         sig["id"]),
+                    )
+                    cursor.execute(
+                        "INSERT INTO signal_events (signal_id, timestamp, event_type, details) VALUES (?, ?, ?, ?)",
+                        (sig["id"], now_ts, "HOLDING_CAP",
+                         f"Holding cap after {bars_held} bars at {close:.2f}."),
+                    )
+                    _attach_benchmark(cursor, sig, today_str, round(net * 100, 2), df_bench)
+                    updates.append({
+                        "symbol": sym,
+                        "type": "HOLDING_CAP",
+                        "text": (
+                            f"⌛ <b>UPDATE on ${sym}</b>: Maximum holding period ({bars_held} days) "
+                            f"reached. Closed at {close:.2f} PKR (Net: {net*100:+.1f}%)."
+                        ),
                     })
 
         conn.commit()
@@ -647,6 +747,52 @@ def trading_days_between(start_date, end_date) -> int:
     if end <= start:
         return 0
     return int(np.busday_count(start.date(), end.date()))
+
+
+# --- Stage 1 exit helpers ---------------------------------------------------
+def _exit_config(mode: str = None) -> dict:
+    """Mode config for exit management, resilient to an unknown mode string."""
+    try:
+        return get_config(mode)
+    except (ValueError, KeyError):
+        return get_config()
+
+
+def _bars_since(df, since_date) -> int:
+    """Completed bars in `df` since the bar dated on/after `since_date` (0 = today)."""
+    if df is None or len(df) == 0 or not since_date:
+        return 0
+    try:
+        target = pd.Timestamp(str(since_date)).normalize()
+    except (ValueError, TypeError):
+        return 0
+    index = pd.to_datetime(df.index)
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_localize(None)
+    position = int((index.normalize() <= target).sum()) - 1
+    if position < 0:
+        return 0
+    return max(0, len(df) - 1 - position)
+
+
+def _ema_value(df, period: int, position: int = -1):
+    """Latest EMA of Close at `position`, or None when there is too little data."""
+    minimum = max(2, min(int(period), 20))   # an EMA needs a few bars, not its full span
+    if df is None or len(df) < minimum or "Close" not in df:
+        return None
+    series = df["Close"].astype(float).ewm(span=int(period), adjust=False).mean()
+    value = float(series.iloc[position])
+    return value if value > 0 else None
+
+
+def _mfe_r(df, bars_held: int, entry: float, risk: float) -> float:
+    """Maximum favourable excursion since entry, in risk units (R)."""
+    if df is None or bars_held <= 0 or not risk or risk <= 0:
+        return 0.0
+    window = df.iloc[-(bars_held + 1):]
+    if window.empty or "High" not in window:
+        return 0.0
+    return round((float(window["High"].max()) - float(entry)) / float(risk), 3)
 
 
 def _verified_close(sig, market_data):

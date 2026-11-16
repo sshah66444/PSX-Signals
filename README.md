@@ -361,6 +361,63 @@ edge after costs.
 
 ---
 
+## 🎯 Stage 1: Exit Profile & Out-of-Sample Reality Check
+
+### The asymmetry that was fixed
+
+The live ledger held every loser until the stop or a 2.5–4.5R target: 10 stop-outs at
+−3.1% held **23.8 trading days** against a single +5.95% winner. Three changes, all in
+position management rather than entry logic:
+
+* **TP1 is now a scale-out at 1.5R** (was 2.5R). Both legs move together
+  (`tp1_risk_multiplier` *and* `tp1_atr_multiplier`) because the engine takes
+  `max(risk_mult x risk, atr_mult x ATR)` — changing one alone would have left TP1
+  at 2.5 ATR. The hard R:R gate (`min_rr_tp1 = 1.5`) still passes by construction.
+* **Time stop on no progress.** Once `time_stop_bars` (15 for swing) have elapsed with
+  a best excursion under `MIN_TIME_STOP_MFE_R` (0.5R) and TP1 never reached, the
+  position closes at the close (`TIME_STOP`). Dead money stops bleeding.
+* **Trailing runner.** After TP1 the stop ratchets up to the mode's trailing EMA
+  (50 for swing), never below breakeven, once `min_hold_before_trail` bars have
+  passed since TP1. Exits record `TRAIL_STOP`, plus a hard `HOLDING_CAP`.
+
+Every exit now writes `closed_reason`, so `/attribution` can show which exit type
+actually makes or loses the money.
+
+### The reality check
+
+`walkforward.py` replays the **live engine** bar-by-bar over cached history
+(`.cache_2y/`, then `.cache/`), with a per-date market regime (no look-ahead), next-open
+entries, unfillable >7.5% gap-ups skipped, and the exits above. It then re-runs the
+whole simulation for **matched random entries** — same symbol, same fold, same price
+distances to stop/TP1/TP2 — 200 times, and reports the p-value of the real result
+against that null distribution.
+
+```
+python walkforward.py --folds 3 --iterations 200 --json wf_report.json
+```
+
+Result on the 16 Nov 2026 cache (74 symbols, Sep-2024 → Nov-2026, 450 trades):
+
+| Window | Trades | Expectancy | Win rate | Profit factor | Random entries |
+|---|---|---|---|---|---|
+| Pooled | 450 | **+0.38%** | 33.6% | 1.14 | −0.10% |
+| Fold 1 (2024-09 → 2025-05) | 66 | +2.45% | 37.9% | 1.71 | −0.18% |
+| Fold 2 (2025-05 → 2026-02) | 70 | +4.54% | 50.0% | 2.76 | **+4.61%** |
+| Fold 3 (2026-02 → 2026-11) | 314 | −0.99% | 29.0% | 0.61 | −1.14% |
+
+**Verdict: indistinguishable from matched random entries (p = 0.055).** The edge is
+not established: fold 2's random control did as well as the signal, fold 3 is
+negative, and the pooled p-value misses 0.05. The `maxDD` figure in that report
+compounds every trade at full size and is a sequence artifact, not a portfolio
+drawdown.
+
+What this means in practice: Stage 1 made the *exits* honest and the *measurement*
+auditable, but it did **not** prove an entry edge. Do not add agents, size up, or
+tune parameters on this evidence — collect more settled trades first, and re-run the
+walk-forward with a fresh cache every month.
+
+---
+
 ## 📂 Project Architecture
 
 ```
@@ -372,6 +429,7 @@ psx-signal-screener/
 ├── backtester.py           # Multi-target backtester with ambiguous bar detection & fee deduction
 ├── signal_tracker.py       # Persistent SQLite ledger (signals.db) with WAL concurrency
 ├── attribution.py          # Settled-trade attribution, excess vs KSE-100, sample guards
+├── walkforward.py          # Out-of-sample replay + matched random-entry null model
 ├── telegram_notifier.py    # Telegram bot with daily scans, lifecycle updates & /commands
 ├── run_swing_scan.command  # macOS double-click launcher for a live swing scan
 ├── test_engine.py          # Automated verification test suite
