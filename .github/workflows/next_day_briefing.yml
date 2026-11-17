@@ -3,10 +3,12 @@ on:
   schedule:
     # Pakistan is UTC+5 year-round. Use UTC explicitly because live runs with
     # timezone: Asia/Karachi have fired at the written UTC hour instead.
-    # 14:05/14:35 UTC = 19:05/19:35 PKT: prepare the data.
-    - cron: '5,35 14 * * 1-5'
-    # 15:02–15:57 UTC = 20:02–20:57 PKT: deliver within the evening window.
-    - cron: '2,17,32,47,57 15 * * 1-5'
+    # 14:08/14:38 UTC = 19:08/19:38 PKT: prepare the data on off-grid minutes.
+    - cron: '8,38 14 * * 1-5'
+    # 15:04, 15:18, 15:34, 15:48 UTC = 20:04, 20:18, 20:34, 20:48 PKT: deliver within the evening window.
+    - cron: '4,18,34,48 15 * * 1-5'
+    # 16:04, 16:18 UTC = 21:04, 21:18 PKT: post-cutoff closeout checkpoint on the same evening.
+    - cron: '4,18 16 * * 1-5'
   workflow_dispatch:
 permissions:
   contents: write
@@ -32,6 +34,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python state_crypto.py decrypt
+      - name: Scrape official PSX market snapshot
+        continue-on-error: true
+        run: python psx_snapshot.py
       - name: Prepare or deliver next-session plan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

@@ -122,24 +122,102 @@ def market_summary(expected):
                 advancing=advancing,declining=declining,asof=published.isoformat())
 
 
+def _get_official_prior_bar(symbol, prev_date, expected_ldcp=None):
+    """
+    Looks up the verified official PSX bar for prev_date from the delivery journal's
+    performance_bars table or from the local cache.
+    Optionally verifies that its Close matches expected_ldcp within 0.5%.
+    """
+    for db_path in (ROOT / '.state' / 'briefing.sqlite3', ROOT / '.state' / 'briefing.db'):
+        if db_path.exists():
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=5)
+                row = conn.execute(
+                    "SELECT open, high, low, close, volume FROM performance_bars WHERE symbol=? AND session=?",
+                    (symbol, prev_date.isoformat())
+                ).fetchone()
+                conn.close()
+                if row:
+                    bar = {'Open': float(row[0]), 'High': float(row[1]), 'Low': float(row[2]), 'Close': float(row[3]), 'Volume': float(row[4])}
+                    if expected_ldcp is None or abs(bar['Close'] / expected_ldcp - 1) <= 0.005:
+                        return bar
+            except Exception:
+                pass
+    cache_path = ROOT / '.cache' / f'{symbol}_real.csv'
+    if cache_path.exists():
+        try:
+            cdf = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            cdf.index = pd.to_datetime(cdf.index).tz_localize(None)
+            matching = cdf[cdf.index.date == prev_date]
+            if not matching.empty:
+                r = matching.iloc[-1]
+                bar = {'Open': float(r['Open']), 'High': float(r['High']), 'Low': float(r['Low']), 'Close': float(r['Close']), 'Volume': float(r['Volume'])}
+                if expected_ldcp is None or abs(bar['Close'] / expected_ldcp - 1) <= 0.005:
+                    return bar
+        except Exception:
+            pass
+    return None
+
+
 def get_stock(symbol,expected,config,summary):
     today=summary['rows'].get(symbol)
     if not today:raise ValueError('Symbol missing from completed PSX market summary')
-    df=yf.Ticker(f'{symbol}.KA').history(period=config['period'],interval='1d',auto_adjust=False)
-    if df is None or df.empty:raise ValueError('Yahoo historical OHLCV unavailable')
-    d=df[['Open','High','Low','Close','Volume']].copy()
-    d.index=pd.to_datetime(d.index).tz_localize(None)
-    d=d[d.index.date<expected]
     prev=previous_session(expected,config)
-    if len(d)<59 or d.index[-1].date()!=prev:
+    d=None
+    source='PSX completed market summary + Yahoo prior history'
+    try:
+        df=yf.Ticker(f'{symbol}.KA').history(period=config['period'],interval='1d',auto_adjust=False)
+        if df is not None and not df.empty:
+            d=df[['Open','High','Low','Close','Volume']].copy()
+            d.index=pd.to_datetime(d.index).tz_localize(None)
+            d=d[d.index.date<expected]
+    except Exception:
+        d=None
+
+    if d is None or len(d)<59:
+        cache_path=ROOT/'.cache'/f'{symbol}_real.csv'
+        if cache_path.exists():
+            try:
+                cdf=pd.read_csv(cache_path,index_col=0,parse_dates=True)
+                cdf.index=pd.to_datetime(cdf.index).tz_localize(None)
+                cd=cdf[['Open','High','Low','Close','Volume']].copy()
+                cd=cd[cd.index.date<expected]
+                if len(cd)>=59:
+                    d=cd
+                    source='PSX completed market summary + local official PSX history'
+            except Exception:
+                pass
+
+    if d is None or len(d)<59:
+        raise ValueError('Yahoo historical OHLCV unavailable')
+
+    latest_hist_date=d.index[-1].date()
+    ldcp=float(today['LDCP'])
+
+    # If vendor feed lagged on prev session or duplicated older prices:
+    mismatch=(latest_hist_date==prev and abs(float(d.Close.iloc[-1])/ldcp-1)>.005)
+    missing_prev=(latest_hist_date<prev)
+
+    if mismatch or missing_prev:
+        official_prev=_get_official_prior_bar(symbol,prev,expected_ldcp=ldcp)
+        if official_prev:
+            prev_row=pd.DataFrame([official_prev],index=pd.to_datetime([prev]))
+            if mismatch:
+                d=pd.concat([d[d.index.date!=prev],prev_row]).sort_index()
+            else:
+                d=pd.concat([d,prev_row]).sort_index()
+            latest_hist_date=d.index[-1].date()
+
+    if len(d)<59 or latest_hist_date!=prev:
         raise ValueError(f'Prior-session history missing (need {prev})')
+
     # Check the cross-source overlap before appending today's official bar.
-    if abs(float(d.Close.iloc[-1])/today['LDCP']-1)>.005:
+    if abs(float(d.Close.iloc[-1])/ldcp-1)>.005:
         raise ValueError('Yahoo/PSX prior-close mismatch; corporate action or feed conflict')
     fresh=pd.DataFrame([{k:today[k] for k in ('Open','High','Low','Close','Volume')}],
                        index=pd.to_datetime([expected]))
     combined=pd.concat([d,fresh]).sort_index()
-    return verified_bars(combined,expected), 'PSX completed market summary + Yahoo prior history'
+    return verified_bars(combined,expected), source
 
 
 def evaluate_candidate(symbol,df,summary):

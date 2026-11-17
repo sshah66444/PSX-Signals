@@ -173,10 +173,31 @@ class BriefingTests(unittest.TestCase):
                     dict(rows={'OGDC':dict(LDCP=101,Open=101,High=103,Low=100,Close=102,Volume=100000)}))
     def test_cross_source_close_mismatch_is_rejected(self):
         c=dict(self.c,symbols=['OGDC'])
-        with patch.object(b.yf,'Ticker') as ticker:
+        with patch.object(b.yf,'Ticker') as ticker, patch.object(b,'_get_official_prior_bar',return_value=None):
             ticker.return_value.history.return_value=self.fixture().iloc[:-1]
             with self.assertRaisesRegex(ValueError,'mismatch'):
                 b.get_stock('OGDC',date(2026,9,22),c,
                     dict(rows={'OGDC':dict(LDCP=130,Open=130,High=131,Low=129,Close=130,Volume=100000)}))
+    def test_stale_yahoo_prior_bar_reconciled_with_official_bar(self):
+        c=dict(self.c,symbols=['OGDC'])
+        # Yahoo returned stale close 101 on 2026-09-21, but PSX LDCP is 105
+        official={'Open':104.,'High':106.,'Low':103.,'Close':105.,'Volume':1200000}
+        with patch.object(b.yf,'Ticker') as ticker, patch.object(b,'_get_official_prior_bar',return_value=official):
+            ticker.return_value.history.return_value=self.fixture().iloc[:-1]
+            bars,src=b.get_stock('OGDC',date(2026,9,22),c,
+                dict(rows={'OGDC':dict(LDCP=105,Open=105,High=107,Low=104,Close=106,Volume=100000)}))
+            self.assertEqual(bars.Close.iloc[-2],105.)
+            self.assertEqual(bars.Close.iloc[-1],106.)
+    def test_missing_yahoo_prior_bar_reconciled_with_official_bar(self):
+        c=dict(self.c,symbols=['OGDC'])
+        # Yahoo is 1 day behind (only up to 2026-09-18), missing 2026-09-21
+        prior=self.fixture().iloc[:-2]
+        official={'Open':104.,'High':106.,'Low':103.,'Close':105.,'Volume':1200000}
+        with patch.object(b.yf,'Ticker') as ticker, patch.object(b,'_get_official_prior_bar',return_value=official):
+            ticker.return_value.history.return_value=prior
+            bars,src=b.get_stock('OGDC',date(2026,9,22),c,
+                dict(rows={'OGDC':dict(LDCP=105,Open=105,High=107,Low=104,Close=106,Volume=100000)}))
+            self.assertEqual(bars.index[-2].date(),date(2026,9,21))
+            self.assertEqual(bars.Close.iloc[-2],105.)
 
 if __name__=='__main__':unittest.main()
