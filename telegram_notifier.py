@@ -163,6 +163,7 @@ def send_telegram_message(token: str, chat_id: str, text: str, thread_id=None, r
             payload["message_thread_id"] = int(thread_id)
         if reply_to_message_id:
             payload["reply_to_message_id"] = int(reply_to_message_id)
+            payload["allow_sending_without_reply"] = True
         ok, res = _post_with_retry(url, payload)
         if not ok:
             print(f"✗ Telegram delivery failed for chat {chat_id}: {res}")
@@ -510,6 +511,7 @@ def run_daily_market_cycle(
             delivered += 1
             if cross_bot_replies:
                 reply_id = desk_msg_id if isinstance(desk_msg_id, int) else None
+                desk_thread = channels.get("desk", {}).get("thread_id")
                 sig_checkin = desk.format_checkin_reply("signals", {
                     "total": len(market_data),
                     "buy_now": state_counts.get("BUY_NOW", 0),
@@ -518,19 +520,19 @@ def run_daily_market_cycle(
                 })
                 time.sleep(TELEGRAM_PACING_SECONDS)
                 if desk.post("signals", sig_checkin, _desk_send, chat_id=chat_id, token=token,
-                             reply_to_message_id=reply_id):
+                             reply_to_message_id=reply_id, thread_id=desk_thread):
                     delivered += 1
 
                 evt_checkin = desk.format_checkin_reply("events", {"blocked": event_blocked})
                 time.sleep(TELEGRAM_PACING_SECONDS)
                 if desk.post("events", evt_checkin, _desk_send, chat_id=chat_id, token=token,
-                             reply_to_message_id=reply_id):
+                             reply_to_message_id=reply_id, thread_id=desk_thread):
                     delivered += 1
 
                 rsk_checkin = desk.format_checkin_reply("risk", {"updates": len(lifecycle_updates)})
                 time.sleep(TELEGRAM_PACING_SECONDS)
                 if desk.post("risk", rsk_checkin, _desk_send, chat_id=chat_id, token=token,
-                             reply_to_message_id=reply_id):
+                             reply_to_message_id=reply_id, thread_id=desk_thread):
                     delivered += 1
 
         # 2. Event Vetoes (into events lane)
