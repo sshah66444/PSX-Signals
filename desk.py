@@ -159,6 +159,11 @@ def extract_desk_ids(payload) -> dict:
     for update in (payload or {}).get("result", []) or []:
         message = update.get("message") or update.get("edited_message") or {}
         chat = message.get("chat") or {}
+        if not chat:
+            # Service updates (my_chat_member, etc.) still carry the chat, which is
+            # how the group id is discovered even before anyone posts in it.
+            member = update.get("my_chat_member") or {}
+            chat = (member.get("chat") or {})
         chat_id = chat.get("id")
         if chat_id is None:
             continue
@@ -187,6 +192,16 @@ ROLE_TOKENS = (
 )
 
 
+# When topic names are invisible (topics created before the bot joined), the command
+# people send inside each topic still identifies the lane.
+COMMAND_TOKENS = (
+    ("events", ("/events",)),
+    ("risk", ("/performance", "/attribution")),
+    ("signals", ("/active", "/watchlist", "/stock", "/why")),
+    ("desk", ("/start", "/help", "/scan")),
+)
+
+
 def suggest_env_block(chat: dict) -> str:
     """
     Maps topic labels onto lane env vars when the names are recognisable.
@@ -198,15 +213,28 @@ def suggest_env_block(chat: dict) -> str:
     topics = chat.get("topics", {}) or {}
     mapped = {}
     used = set()
-    for role, tokens in ROLE_TOKENS:
-        for thread_id, label in sorted(topics.items()):
-            if thread_id in used:
+
+    def assign(pairs, skip_commands=False):
+        for role, tokens in pairs:
+            if role in mapped:
                 continue
-            lowered = str(label or "").lower()
-            if any(token in lowered for token in tokens):
-                mapped[role] = thread_id
-                used.add(thread_id)
-                break
+            for thread_id, label in sorted(topics.items()):
+                if thread_id in used:
+                    continue
+                lowered = str(label or "").lower()
+                # A label that is a command (no topic name visible) must be matched by
+                # COMMAND_TOKENS only -- otherwise "/start@my_psx_trade_signals_bot"
+                # would match "signal" and claim the Signals lane via the bot's name.
+                if skip_commands and lowered.startswith("/"):
+                    continue
+                if any(token in lowered for token in tokens):
+                    mapped[role] = thread_id
+                    used.add(thread_id)
+                    break
+
+    assign(ROLE_TOKENS, skip_commands=True)   # topic names first
+    assign(COMMAND_TOKENS)                    # then the command sent inside the topic
+
     for role in ROLES:
         if role in mapped:
             lines.append(f"PSX_TOPIC_{role.upper()}={mapped[role]}")

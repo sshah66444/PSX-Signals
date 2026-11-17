@@ -225,6 +225,24 @@ class DeskIdExtractionTest(unittest.TestCase):
         self.assertIn("topic 3", report)
         self.assertIn("privacy mode", desk.format_desk_ids({}))
 
+    def test_commands_identify_lanes_when_topic_names_are_invisible(self):
+        chat = {"chat_id": "-100", "topics": {
+            5: "/start@my_psx_trade_signals_bot", 6: "/active", 7: "/events SNGP", 8: "/performance"}}
+        block = desk.suggest_env_block(chat)
+        self.assertIn("PSX_TOPIC_DESK=5", block)
+        self.assertIn("PSX_TOPIC_SIGNALS=6", block)
+        self.assertIn("PSX_TOPIC_EVENTS=7", block)
+        self.assertIn("PSX_TOPIC_RISK=8", block)
+
+    def test_membership_updates_supply_the_chat_before_any_message(self):
+        payload = {"result": [{"update_id": 1, "my_chat_member": {
+            "chat": {"id": -1003984606400, "type": "supergroup", "title": "PSX Desk", "is_forum": True},
+            "new_chat_member": {"status": "administrator"},
+        }}]}
+        chats = desk.extract_desk_ids(payload)
+        self.assertIn("-1003984606400", chats)
+        self.assertEqual(chats["-1003984606400"]["title"], "PSX Desk")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

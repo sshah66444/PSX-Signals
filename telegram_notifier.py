@@ -749,7 +749,7 @@ def main():
         try:
             response = requests.get(
                 f"https://api.telegram.org/bot{token}/getUpdates",
-                params={"timeout": 0, "allowed_updates": '["message"]'},
+                params={"timeout": 0},
                 timeout=20,
             )
             payload = response.json()
