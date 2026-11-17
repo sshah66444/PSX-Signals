@@ -244,5 +244,65 @@ class DeskIdExtractionTest(unittest.TestCase):
         self.assertEqual(chats["-1003984606400"]["title"], "PSX Desk")
 
 
+class CrossBotRepliesTest(unittest.TestCase):
+    def test_post_passes_reply_to_and_custom_thread(self):
+        sent = []
+        def capturing_sender(token, chat_id, text, thread_id=None, reply_to_message_id=None):
+            sent.append({
+                "token": token, "chat_id": chat_id, "text": text,
+                "thread_id": thread_id, "reply_to_message_id": reply_to_message_id,
+            })
+            return 999
+
+        env = dict(BASE_ENV, PSX_TOPIC_SIGNALS="6", PSX_TOPIC_EVENTS="7", PSX_TOPIC_RISK="8")
+        msg_id = desk.post("events", "Cleared", capturing_sender, environ=env,
+                           reply_to_message_id=1234, thread_id=6)
+        self.assertEqual(msg_id, 999)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["thread_id"], 6)
+        self.assertEqual(sent[0]["reply_to_message_id"], 1234)
+        self.assertIn("<b>EVENT DESK</b>", sent[0]["text"])
+
+    def test_format_event_reply_verdicts(self):
+        clear_reply = desk.format_event_reply("OGDC", {"verdict": "CLEAR"})
+        self.assertIn("EVENT CLEARANCE", clear_reply)
+        self.assertIn("passed", clear_reply.lower())
+
+        watch_reply = desk.format_event_reply("OGDC", {"verdict": "WATCH", "warnings": ["Board meeting on Nov 25"]})
+        self.assertIn("EVENT CAUTION", watch_reply)
+        self.assertIn("Board meeting on Nov 25", watch_reply)
+
+        block_reply = desk.format_event_reply("OGDC", {"verdict": "BLOCK", "blockers": ["Dividend book closure on Nov 20"]})
+        self.assertIn("EVENT VETO", block_reply)
+        self.assertIn("Dividend book closure on Nov 20", block_reply)
+
+    def test_format_risk_reply(self):
+        setup = {
+            "symbol": "NML", "entry_min": 131.0, "entry_max": 135.0,
+            "stop_loss": 125.0, "tp1": 150.0, "tp2": 170.0,
+            "current_price": 133.0, "time_stop_bars": 15, "trailing_stop_ema": 128.5,
+            "adv_tier": "Tier 1",
+        }
+        text = desk.format_risk_reply(setup)
+        self.assertIn("RISK PROTOCOL", text)
+        self.assertIn("125.00 PKR", text)
+        self.assertIn("150.00 PKR", text)
+        self.assertIn("breakeven", text)
+        self.assertIn("EMA-50", text)
+
+    def test_format_checkin_reply(self):
+        sig = desk.format_checkin_reply("signals", {"total": 75, "buy_now": 2, "buy_zone": 3, "watch": 10})
+        self.assertIn("SIGNALS CHECK-IN", sig)
+        self.assertIn("75 equities", sig)
+
+        evt = desk.format_checkin_reply("events", {"blocked": 1})
+        self.assertIn("EVENT DESK CHECK-IN", evt)
+        self.assertIn("setup(s) vetoed", evt)
+
+        rsk = desk.format_checkin_reply("risk", {"updates": 4})
+        self.assertIn("RISK DESK CHECK-IN", rsk)
+        self.assertIn("position update(s)", rsk)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

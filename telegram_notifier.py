@@ -116,7 +116,10 @@ def _post_with_retry(url: str, payload: dict, timeout: int = 20) -> tuple[bool, 
             continue
 
         if resp.status_code == 200:
-            return True, ""
+            try:
+                return True, resp.json()
+            except Exception:
+                return True, ""
         if resp.status_code == 429:
             try:
                 retry_after = int(resp.json().get("parameters", {}).get("retry_after", 5))
@@ -134,11 +137,13 @@ def _post_with_retry(url: str, payload: dict, timeout: int = 20) -> tuple[bool, 
     return False, f"failed after {TELEGRAM_MAX_ATTEMPTS} attempts ({last_error})"
 
 
-def send_telegram_message(token: str, chat_id: str, text: str, thread_id=None) -> bool:
+def send_telegram_message(token: str, chat_id: str, text: str, thread_id=None, reply_to_message_id=None):
     """Sends an HTML formatted message to Telegram, chunking and retrying as needed.
 
     `thread_id` targets a forum topic in a supergroup (the desk lanes); when omitted
     we fall back to the reply thread of the command being handled, if any.
+    `reply_to_message_id` quotes/replies to an existing message in the chat.
+    Returns the message_id (int) of the sent message on success, or False on failure.
     """
     if not token or not chat_id or not str(text).strip():
         return False
@@ -146,6 +151,7 @@ def send_telegram_message(token: str, chat_id: str, text: str, thread_id=None) -
         thread_id = _ACTIVE_THREAD_ID
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     delivered = True
+    last_msg_id = None
     for chunk in _split_message(str(text)):
         payload = {
             "chat_id": chat_id,
@@ -155,14 +161,20 @@ def send_telegram_message(token: str, chat_id: str, text: str, thread_id=None) -
         }
         if thread_id:
             payload["message_thread_id"] = int(thread_id)
-        ok, error = _post_with_retry(url, payload)
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+        ok, res = _post_with_retry(url, payload)
         if not ok:
-            print(f"✗ Telegram delivery failed for chat {chat_id}: {error}")
+            print(f"✗ Telegram delivery failed for chat {chat_id}: {res}")
             delivered = False
-    return delivered
+        elif isinstance(res, dict):
+            last_msg_id = res.get("result", {}).get("message_id")
+    if delivered:
+        return last_msg_id if last_msg_id is not None else True
+    return False
 
 
-def broadcast_telegram_message(token: str, chat_ids_str: str, text: str, thread_id=None) -> bool:
+def broadcast_telegram_message(token: str, chat_ids_str: str, text: str, thread_id=None, reply_to_message_id=None) -> bool:
     """Delivers message to one or more recipients, groups, or channels (comma-separated)."""
     if not token or not chat_ids_str:
         return False
@@ -171,15 +183,15 @@ def broadcast_telegram_message(token: str, chat_ids_str: str, text: str, thread_
     for idx, cid in enumerate(recipients):
         if idx:
             time.sleep(TELEGRAM_PACING_SECONDS)
-        ok = send_telegram_message(token, cid, text, thread_id=thread_id)
+        ok = send_telegram_message(token, cid, text, thread_id=thread_id, reply_to_message_id=reply_to_message_id)
         if not ok:
             success = False
     return success
 
 
-def _desk_send(token: str, chat_id: str, text: str, thread_id=None) -> bool:
+def _desk_send(token: str, chat_id: str, text: str, thread_id=None, reply_to_message_id=None):
     """Adapter handed to desk.post() so the module stays import-cycle free."""
-    return send_telegram_message(token, chat_id, text, thread_id=thread_id)
+    return send_telegram_message(token, chat_id, text, thread_id=thread_id, reply_to_message_id=reply_to_message_id)
 
 
 def build_no_signals_note(is_bullish: bool) -> str:
@@ -415,7 +427,7 @@ def run_daily_market_cycle(
             if is_new_or_updated:
                 comp_name = watchlist.get(sym, {}).get("name", sym)
                 card = format_actionable_card(setup, company_name=comp_name, mode=mode)
-                new_setup_cards.append((setup.get("score") or 0, card))
+                new_setup_cards.append((setup.get("score") or 0, card, setup, assessment))
     print(
         "   Signal states: "
         f"BUY_NOW={state_counts.get('BUY_NOW', 0)} "
@@ -470,36 +482,104 @@ def run_daily_market_cycle(
     # Prepend header, then every detail message, in the exact order they will
     # be broadcast below -- so the returned list (used for the dry-run
     # preview) always matches what a live subscriber actually receives.
+    cross_bot_replies = os.environ.get("PSX_CROSS_BOT_REPLIES", "1").lower() not in ("0", "false", "no", "off")
     messages.insert(0, header)
     for veto in event_messages:
         messages.append(desk.envelope("events", veto["text"], symbol=veto["symbol"]))
-    ranked_cards = [card for _, card in sorted(new_setup_cards, key=lambda x: -x[0])]
-    messages.extend(ranked_cards[:MAX_CARDS_PER_RUN])
+    ranked_items = sorted(new_setup_cards, key=lambda x: -x[0])
+    for item in ranked_items[:MAX_CARDS_PER_RUN]:
+        score, card, setup, assessment = item
+        messages.append(card)
+        if cross_bot_replies:
+            sym = setup.get("symbol")
+            messages.append(desk.envelope("events", desk.format_event_reply(sym, assessment), symbol=sym))
+            messages.append(desk.envelope("risk", desk.format_risk_reply(setup), symbol=sym))
     if no_signals_note:
         messages.append(no_signals_note)
 
     # 6. Broadcast in banner-first order: header, then event vetoes, then lifecycle
-    # updates, then new setup cards, then the no-signals fallback. Each message goes
-    # to its desk lane (topic / bot identity) and is paced so a 40-60 alert evening
-    # does not trip Telegram's flood control.
+    # updates, then new setup cards with cross-bot specialist replies.
     if not dry_run and token and chat_id:
-        outbox = [("desk", header, None)]
-        outbox.extend(("events", veto["text"], veto["symbol"]) for veto in event_messages)
-        outbox.extend(
-            (desk.role_for_update(upd.get("type")), upd["text"], None)
-            for upd in lifecycle_updates
-        )
-        outbox.extend(("signals", card, None) for card in ranked_cards[:MAX_CARDS_PER_RUN])
-        if no_signals_note:
-            outbox.append(("desk", no_signals_note, None))
-
+        channels = desk.resolve_channels(chat_id=chat_id, token=token)
+        signals_thread = channels.get("signals", {}).get("thread_id")
         delivered = 0
-        for idx, (role, item, symbol) in enumerate(outbox):
-            if idx:
+
+        # 1. Post Header to desk lane
+        desk_msg_id = desk.post("desk", header, _desk_send, chat_id=chat_id, token=token)
+        if desk_msg_id:
+            delivered += 1
+            if cross_bot_replies:
+                reply_id = desk_msg_id if isinstance(desk_msg_id, int) else None
+                sig_checkin = desk.format_checkin_reply("signals", {
+                    "total": len(market_data),
+                    "buy_now": state_counts.get("BUY_NOW", 0),
+                    "buy_zone": state_counts.get("BUY_ZONE", 0),
+                    "watch": state_counts.get("WATCH", 0),
+                })
                 time.sleep(TELEGRAM_PACING_SECONDS)
-            if desk.post(role, item, _desk_send, chat_id=chat_id, token=token, symbol=symbol):
+                if desk.post("signals", sig_checkin, _desk_send, chat_id=chat_id, token=token,
+                             reply_to_message_id=reply_id):
+                    delivered += 1
+
+                evt_checkin = desk.format_checkin_reply("events", {"blocked": event_blocked})
+                time.sleep(TELEGRAM_PACING_SECONDS)
+                if desk.post("events", evt_checkin, _desk_send, chat_id=chat_id, token=token,
+                             reply_to_message_id=reply_id):
+                    delivered += 1
+
+                rsk_checkin = desk.format_checkin_reply("risk", {"updates": len(lifecycle_updates)})
+                time.sleep(TELEGRAM_PACING_SECONDS)
+                if desk.post("risk", rsk_checkin, _desk_send, chat_id=chat_id, token=token,
+                             reply_to_message_id=reply_id):
+                    delivered += 1
+
+        # 2. Event Vetoes (into events lane)
+        for veto in event_messages:
+            time.sleep(TELEGRAM_PACING_SECONDS)
+            if desk.post("events", veto["text"], _desk_send, chat_id=chat_id, token=token, symbol=veto["symbol"]):
                 delivered += 1
-        print(f"   Telegram delivery: {delivered}/{len(outbox)} messages sent successfully.")
+
+        # 3. Lifecycle Updates (into risk lane)
+        for upd in lifecycle_updates:
+            time.sleep(TELEGRAM_PACING_SECONDS)
+            role = desk.role_for_update(upd.get("type"))
+            if desk.post(role, upd["text"], _desk_send, chat_id=chat_id, token=token):
+                delivered += 1
+
+        # 4. Ranked Signals with Cross-Bot Replies
+        for item in ranked_items[:MAX_CARDS_PER_RUN]:
+            score, card, setup, assessment = item
+            time.sleep(TELEGRAM_PACING_SECONDS)
+            sym = setup.get("symbol")
+            card_msg_id = desk.post("signals", card, _desk_send, chat_id=chat_id, token=token, symbol=sym)
+            if card_msg_id:
+                delivered += 1
+                if cross_bot_replies:
+                    reply_id = card_msg_id if isinstance(card_msg_id, int) else None
+
+                    # Event Desk reply
+                    time.sleep(TELEGRAM_PACING_SECONDS)
+                    evt_text = desk.format_event_reply(sym, assessment)
+                    if desk.post("events", evt_text, _desk_send, chat_id=chat_id, token=token,
+                                 symbol=sym, reply_to_message_id=reply_id, thread_id=signals_thread):
+                        delivered += 1
+
+                    # Risk Desk reply
+                    time.sleep(TELEGRAM_PACING_SECONDS)
+                    rsk_text = desk.format_risk_reply(setup)
+                    if desk.post("risk", rsk_text, _desk_send, chat_id=chat_id, token=token,
+                                 symbol=sym, reply_to_message_id=reply_id, thread_id=signals_thread):
+                        delivered += 1
+
+        # 5. No signals note if needed
+        if no_signals_note:
+            time.sleep(TELEGRAM_PACING_SECONDS)
+            if desk.post("desk", no_signals_note, _desk_send, chat_id=chat_id, token=token):
+                delivered += 1
+
+        print(f"   Telegram delivery: {delivered} message(s) sent successfully.")
+
+    return messages
 
     return messages
 
@@ -650,7 +730,22 @@ def _handle_interactive_command(token: str, chat_id: str, cmd_text: str):
             send_telegram_message(token, chat_id, reply)
         else:
             card = format_actionable_card(setup, company_name=comp_name)
-            send_telegram_message(token, chat_id, card)
+            card_msg_id = send_telegram_message(token, chat_id, card)
+            cross_bot_replies = os.environ.get("PSX_CROSS_BOT_REPLIES", "1").lower() not in ("0", "false", "no", "off")
+            if cross_bot_replies and card_msg_id:
+                try:
+                    events_store = load_events()
+                    assessment = assess_event_risk(sym, events=events_store.get("events", []))
+                    evt_text = desk.format_event_reply(sym, assessment)
+                    reply_id = card_msg_id if isinstance(card_msg_id, int) else None
+                    desk.post("events", evt_text, _desk_send, chat_id=chat_id, token=token,
+                              symbol=sym, reply_to_message_id=reply_id)
+
+                    rsk_text = desk.format_risk_reply(setup)
+                    desk.post("risk", rsk_text, _desk_send, chat_id=chat_id, token=token,
+                              symbol=sym, reply_to_message_id=reply_id)
+                except Exception as exc:
+                    print(f"Interactive cross-bot reply error: {exc}")
 
     elif cmd == "/scan":
         send_telegram_message(token, chat_id, "🔄 Running fresh market scan...")
@@ -728,9 +823,16 @@ def main():
                         help="Query Telegram for the group chat id and every topic id, then print an env block")
     parser.add_argument("--allow-stale", action="store_true", default=True, help="Bypass strict session freshness guard (default: on, so a one-session feed lag still delivers alerts with a pending notice)")
     parser.add_argument("--strict-freshness", action="store_true", help="Halt the scan when today's EOD bar has not settled yet")
+    parser.add_argument("--cross-bot-replies", action="store_true", default=None,
+                        help="Enable cross-bot automated replies between lanes (default: on via PSX_CROSS_BOT_REPLIES)")
+    parser.add_argument("--no-cross-bot-replies", dest="cross_bot_replies", action="store_false",
+                        help="Disable cross-bot automated replies")
     parser.add_argument("--mode", type=str, default=None, choices=["day_trade", "swing_trade", "position_trade"],
                        help="Trading mode (default: swing_trade or PSX_TRADING_MODE env var)")
     args = parser.parse_args()
+
+    if args.cross_bot_replies is not None:
+        os.environ["PSX_CROSS_BOT_REPLIES"] = "1" if args.cross_bot_replies else "0"
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")

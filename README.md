@@ -569,8 +569,12 @@ PSX_BOT_TOKEN_RISK=...
 
 ### Behaviour
 
-* Commands reply **in the topic they were issued in** (`/events SNGP` inside Events
-  stays inside Events).
+* **Automated Cross-Bot Replies**: When a signal card is posted, the **Event Desk** and **Risk Desk** automatically reply directly to that card thread:
+  * `🗓 EVENT DESK`: Replies with corporate calendar clearance (`CLEAR`) or blackout warnings (`CAUTION`/`VETO`).
+  * `🛡 RISK`: Replies with position sizing limits, 1R capital risk, hard invalidation level, breakeven trigger, and trailing model.
+  * `🎛 DESK`: When the scan header is posted, specialist lanes check in with summary tallies.
+  * To disable cross-bot replies: `PSX_CROSS_BOT_REPLIES=0` or pass `--no-cross-bot-replies`.
+* Commands reply **in the topic they were issued in** (`/events SNGP` inside Events stays inside Events).
 * A dry run sends nothing and writes nothing.
 * With no topics and no lane tokens the desk collapses to today's single feed — same
   token, same chat, same order.

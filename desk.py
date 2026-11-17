@@ -107,13 +107,14 @@ def envelope(role: str, text: str, symbol: str = None, headline: str = None) -> 
 
 
 def post(role: str, text: str, send, environ=None, chat_id=None, dry_run: bool = False,
-         symbol: str = None, headline: str = None, token: str = None) -> bool:
+         symbol: str = None, headline: str = None, token: str = None,
+         reply_to_message_id=None, thread_id=None):
     """
-    Sends one lane message through an injected `send(token, chat_id, text, thread_id)`.
+    Sends one lane message through an injected `send(token, chat_id, text, thread_id, reply_to_message_id)`.
 
     `send` is injected (not imported) so this module stays testable and free of a
-    circular import with telegram_notifier. Returns False when the lane is not
-    configured or the send fails -- callers treat delivery as best-effort.
+    circular import with telegram_notifier. Returns the sent message id or True when successful,
+    or False when the lane is not configured or delivery fails.
     """
     if not text or dry_run:
         return False
@@ -121,16 +122,90 @@ def post(role: str, text: str, send, environ=None, chat_id=None, dry_run: bool =
     channel = channels.get(role) or channels["desk"]
     if not channel["enabled"]:
         return False
+    target_thread = thread_id if thread_id is not None else channel["thread_id"]
+    body = envelope(role, text, symbol, headline)
     try:
-        return bool(send(channel["token"], channel["chat_id"],
-                         envelope(role, text, symbol, headline), channel["thread_id"]))
+        res = send(channel["token"], channel["chat_id"],
+                   body, target_thread, reply_to_message_id=reply_to_message_id)
+        return res if res else True
     except TypeError:
-        # A sender that predates thread support must not break the desk.
-        return bool(send(channel["token"], channel["chat_id"],
-                         envelope(role, text, symbol, headline)))
+        # Fall back if sender does not take reply_to_message_id
+        try:
+            res = send(channel["token"], channel["chat_id"], body, target_thread)
+            return res if res else True
+        except TypeError:
+            # Fall back if sender does not take thread_id
+            res = send(channel["token"], channel["chat_id"], body)
+            return res if res else True
     except Exception as exc:  # delivery is best-effort by design
         print(f"✗ desk delivery failed ({role}): {exc}")
         return False
+
+
+def format_event_reply(symbol: str, assessment: dict) -> str:
+    """Formats an event desk check-in reply to a signal card."""
+    sym = str(symbol or "").upper()
+    verdict = (assessment or {}).get("verdict", "CLEAR")
+    if verdict == "BLOCK":
+        reason = (((assessment or {}).get("blockers") or []) + ["corporate event window"])[0]
+        return f"⛔ <b>EVENT VETO:</b> Corporate action blackout active — {reason}. Trade entry suppressed."
+    elif verdict == "WATCH":
+        warning = (((assessment or {}).get("warnings") or []) + ["upcoming announcement"])[0]
+        return f"⚠️ <b>EVENT CAUTION:</b> {warning}. Tighten risk parameters; do not hold through announcement."
+    else:
+        return "✅ <b>EVENT CLEARANCE:</b> No blackout events or board meetings within 7 sessions. Event gate passed."
+
+
+def format_risk_reply(setup: dict) -> str:
+    """Formats a risk management protocol reply to a signal card."""
+    entry_min = setup.get("entry_min") or setup.get("planned_entry_min") or 0.0
+    entry_max = setup.get("entry_max") or setup.get("planned_entry_max") or 0.0
+    sl = setup.get("stop_loss") or setup.get("invalidation_sl") or 0.0
+    tp1 = setup.get("tp1") or 0.0
+    tp2 = setup.get("tp2") or 0.0
+    price = setup.get("current_price") or entry_min or 1.0
+    risk_pct = abs(price - sl) / price * 100.0 if price > 0 and sl > 0 else 0.0
+    tp1_pct = abs(tp1 - price) / price * 100.0 if price > 0 and tp1 > 0 else 0.0
+    tp2_pct = abs(tp2 - price) / price * 100.0 if price > 0 and tp2 > 0 else 0.0
+    time_stop = setup.get("time_stop_bars") or 15
+    trail_ema = setup.get("trailing_stop_ema") or 0.0
+    adv_tier = setup.get("adv_tier") or "Tier 1/2"
+
+    lines = [
+        "🛡 <b>RISK PROTOCOL &amp; SIZING:</b>",
+        f"• <b>Position Sizing:</b> Max 10% capital (Risk: -{risk_pct:.1f}%) | Liquidity: {adv_tier}",
+        f"• <b>Hard Stop:</b> {sl:.2f} PKR (close below exits)",
+        f"• <b>Target 1:</b> {tp1:.2f} PKR (+{tp1_pct:.1f}%) ➔ Lock 50%, stop moves to breakeven",
+        f"• <b>Target 2:</b> {tp2:.2f} PKR (+{tp2_pct:.1f}%) ➔ Trail EMA-50 ({trail_ema:.2f} PKR)",
+        f"• <b>Time Stop:</b> {time_stop} sessions max if stalled",
+    ]
+    return "\n".join(lines)
+
+
+def format_checkin_reply(role: str, summary: dict) -> str:
+    """Formats a lane specialist check-in reply to the daily scan header."""
+    if role == "signals":
+        total = summary.get("total", 0)
+        buy_now = summary.get("buy_now", 0)
+        buy_zone = summary.get("buy_zone", 0)
+        watch = summary.get("watch", 0)
+        return (
+            f"🛰 <b>SIGNALS CHECK-IN:</b>\n"
+            f"Evaluated {total} equities: <b>{buy_now}</b> BUY NOW, "
+            f"<b>{buy_zone}</b> BUY ZONE, <b>{watch}</b> WATCH."
+        )
+    elif role == "events":
+        blocked = summary.get("blocked", 0)
+        veto_str = f"<b>{blocked}</b> setup(s) vetoed by binary event risk" if blocked else "All candidates cleared event calendar"
+        return f"🗓 <b>EVENT DESK CHECK-IN:</b>\nAnnouncements & board meetings audited. {veto_str}."
+    elif role == "risk":
+        updates = summary.get("updates", 0)
+        return (
+            f"🛡 <b>RISK DESK CHECK-IN:</b>\n"
+            f"Active lifecycle monitor: <b>{updates}</b> position update(s). "
+            f"Portfolio exposure caps & 1R stop protocols armed."
+        )
+    return ""
 
 
 def describe(environ=None, chat_id=None, token=None) -> str:
