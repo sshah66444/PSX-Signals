@@ -724,6 +724,8 @@ def main():
     parser.add_argument("--test", action="store_true", help="Send a single diagnostic message to Telegram and exit")
     parser.add_argument("--check-feeds", action="store_true", help="Report data-feed health (Yahoo, PSX DPS, benchmark) and exit")
     parser.add_argument("--desk", action="store_true", help="Show desk lane routing (topics / bot identities) and exit")
+    parser.add_argument("--desk-ids", action="store_true",
+                        help="Query Telegram for the group chat id and every topic id, then print an env block")
     parser.add_argument("--allow-stale", action="store_true", default=True, help="Bypass strict session freshness guard (default: on, so a one-session feed lag still delivers alerts with a pending notice)")
     parser.add_argument("--strict-freshness", action="store_true", help="Halt the scan when today's EOD bar has not settled yet")
     parser.add_argument("--mode", type=str, default=None, choices=["day_trade", "swing_trade", "position_trade"],
@@ -738,6 +740,27 @@ def main():
         print(desk.describe(chat_id=chat_id, token=token))
         print("\nSet PSX_TOPIC_<LANE> to a forum topic id, and optionally")
         print("PSX_BOT_TOKEN_<LANE> to have a different bot identity per lane.")
+        return 0
+
+    if args.desk_ids:
+        if not token:
+            print("TELEGRAM_BOT_TOKEN missing — cannot query Telegram.")
+            return 1
+        try:
+            response = requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"timeout": 0, "allowed_updates": '["message"]'},
+                timeout=20,
+            )
+            payload = response.json()
+        except Exception as exc:
+            print(f"getUpdates failed: {exc}")
+            return 1
+        if not payload.get("ok"):
+            print(f"Telegram error: {payload.get('description')}")
+            return 1
+        print("=== DESK IDS ===")
+        print(desk.format_desk_ids(desk.extract_desk_ids(payload)))
         return 0
 
     if args.check_feeds:

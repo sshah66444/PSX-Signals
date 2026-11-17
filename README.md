@@ -539,14 +539,24 @@ a citation rather than an opinion.
 1. Create a **supergroup**, enable **Topics**, and add the bot(s) as **administrators**
    (a bot cannot post into a topic without admin rights).
 2. Create topics: `Signals`, `Events`, `Risk` (add `Desk` if you want the header there).
-3. Get each topic's id: post once in the topic, then read `message_thread_id` from
-   `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+3. Get each topic's id: post one message inside each topic, then run
+   `python telegram_notifier.py --desk-ids`. It prints the chat id, every topic id it
+   can see, and a ready-to-paste env block (topic names containing `desk`, `signal`,
+   `event` or `risk` are mapped automatically).
+   With privacy mode on, only **addressed** commands reach the bot — send
+   `/start@your_bot` in each topic, not a plain message.
 4. Configure and verify:
 
 ```bash
+PSX_DESK_CHAT_ID=-100...               # the supergroup the desk posts into
 PSX_TOPIC_DESK=... PSX_TOPIC_SIGNALS=... PSX_TOPIC_EVENTS=... PSX_TOPIC_RISK=...
 python telegram_notifier.py --desk      # prints lane -> topic -> token source
 ```
+
+`TELEGRAM_CHAT_ID` keeps its current meaning (broadcast targets, and the command
+allow-list). If you want commands to work from the group too, add the group id to that
+list: `TELEGRAM_CHAT_ID=1971314850,-100...`. Laned delivery uses `PSX_DESK_CHAT_ID`,
+so the two never fight.
 
 Optional, for genuinely separate bot identities (create each in BotFather, add all to
 the group):

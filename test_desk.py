@@ -52,6 +52,22 @@ class ChannelResolutionTest(unittest.TestCase):
         self.assertEqual(channels["desk"]["chat_id"], "-999")
         self.assertEqual(channels["desk"]["token"], "explicit")
 
+    def test_desk_chat_id_targets_the_group_separately(self):
+        env = dict(BASE_ENV, PSX_DESK_CHAT_ID="-100555")
+        channels = desk.resolve_channels(env)
+        self.assertEqual(channels["desk"]["chat_id"], "-100555")
+        self.assertEqual(channels["risk"]["chat_id"], "-100555")
+
+    def test_comma_separated_chat_list_routes_to_the_first_entry(self):
+        env = dict(BASE_ENV, TELEGRAM_CHAT_ID="1971314850,-100555")
+        channels = desk.resolve_channels(env)
+        self.assertEqual(channels["signals"]["chat_id"], "1971314850")
+
+    def test_desk_chat_id_beats_a_broadcast_list(self):
+        env = dict(BASE_ENV, TELEGRAM_CHAT_ID="1971314850,-100555", PSX_DESK_CHAT_ID="-100555")
+        channels = desk.resolve_channels(env)
+        self.assertEqual(channels["desk"]["chat_id"], "-100555")
+
 
 class RoutingTest(unittest.TestCase):
     def test_lifecycle_updates_route_to_the_risk_lane(self):
@@ -153,6 +169,62 @@ class CommandThreadTest(unittest.TestCase):
         self.assertEqual(captured.get("chat_id"), "-100")
 
 
+UPDATES_FIXTURE = {
+    "ok": True,
+    "result": [
+        {"update_id": 1, "message": {
+            "message_id": 5, "message_thread_id": 3,
+            "chat": {"id": -1002345678901, "type": "supergroup", "title": "PSX Desk", "is_forum": True},
+            "text": "/start@my_psx_trade_signals_bot"}},
+        {"update_id": 2, "message": {
+            "message_id": 6, "message_thread_id": 4,
+            "chat": {"id": -1002345678901, "type": "supergroup", "title": "PSX Desk", "is_forum": True},
+            "text": "/start@my_psx_trade_signals_bot"}},
+        {"update_id": 3, "message": {
+            "message_id": 7,
+            "chat": {"id": 888888, "type": "private", "first_name": "Syed"},
+            "text": "/start"}},
+    ],
+}
+
+
+class DeskIdExtractionTest(unittest.TestCase):
+    def test_extracts_chat_and_topic_ids(self):
+        chats = desk.extract_desk_ids(UPDATES_FIXTURE)
+        self.assertEqual(set(chats), {"-1002345678901", "888888"})
+        forum = chats["-1002345678901"]
+        self.assertTrue(forum["is_forum"])
+        self.assertEqual(forum["title"], "PSX Desk")
+        self.assertEqual(sorted(forum["topics"]), [3, 4])
+        self.assertEqual(chats["888888"]["topics"], {})
+
+    def test_topic_creation_messages_supply_labels(self):
+        payload = {"result": [{"message": {
+            "chat": {"id": -100, "type": "supergroup", "title": "Desk", "is_forum": True},
+            "message_thread_id": 9,
+            "forum_topic_created": {"name": "Signals"},
+        }}]}
+        chats = desk.extract_desk_ids(payload)
+        self.assertEqual(chats["-100"]["topics"][9], "Signals")
+
+    def test_env_block_maps_recognisable_topic_names(self):
+        chat = {"chat_id": "-100",
+                "topics": {2: "Desk", 3: "Signals", 4: "Event desk", 5: "Risk", 6: "Chit chat"}}
+        block = desk.suggest_env_block(chat)
+        self.assertIn("TELEGRAM_CHAT_ID=-100", block)
+        self.assertIn("PSX_TOPIC_DESK=2", block)
+        self.assertIn("PSX_TOPIC_SIGNALS=3", block)
+        self.assertIn("PSX_TOPIC_EVENTS=4", block)
+        self.assertIn("PSX_TOPIC_RISK=5", block)
+        self.assertIn("assign manually", block)
+        self.assertIn("#   PSX_TOPIC_???=6", block)
+
+    def test_report_and_empty_state(self):
+        report = desk.format_desk_ids(desk.extract_desk_ids(UPDATES_FIXTURE))
+        self.assertIn("PSX Desk", report)
+        self.assertIn("topic 3", report)
+        self.assertIn("privacy mode", desk.format_desk_ids({}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
