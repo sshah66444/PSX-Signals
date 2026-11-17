@@ -114,7 +114,10 @@ class BriefingTests(unittest.TestCase):
         text=b.render(snap);self.assertIn('Do not chase'.lower(),text.lower());self.assertLess(len(text),3500)
     def test_preview_build_does_not_import_trade_ledger(self):
         import sys
-        self.assertNotIn('signal_tracker',sys.modules)
+        before = set(sys.modules)
+        b.render(self.snapshot())
+        added = set(sys.modules) - before
+        self.assertNotIn('signal_tracker', added)
     def test_zero_candidates_still_produces_daily_report(self):
         self.assertIn('NO QUALIFYING BREAKOUTS',b.render(self.snapshot()))
     def test_conditional_dip_requires_zone_and_trigger(self):
