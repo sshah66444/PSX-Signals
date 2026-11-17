@@ -457,7 +457,8 @@ def load_credentials():
                 k,v=line.split('=',1);os.environ.setdefault(k.strip(),v.strip().strip('\"\''))
     token,chat=os.getenv('TELEGRAM_BOT_TOKEN'),os.getenv('TELEGRAM_CHAT_ID')
     if not token or not chat: raise ValueError('Configure TELEGRAM_BOT_TOKEN and one TELEGRAM_CHAT_ID')
-    if ',' in chat or chat=='*': raise ValueError('Configure exactly one recipient for this personal briefing')
+    if ',' in chat: chat = chat.split(',')[0].strip()
+    if not chat or chat=='*': raise ValueError('Configure exactly one recipient for this personal briefing')
     return token,chat
 
 
