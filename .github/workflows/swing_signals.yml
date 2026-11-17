@@ -58,6 +58,15 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PSX_DESK_CHAT_ID: ${{ secrets.PSX_DESK_CHAT_ID }}
+          PSX_TOPIC_DESK: ${{ secrets.PSX_TOPIC_DESK }}
+          PSX_TOPIC_SIGNALS: ${{ secrets.PSX_TOPIC_SIGNALS }}
+          PSX_TOPIC_EVENTS: ${{ secrets.PSX_TOPIC_EVENTS }}
+          PSX_TOPIC_RISK: ${{ secrets.PSX_TOPIC_RISK }}
+          PSX_BOT_TOKEN_SIGNALS: ${{ secrets.PSX_BOT_TOKEN_SIGNALS }}
+          PSX_BOT_TOKEN_EVENTS: ${{ secrets.PSX_BOT_TOKEN_EVENTS }}
+          PSX_BOT_TOKEN_RISK: ${{ secrets.PSX_BOT_TOKEN_RISK }}
+          PSX_CROSS_BOT_REPLIES: ${{ secrets.PSX_CROSS_BOT_REPLIES }}
           PSX_TRADING_MODE: swing_trade
         run: python telegram_notifier.py --mode swing_trade
 
