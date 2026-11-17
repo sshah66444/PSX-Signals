@@ -2,6 +2,10 @@
 telegram_notifier.py
 Production PSX Telegram Bot with Actionable Cards, Lifecycle Follow-ups,
 and Interactive Commands (/scan, /active, /stock, /why, /performance, /watchlist).
+
+Delivery is lane-aware: messages go to the desk lane they belong to (see desk.py),
+so a group with forum topics shows the engine, the event gate and the risk layer as
+separate voices. Without topic configuration everything lands in the one chat.
 """
 
 import os
@@ -51,6 +55,7 @@ from event_risk import (
     upcoming_events,
 )
 from html import escape as _escape
+import desk
 from swing_config import get_config
 
 
@@ -61,6 +66,9 @@ TELEGRAM_PACING_SECONDS = 1.1     # ~1 message/sec per chat stays under flood li
 # Deliver the highest-conviction ones and report the rest in the header, so the
 # chat stays readable (the full list is always in the ledger/dashboard).
 MAX_CARDS_PER_RUN = int(os.environ.get("PSX_MAX_CARDS", "12"))
+# Forum topic of the command being handled (set by the poller). A reply inside a
+# desk topic must land in the same topic instead of the group's General thread.
+_ACTIVE_THREAD_ID = None
 
 
 def _split_message(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
@@ -126,10 +134,16 @@ def _post_with_retry(url: str, payload: dict, timeout: int = 20) -> tuple[bool, 
     return False, f"failed after {TELEGRAM_MAX_ATTEMPTS} attempts ({last_error})"
 
 
-def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
-    """Sends an HTML formatted message to Telegram, chunking and retrying as needed."""
+def send_telegram_message(token: str, chat_id: str, text: str, thread_id=None) -> bool:
+    """Sends an HTML formatted message to Telegram, chunking and retrying as needed.
+
+    `thread_id` targets a forum topic in a supergroup (the desk lanes); when omitted
+    we fall back to the reply thread of the command being handled, if any.
+    """
     if not token or not chat_id or not str(text).strip():
         return False
+    if thread_id is None:
+        thread_id = _ACTIVE_THREAD_ID
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     delivered = True
     for chunk in _split_message(str(text)):
@@ -139,6 +153,8 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if thread_id:
+            payload["message_thread_id"] = int(thread_id)
         ok, error = _post_with_retry(url, payload)
         if not ok:
             print(f"✗ Telegram delivery failed for chat {chat_id}: {error}")
@@ -146,7 +162,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
     return delivered
 
 
-def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool:
+def broadcast_telegram_message(token: str, chat_ids_str: str, text: str, thread_id=None) -> bool:
     """Delivers message to one or more recipients, groups, or channels (comma-separated)."""
     if not token or not chat_ids_str:
         return False
@@ -155,10 +171,15 @@ def broadcast_telegram_message(token: str, chat_ids_str: str, text: str) -> bool
     for idx, cid in enumerate(recipients):
         if idx:
             time.sleep(TELEGRAM_PACING_SECONDS)
-        ok = send_telegram_message(token, cid, text)
+        ok = send_telegram_message(token, cid, text, thread_id=thread_id)
         if not ok:
             success = False
     return success
+
+
+def _desk_send(token: str, chat_id: str, text: str, thread_id=None) -> bool:
+    """Adapter handed to desk.post() so the module stays import-cycle free."""
+    return send_telegram_message(token, chat_id, text, thread_id=thread_id)
 
 
 def build_no_signals_note(is_bullish: bool) -> str:
@@ -359,18 +380,25 @@ def run_daily_market_cycle(
     print("4. Evaluating setups across watchlist...")
     new_setup_cards = []
     event_blocked = 0
+    event_messages = []
     state_counts = {"BUY_NOW": 0, "BUY_ZONE": 0, "WATCH": 0, "AVOID": 0}
     for sym, m_info in market_data.items():
         df = m_info["df"]
         setup = generate_signal(sym, df, data_meta=m_info, df_kse=df_kse, market_regime=regime_info, mode=mode)
         # Veto rights for the calendar: results days, book closures, suspensions.
-        setup = apply_event_gate(setup, assess_event_risk(sym, events=events))
+        assessment = assess_event_risk(sym, events=events)
+        setup = apply_event_gate(setup, assessment)
         if setup.get("gate_downgraded_from"):
             event_blocked += 1
+            reason = ((assessment.get("blockers") or assessment.get("warnings")) or ["event window"])[0]
+            event_messages.append({
+                "symbol": sym,
+                "text": f"⛔ <b>{assessment.get('verdict')}</b> — {reason}",
+            })
             if not dry_run:
                 # Blocked setups never reach the ledger, so log the veto itself --
                 # otherwise the gate could never be priced against what it avoided.
-                log_gate_decision(setup.get("event_risk"), setup["gate_downgraded_from"])
+                log_gate_decision(assessment, setup["gate_downgraded_from"])
         state = setup.get("state")
         state_counts[state] = state_counts.get(state, 0) + 1
 
@@ -443,34 +471,40 @@ def run_daily_market_cycle(
     # be broadcast below -- so the returned list (used for the dry-run
     # preview) always matches what a live subscriber actually receives.
     messages.insert(0, header)
+    for veto in event_messages:
+        messages.append(desk.envelope("events", veto["text"], symbol=veto["symbol"]))
     ranked_cards = [card for _, card in sorted(new_setup_cards, key=lambda x: -x[0])]
     messages.extend(ranked_cards[:MAX_CARDS_PER_RUN])
     if no_signals_note:
         messages.append(no_signals_note)
 
-    # 6. Broadcast in banner-first order: header, then lifecycle updates, then
-    # new setup cards, then the no-signals fallback if there was nothing else.
-    # Each message is paced so a 40-60 alert evening does not trip Telegram's
-    # flood control (previously the tail of the batch was dropped silently).
+    # 6. Broadcast in banner-first order: header, then event vetoes, then lifecycle
+    # updates, then new setup cards, then the no-signals fallback. Each message goes
+    # to its desk lane (topic / bot identity) and is paced so a 40-60 alert evening
+    # does not trip Telegram's flood control.
     if not dry_run and token and chat_id:
-        outbox = [header]
-        outbox.extend([upd["text"] for upd in lifecycle_updates])
-        outbox.extend(ranked_cards[:MAX_CARDS_PER_RUN])
+        outbox = [("desk", header, None)]
+        outbox.extend(("events", veto["text"], veto["symbol"]) for veto in event_messages)
+        outbox.extend(
+            (desk.role_for_update(upd.get("type")), upd["text"], None)
+            for upd in lifecycle_updates
+        )
+        outbox.extend(("signals", card, None) for card in ranked_cards[:MAX_CARDS_PER_RUN])
         if no_signals_note:
-            outbox.append(no_signals_note)
+            outbox.append(("desk", no_signals_note, None))
 
         delivered = 0
-        for idx, item in enumerate(outbox):
+        for idx, (role, item, symbol) in enumerate(outbox):
             if idx:
                 time.sleep(TELEGRAM_PACING_SECONDS)
-            if broadcast_telegram_message(token, chat_id, item):
+            if desk.post(role, item, _desk_send, chat_id=chat_id, token=token, symbol=symbol):
                 delivered += 1
         print(f"   Telegram delivery: {delivered}/{len(outbox)} messages sent successfully.")
 
     return messages
 
 
-def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
+def _handle_interactive_command(token: str, chat_id: str, cmd_text: str):
     """
     Processes interactive user commands sent via Telegram.
     """
@@ -623,6 +657,23 @@ def handle_interactive_command(token: str, chat_id: str, cmd_text: str):
         run_daily_market_cycle(token, chat_id)
 
 
+def handle_interactive_command(token: str, chat_id: str, cmd_text: str, thread_id=None):
+    """
+    Public command entry point.
+
+    `thread_id` is the forum topic the command arrived in; replies are sent back to
+    that topic so a desk conversation stays in its lane. The topic is carried in a
+    module-level value because every command branch replies through
+    send_telegram_message() without threading the id through each call.
+    """
+    global _ACTIVE_THREAD_ID
+    _ACTIVE_THREAD_ID = thread_id
+    try:
+        _handle_interactive_command(token, chat_id, cmd_text)
+    finally:
+        _ACTIVE_THREAD_ID = None
+
+
 def poll_incoming_commands(token: str, chat_id: str):
     """
     Checks for any pending interactive commands from the user and replies.
@@ -654,7 +705,9 @@ def poll_incoming_commands(token: str, chat_id: str):
             is_authorized = not authorized_ids or "*" in authorized_ids or sender_chat_id in authorized_ids
             if is_authorized and text.startswith("/"):
                 print(f"Processing command from user {sender_chat_id}: {text}")
-                handle_interactive_command(token, sender_chat_id, text)
+                handle_interactive_command(
+                    token, sender_chat_id, text, thread_id=msg.get("message_thread_id")
+                )
 
         # Clear processed updates
         if max_update_id > 0:
@@ -670,6 +723,7 @@ def main():
     parser.add_argument("--check-commands", action="store_true", help="Poll and execute interactive Telegram commands")
     parser.add_argument("--test", action="store_true", help="Send a single diagnostic message to Telegram and exit")
     parser.add_argument("--check-feeds", action="store_true", help="Report data-feed health (Yahoo, PSX DPS, benchmark) and exit")
+    parser.add_argument("--desk", action="store_true", help="Show desk lane routing (topics / bot identities) and exit")
     parser.add_argument("--allow-stale", action="store_true", default=True, help="Bypass strict session freshness guard (default: on, so a one-session feed lag still delivers alerts with a pending notice)")
     parser.add_argument("--strict-freshness", action="store_true", help="Halt the scan when today's EOD bar has not settled yet")
     parser.add_argument("--mode", type=str, default=None, choices=["day_trade", "swing_trade", "position_trade"],
@@ -678,6 +732,13 @@ def main():
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if args.desk:
+        print("=== DESK LANE ROUTING ===")
+        print(desk.describe(chat_id=chat_id, token=token))
+        print("\nSet PSX_TOPIC_<LANE> to a forum topic id, and optionally")
+        print("PSX_BOT_TOKEN_<LANE> to have a different bot identity per lane.")
+        return 0
 
     if args.check_feeds:
         from data_engine import dps_is_retired, _fetch_from_psx_dps

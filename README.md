@@ -519,6 +519,59 @@ can be judged on evidence rather than intent.
 
 ---
 
+## 🗣 Stage 3: The Desk in Telegram (one group, several voices)
+
+The signals, the calendar vetoes and the risk updates are different kinds of message.
+A single feed buries a stop-out under twelve BUY cards. `desk.py` posts each lane into
+its own **forum topic**, and can give each lane its **own bot identity** — which is the
+literal "bots in a group" setup, with the difference that every bot here has a job and
+a citation rather than an opinion.
+
+| Lane | Badge | Posts |
+|---|---|---|
+| `desk` | 🎛 DESK | daily scan header, regime line, "no signals" note |
+| `signals` | 🛰 ENGINE | BUY NOW / BUY ZONE cards from the deterministic engine |
+| `events` | 🗓 EVENT DESK | every announcement veto, with the event and its date |
+| `risk` | 🛡 RISK | stops, TP1/TP2, time stops, trailing exits, invalidations, partials |
+
+### Setup
+
+1. Create a **supergroup**, enable **Topics**, and add the bot(s) as **administrators**
+   (a bot cannot post into a topic without admin rights).
+2. Create topics: `Signals`, `Events`, `Risk` (add `Desk` if you want the header there).
+3. Get each topic's id: post once in the topic, then read `message_thread_id` from
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+4. Configure and verify:
+
+```bash
+PSX_TOPIC_DESK=... PSX_TOPIC_SIGNALS=... PSX_TOPIC_EVENTS=... PSX_TOPIC_RISK=...
+python telegram_notifier.py --desk      # prints lane -> topic -> token source
+```
+
+Optional, for genuinely separate bot identities (create each in BotFather, add all to
+the group):
+
+```
+PSX_BOT_TOKEN_SIGNALS=...
+PSX_BOT_TOKEN_EVENTS=...
+PSX_BOT_TOKEN_RISK=...
+```
+
+### Behaviour
+
+* Commands reply **in the topic they were issued in** (`/events SNGP` inside Events
+  stays inside Events).
+* A dry run sends nothing and writes nothing.
+* With no topics and no lane tokens the desk collapses to today's single feed — same
+  token, same chat, same order.
+* Delivery stays best-effort and paced; a failed lane never fails the scan.
+
+What this is **not**: agents arguing with each other. Each lane is a single voice over
+work that is already verified — the engine's card, the gate's cited veto, the ledger's
+exit. If a lane ever needs to be more than that, the harness has to show the edge first.
+
+---
+
 ## 📂 Project Architecture
 
 ```
@@ -533,12 +586,14 @@ psx-signal-screener/
 ├── walkforward.py          # Out-of-sample replay + matched random-entry null model
 ├── refresh_cache.py        # Downloads one uniform history window for the watchlist
 ├── event_risk.py           # Announcement store, event verdicts, veto gate & forward log
+├── desk.py                 # Telegram desk lanes: topics, per-lane bot identities, routing
 ├── telegram_notifier.py    # Telegram bot with daily scans, lifecycle updates & /commands
 ├── run_swing_scan.command  # macOS double-click launcher for a live swing scan
 ├── test_engine.py          # Automated verification test suite
 ├── test_ledger_integrity.py # Stage-0 ledger tests (isolated temp DB, never signals.db)
 ├── test_stage1.py          # Exit profile + walk-forward/null-model tests
 ├── test_stage2.py          # Event gate: classification, store, verdicts, parser, log
+├── test_desk.py            # Desk lanes: topic/token resolution, routing, thread replies
 ├── signals.db              # SQLite persistent trade ledger (WAL enabled)
 └── .github/workflows/
     ├── daily_psx_signals.yml # Telegram /command polling runner
