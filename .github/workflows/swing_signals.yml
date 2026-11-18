@@ -39,11 +39,12 @@ jobs:
       - name: Check whether today's scan already delivered
         id: gate
         run: |
-          TODAY=$(TZ=Asia/Karachi date +%F)
-          echo "today=${TODAY}" >> "$GITHUB_OUTPUT"
-          if [ -f ".state/swing_scan_${TODAY}.done" ] && [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+          SESSION=$(python -c "from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; now = datetime.now(ZoneInfo('Asia/Karachi')); print(((now - timedelta(days=1)).date() if now.hour < 17 else now.date()).isoformat())")
+          echo "session=${SESSION}" >> "$GITHUB_OUTPUT"
+          echo "Evaluating PSX market session: ${SESSION}"
+          if [ -f ".state/swing_scan_${SESSION}.done" ] && [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Swing scan already delivered for ${TODAY}; skipping this retry window."
+            echo "Swing scan already delivered for session ${SESSION}; skipping this retry window."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -74,8 +75,8 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: |
           mkdir -p .state
-          printf '{"delivered_at": "%s", "mode": "swing_trade"}\n' \
-            "$(TZ=Asia/Karachi date -Iseconds)" > ".state/swing_scan_${{ steps.gate.outputs.today }}.done"
+          printf '{"delivered_at": "%s", "mode": "swing_trade", "session": "%s"}\n' \
+            "$(TZ=Asia/Karachi date -Iseconds)" "${{ steps.gate.outputs.session }}" > ".state/swing_scan_${{ steps.gate.outputs.session }}.done"
 
       - name: Persist signal ledger and delivery marker
         if: always()
