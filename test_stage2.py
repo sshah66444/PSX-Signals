@@ -206,7 +206,7 @@ class CliTest(unittest.TestCase):
                 code = event_risk.main(["--path", path, "--add", "OGDC", "RESULTS", "2026-11-17",
                                         "--headline", "Board meeting to consider accounts"])
                 self.assertEqual(code, 0)
-                code = event_risk.main(["--path", path, "--check", "OGDC"])
+                code = event_risk.main(["--path", path, "--check", "OGDC", "--as-of", "2026-11-17"])
                 self.assertEqual(code, 0)
             output = buffer.getvalue()
             self.assertIn("1 events stored", output)

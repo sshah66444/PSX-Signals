@@ -655,6 +655,7 @@ def main(argv=None):
     parser.add_argument("--symbols", nargs="*", help="Limit a refresh to these symbols (default: watchlist)")
     parser.add_argument("--import", dest="import_path", help="Import a saved announcements HTML page or JSON export")
     parser.add_argument("--check", nargs="*", help="Assess these symbols, e.g. --check OGDC MEBL")
+    parser.add_argument("--as-of", help="Evaluation date YYYY-MM-DD (default: today)")
     parser.add_argument("--add", nargs=3, metavar=("SYMBOL", "TYPE", "DATE"),
                         help="Seed one event, e.g. --add OGDC RESULTS 2026-11-20 --headline 'Board meeting'")
     parser.add_argument("--headline", default="Manually seeded event", help="Headline used by --add")
@@ -706,7 +707,8 @@ def main(argv=None):
         store = load_events(args.path)
         if store.get("error"):
             print(f"warning: {store['error']}")
-        assessments = [assess(symbol, events=store["events"], horizon_days=args.horizon)
+        as_of_date = _as_date(args.as_of) if args.as_of else None
+        assessments = [assess(symbol, as_of=as_of_date, events=store["events"], horizon_days=args.horizon)
                        for symbol in args.check]
         if args.json:
             print(json.dumps(assessments, indent=2))

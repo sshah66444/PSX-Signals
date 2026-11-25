@@ -57,14 +57,27 @@ def fetch_html(url: str = SNAPSHOT_URL, timeout: int = 30) -> str:
 
 def parse_session_status(page_html: str) -> str:
     """
-    Reads the exchange status banner ("Closed" / "Open" / "Pre-open").
+    Reads the exchange status banner ("Closed" / "Open" / "Pre-open" / "Postclose").
 
-    Only a closed session represents settled end-of-day prices.
+    Only a completed session represents settled end-of-day prices.
     """
     match = re.search(r"Status:\s*(?:<[^>]+>\s*)*([A-Za-z][A-Za-z\s-]{2,20})", page_html)
     if not match:
         return "Unknown"
     return match.group(1).strip().split()[0].title()
+
+
+def is_session_settled_status(status: str) -> bool:
+    """
+    Returns True if the exchange status banner indicates that trading has completed.
+
+    PSX sets 'Postclose' / 'Post-Close' immediately after market close (16:30 PKT,
+    16:00 on Fridays), during which all trades are finished and the official market
+    summary table contains finalized closing prices. 'Closed' is set later in the evening.
+    Both represent settled EOD market data.
+    """
+    s = str(status).strip().lower().replace("-", "").replace(" ", "")
+    return s in ("closed", "postclose", "eod", "post")
 
 
 def _cells(row_html: str) -> list:
@@ -237,7 +250,7 @@ def refresh(dry_run: bool = False, force: bool = False, limit: int = None) -> di
     if frame.empty:
         raise RuntimeError("PSX snapshot parsed 0 symbols (page layout may have changed)")
 
-    if status.lower() != "closed" and not force:
+    if not is_session_settled_status(status) and not force:
         return {
             "updated": 0,
             "skipped": 0,

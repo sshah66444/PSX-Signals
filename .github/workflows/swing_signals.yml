@@ -71,12 +71,14 @@ jobs:
           PSX_TRADING_MODE: swing_trade
         run: python telegram_notifier.py --mode swing_trade
 
-      - name: Mark today as delivered
+      - name: Verify delivery status
         if: steps.gate.outputs.skip != 'true'
         run: |
-          mkdir -p .state
-          printf '{"delivered_at": "%s", "mode": "swing_trade", "session": "%s"}\n' \
-            "$(TZ=Asia/Karachi date -Iseconds)" "${{ steps.gate.outputs.session }}" > ".state/swing_scan_${{ steps.gate.outputs.session }}.done"
+          if [ -f ".state/swing_scan_${{ steps.gate.outputs.session }}.done" ]; then
+            echo "Session ${{ steps.gate.outputs.session }} successfully delivered."
+          else
+            echo "Session ${{ steps.gate.outputs.session }} deferred (pending settlement); retry window will re-evaluate."
+          fi
 
       - name: Persist signal ledger and delivery marker
         if: always()

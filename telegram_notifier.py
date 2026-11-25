@@ -34,6 +34,7 @@ from data_engine import (
     fetch_kse100_index,
     build_synthetic_benchmark,
     audit_watchlist,
+    PKT_TZ,
 )
 from signal_engine import generate_signal, format_actionable_card
 from signal_tracker import (
@@ -309,7 +310,7 @@ def run_daily_market_cycle(
         )
         print(f"   [FRESHNESS GUARD] Session {expected_sess_date} pending EOD settlement (latest bar: {kse_last_date}). Halting daily scan.")
         if not dry_run and token and chat_id:
-            broadcast_telegram_message(token, chat_id, pending_msg)
+            desk.post("desk", pending_msg, _desk_send, chat_id=chat_id, token=token)
         return [pending_msg]
 
     print(f"2. Fetching real market data for {len(target_symbols)} symbols...")
@@ -418,6 +419,12 @@ def run_daily_market_cycle(
         # Only tradeable states are delivered. WATCH stays in the dashboard/ledger
         # so the chat is not flooded with "still waiting" noise.
         if state in ("BUY_NOW", "BUY_ZONE"):
+            if not setup.get("is_settled", True) and strict_freshness:
+                print(
+                    f"   [WITHHOLD STALE] {sym}: EOD bar {setup.get('last_date')} is pending settlement "
+                    f"(expected {setup.get('expected_date')}). Card withheld."
+                )
+                continue
             if dry_run:
                 # A dry run must never mutate the live ledger: otherwise the real
                 # scan that follows sees the setup as "already active" and stays
@@ -581,7 +588,24 @@ def run_daily_market_cycle(
 
         print(f"   Telegram delivery: {delivered} message(s) sent successfully.")
 
-    return messages
+        # Record delivery marker so scheduled retries know today was delivered
+        state_dir = os.path.join(os.path.dirname(__file__), ".state")
+        os.makedirs(state_dir, exist_ok=True)
+        marker_file = os.path.join(state_dir, f"swing_scan_{expected_sess_date}.done")
+        payload = {
+            "delivered_at": datetime.datetime.now(PKT_TZ).isoformat() if PKT_TZ else datetime.datetime.now().isoformat(),
+            "mode": mode or "swing_trade",
+            "session": str(expected_sess_date),
+            "delivered_messages": delivered,
+            "signals_count": len(ranked_items[:MAX_CARDS_PER_RUN]),
+        }
+        try:
+            import json as _json
+            with open(marker_file, "w") as f:
+                _json.dump(payload, f, indent=2)
+            print(f"   Recorded delivery marker: {marker_file}")
+        except Exception as exc:
+            print(f"   Warning: could not write delivery marker: {exc}")
 
     return messages
 
@@ -823,8 +847,12 @@ def main():
     parser.add_argument("--desk", action="store_true", help="Show desk lane routing (topics / bot identities) and exit")
     parser.add_argument("--desk-ids", action="store_true",
                         help="Query Telegram for the group chat id and every topic id, then print an env block")
-    parser.add_argument("--allow-stale", action="store_true", default=True, help="Bypass strict session freshness guard (default: on, so a one-session feed lag still delivers alerts with a pending notice)")
-    parser.add_argument("--strict-freshness", action="store_true", help="Halt the scan when today's EOD bar has not settled yet")
+    parser.add_argument("--allow-stale", action="store_true", default=False,
+                        help="Allow scans to evaluate and emit setups on prior session data if today's EOD bar is not settled (default: False)")
+    parser.add_argument("--strict-freshness", dest="strict_freshness", action="store_true", default=True,
+                        help="Halt the scan when today's EOD bar has not settled yet (default: True)")
+    parser.add_argument("--no-strict-freshness", dest="strict_freshness", action="store_false",
+                        help="Disable strict session freshness check")
     parser.add_argument("--cross-bot-replies", action="store_true", default=None,
                         help="Enable cross-bot automated replies between lanes (default: on via PSX_CROSS_BOT_REPLIES)")
     parser.add_argument("--no-cross-bot-replies", dest="cross_bot_replies", action="store_false",
@@ -936,13 +964,14 @@ def main():
         return
 
     symbols = [args.symbol.upper()] if args.symbol else None
+    strict_freshness = bool(args.strict_freshness and not args.allow_stale)
     try:
         messages = run_daily_market_cycle(
             token,
             chat_id,
             symbols=symbols,
             dry_run=args.dry_run,
-            strict_freshness=args.strict_freshness,
+            strict_freshness=strict_freshness,
             mode=args.mode,
         )
     except Exception:
